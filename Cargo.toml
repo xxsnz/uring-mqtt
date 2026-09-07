@@ -3,6 +3,12 @@ name = "uring-mqtt"
 version = "0.1.0"
 edition = "2021"
 description = "High-performance MQTT broker using Monoio io_uring runtime"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/xxsnz/uring-mqtt"
+readme = "README.md"
+keywords = ["mqtt", "io-uring", "iot", "telemetry", "monoio"]
+categories = ["network-programming", "asynchronous"]
+rust-version = "1.89"
 
 [dependencies]
 # Monoio runtime with io_uring support

@@ -104,9 +104,7 @@ impl MqttBroker {
         callback: Option<EventCallback>,
     ) -> Result<(), Error> {
         let num_workers = config.num_workers.unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(std::num::NonZero::get)
-                .unwrap_or(4)
+            std::thread::available_parallelism().map_or(4, std::num::NonZero::get)
         });
 
         tracing::info!(
