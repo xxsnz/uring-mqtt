@@ -1,5 +1,6 @@
 use monoio::io::sink::SinkExt;
 use monoio::io::stream::Stream;
+use monoio::io::{AsyncReadRent, AsyncWriteRent};
 use monoio::net::TcpStream;
 use monoio_codec::Framed;
 use std::time::Duration;
@@ -13,7 +14,6 @@ use crate::codec::mqtt::{
 use crate::codec::version::{ProtocolVersion, VersionDecoder};
 use crate::connection::ConnectionState;
 use crate::error::Error;
-use rmqtt_codec::types::QoS;
 use rmqtt_codec::v5::ConnectAckReason as V5ConnectAckReason;
 
 /// Handle a single MQTT client connection.
@@ -23,15 +23,36 @@ pub async fn handle_client(
     connection_timeout_secs: u64,
     idle_timeout_secs: u64,
 ) -> Result<(), Error> {
-    let mut state = ConnectionState::new();
-
-    // Capture peer addr before the stream is moved into Framed.
     let peer_addr = stream.peer_addr().map_err(Error::Io)?;
+    handle_client_io(
+        stream,
+        peer_addr,
+        event_tx,
+        connection_timeout_secs,
+        idle_timeout_secs,
+    )
+    .await
+}
+
+/// IO-generic body of `handle_client`. The public entry keeps the
+/// monomorphic `TcpStream` signature; tests substitute a `TestIo` wrapper.
+async fn handle_client_io<IO>(
+    stream: IO,
+    peer_addr: std::net::SocketAddr,
+    event_tx: LocalSender<Event>,
+    connection_timeout_secs: u64,
+    idle_timeout_secs: u64,
+) -> Result<(), Error>
+where
+    IO: AsyncReadRent + AsyncWriteRent,
+{
+    let mut state = ConnectionState::new();
 
     // Shared handshake budget — version detect + CONNECT decode + the
     // handshake reply writes share one timer; config is clamped to
-    // MAX_TIMEOUT_SECS so the u64 → Duration conversion is overflow-safe
-    // for any input (no `Instant + Duration` sum anywhere).
+    // MAX_TIMEOUT_SECS so monoio's timer, which panics converting absurd
+    // Durations to millis, never sees a deadline past the supported ceiling
+    // (no `Instant + Duration` sum anywhere).
     let handshake_start = std::time::Instant::now();
     let budget = Duration::from_secs(connection_timeout_secs.min(handshake::MAX_TIMEOUT_SECS));
     let remaining = || budget.saturating_sub(handshake_start.elapsed());
@@ -71,7 +92,7 @@ pub async fn handle_client(
                         session_present: false,
                     })),
                     ProtocolVersion::MQTT5 => MqttPacket::V5(PacketV5::ConnectAck(Box::new(
-                        v5_connack_with_reason(V5ConnectAckReason::ClientIdentifierNotValid),
+                        handshake::honest_v5_connack(V5ConnectAckReason::ClientIdentifierNotValid),
                     ))),
                 };
                 bounded_send(&mut framed, refusal, remaining()).await?;
@@ -85,6 +106,9 @@ pub async fn handle_client(
         Ok(None) => return Err(Error::Protocol("Connection closed during handshake".into())),
         Err(_) => return Err(Error::Timeout),
     };
+    // Idle-window anchor: CONNECT receipt, so a slow CONNACK flush cannot
+    // extend the first idle interval.
+    let connect_received_at = std::time::Instant::now();
 
     // Phase 4: Evaluate CONNECT, then release the packet — its will payload,
     // credentials, and properties must not stay allocated for the whole connection.
@@ -115,7 +139,7 @@ pub async fn handle_client(
             bounded_send(&mut framed, connack, remaining()).await?;
             state.client_id = client_id;
             state.keep_alive = keep_alive_secs;
-            state.update_activity();
+            state.last_packet_time = connect_received_at;
 
             run_packet_loop(&mut framed, &mut state, event_tx, idle_timeout, peer_addr).await?;
         }
@@ -125,13 +149,16 @@ pub async fn handle_client(
 }
 
 /// Main packet loop — idle deadline anchored to the last received packet.
-async fn run_packet_loop(
-    framed: &mut Framed<TcpStream, CodecPair>,
+async fn run_packet_loop<IO>(
+    framed: &mut Framed<IO, CodecPair>,
     state: &mut ConnectionState,
     event_tx: LocalSender<Event>,
     idle_timeout: Duration,
     peer_addr: std::net::SocketAddr,
-) -> Result<(), Error> {
+) -> Result<(), Error>
+where
+    IO: AsyncReadRent + AsyncWriteRent,
+{
     loop {
         let remaining_idle = idle_timeout.saturating_sub(state.last_packet_time.elapsed());
         let packet_result = monoio::time::timeout(remaining_idle, framed.next()).await;
@@ -205,31 +232,19 @@ async fn run_packet_loop(
 }
 
 /// Bounded `send_and_flush` under a deadline (handshake or idle).
-async fn bounded_send(
-    framed: &mut Framed<TcpStream, CodecPair>,
+async fn bounded_send<IO>(
+    framed: &mut Framed<IO, CodecPair>,
     pkt: MqttPacket,
     deadline: Duration,
-) -> Result<(), Error> {
+) -> Result<(), Error>
+where
+    IO: AsyncWriteRent,
+{
     let send_fut = SinkExt::send_and_flush(framed, pkt);
     match monoio::time::timeout(deadline, send_fut).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(Error::Io(e)),
         Err(_) => Err(Error::Timeout),
-    }
-}
-
-/// Honest v5 CONNACK with an explicit reason code (mirror of handshake helper).
-fn v5_connack_with_reason(reason: V5ConnectAckReason) -> rmqtt_codec::v5::ConnectAck {
-    rmqtt_codec::v5::ConnectAck {
-        reason_code: reason,
-        session_present: false,
-        session_expiry_interval_secs: Some(0),
-        max_qos: QoS::AtMostOnce,
-        retain_available: true,
-        wildcard_subscription_available: false,
-        subscription_identifiers_available: false,
-        shared_subscription_available: false,
-        ..Default::default()
     }
 }
 
@@ -289,10 +304,12 @@ mod tests {
     use super::*;
     use crate::broker::worker::{local_channel, LocalReceiver};
     use bytes::BytesMut;
+    use monoio::buf::{IoBuf, IoBufMut, IoVecBuf, IoVecBufMut};
     use monoio::io::{AsyncReadRent, AsyncWriteRent};
     use monoio::net::{TcpListener, TcpStream};
     use monoio_codec::Encoder as _;
     use rmqtt_codec::types::Publish as TypesPublish;
+    use rmqtt_codec::types::QoS;
 
     // Wire fixtures (byte literals — server's own encoder never produces expected values).
     /// v3 CONNECT: ka=60, id "test", flags 0x00. Mirrors `src/codec/version.rs:76-86`.
@@ -344,6 +361,102 @@ mod tests {
         let handle = monoio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
             handle_client(stream, tx, connection_timeout_secs, idle_timeout_secs).await
+        });
+        let client = TcpStream::connect(addr).await.expect("connect");
+        (client, rx, handle)
+    }
+
+    /// Test IO wrapper: delays every write (slow flush) and optionally serves a
+    /// scripted payload before the first socket read, so "a packet is already
+    /// buffered when the flush completes" is a precondition the test sets rather
+    /// than TCP luck.
+    struct TestIo<S> {
+        first_read: Option<Vec<u8>>,
+        /// Bytes of `first_read` already handed out.
+        consumed: usize,
+        write_delay: Duration,
+        inner: S,
+    }
+
+    impl<S: AsyncReadRent> AsyncReadRent for TestIo<S> {
+        async fn read<T: IoBufMut>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
+            let pending = match self.first_read.as_ref() {
+                Some(prefix) if self.consumed < prefix.len() => {
+                    Some(prefix[self.consumed..].to_vec())
+                }
+                _ => None,
+            };
+            match pending {
+                // Delegate to monoio's own `impl AsyncReadRent for &[u8]` — the
+                // crate forbids unsafe, so no hand-filling of the IoBufMut.
+                Some(pending) => {
+                    let mut slice: &[u8] = &pending;
+                    let (res, buf) = slice.read(buf).await;
+                    if let Ok(n) = res {
+                        self.consumed += n;
+                    }
+                    (res, buf)
+                }
+                None => self.inner.read(buf).await,
+            }
+        }
+
+        async fn readv<T: IoVecBufMut>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
+            self.inner.readv(buf).await
+        }
+    }
+
+    impl<S: AsyncWriteRent> AsyncWriteRent for TestIo<S> {
+        async fn write<T: IoBuf>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
+            monoio::time::sleep(self.write_delay).await;
+            self.inner.write(buf).await
+        }
+
+        async fn writev<T: IoVecBuf>(&mut self, buf_vec: T) -> monoio::BufResult<usize, T> {
+            monoio::time::sleep(self.write_delay).await;
+            self.inner.writev(buf_vec).await
+        }
+
+        async fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush().await
+        }
+
+        async fn shutdown(&mut self) -> std::io::Result<()> {
+            self.inner.shutdown().await
+        }
+    }
+
+    /// `spawn_handler` over the `handle_client_io` seam with a `TestIo` stream.
+    async fn spawn_handler_test_io(
+        connection_timeout_secs: u64,
+        idle_timeout_secs: u64,
+        write_delay: Duration,
+        first_read: Option<Vec<u8>>,
+    ) -> (
+        TcpStream,
+        LocalReceiver<Event>,
+        monoio::task::JoinHandle<Result<(), Error>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let (tx, rx) = local_channel::<Event>(16);
+        let handle = monoio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let peer_addr = stream.peer_addr().map_err(Error::Io)?;
+            let io = TestIo {
+                first_read,
+                consumed: 0,
+                write_delay,
+                inner: stream,
+            };
+            handle_client_io(
+                io,
+                peer_addr,
+                tx,
+                connection_timeout_secs,
+                idle_timeout_secs,
+            )
+            .await
         });
         let client = TcpStream::connect(addr).await.expect("connect");
         (client, rx, handle)
@@ -633,6 +746,12 @@ mod tests {
                         ack.reason_code,
                         V5ConnectAckReason::ClientIdentifierNotValid
                     ));
+                    assert!(matches!(ack.max_qos, QoS::AtMostOnce));
+                    assert!(!ack.wildcard_subscription_available);
+                    assert!(!ack.shared_subscription_available);
+                    assert!(!ack.subscription_identifiers_available);
+                    assert_eq!(ack.session_expiry_interval_secs, Some(0));
+                    assert!(ack.retain_available);
                 }
                 other => panic!("expected v5 CONNACK, got {other:?}"),
             }
@@ -853,6 +972,10 @@ mod tests {
 
     /// Last 9 bytes of the v3 CONNECT fixture — completes the CONNECT payload.
     const V3_CONNECT_LAST_9: [u8; 9] = [0x00, 0x00, 0x3C, 0x00, 0x04, b't', b'e', b's', b't'];
+
+    /// Last 9 bytes of the ka=1 v3 CONNECT fixture — `V3_CONNECT_FIRST_9` is the
+    /// shared prefix, so the two together are `V3_CONNECT_TEST_KA1`.
+    const V3_CONNECT_KA1_LAST_9: [u8; 9] = [0x00, 0x00, 0x01, 0x00, 0x04, b't', b'e', b's', b't'];
 
     /// Bound a `read` so a stuck server cannot hang the test. On expiry
     /// returns `Ok(empty Vec)` so callers asserting "no premature bytes
@@ -1200,5 +1323,320 @@ mod tests {
             // Now drop the client.
             drop(client);
         });
+    }
+
+    #[test]
+    fn closes_at_1_5x_from_connect_receipt_under_slow_connack_flush() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            // 1s write delay → the CONNACK flush completes ~1s after the CONNECT
+            // decode, inside the 1.5s negotiated window (ka=1).
+            let (mut client, _rx, handle) =
+                spawn_handler_test_io(5, 30, Duration::from_secs(1), None).await;
+
+            tcp_write_all(&mut client, &V3_CONNECT_FIRST_9)
+                .await
+                .expect("write 9-byte prefix");
+            monoio::time::sleep(Duration::from_secs(1)).await;
+            let connect_done = std::time::Instant::now();
+            tcp_write_all(&mut client, &V3_CONNECT_KA1_LAST_9)
+                .await
+                .expect("write remaining 9 bytes");
+
+            let connack = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(3))
+                .await
+                .expect("read connack");
+            assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+
+            let _ = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(6))
+                .await
+                .expect("read to eof (bounded)");
+            let join_res = monoio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .expect("join timeout");
+            assert!(join_res.is_ok(), "handler returned error: {join_res:?}");
+
+            let from_connect = connect_done.elapsed();
+            // Excludes both wrong anchors: connection creation closes at ~1.0s,
+            // CONNACK completion at ~2.5s.
+            assert!(
+                (Duration::from_millis(1300)..=Duration::from_millis(2100)).contains(&from_connect),
+                "elapsed from CONNECT receipt {from_connect:?} outside 1.3s..=2.1s window"
+            );
+        });
+    }
+
+    #[test]
+    fn processes_publish_buffered_with_connect_under_overlong_flush() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            // CONNECT + PUBLISH served as one scripted read; the 2s flush delay
+            // exhausts the 1.5s window before the CONNACK completes.
+            let mut buffered = Vec::new();
+            buffered.extend_from_slice(&V3_CONNECT_TEST_KA1);
+            buffered.extend_from_slice(&PUBLISH_QOS0_T);
+            assert_eq!(buffered.len(), 27);
+            let (mut client, mut rx, handle) =
+                spawn_handler_test_io(5, 30, Duration::from_secs(2), Some(buffered)).await;
+
+            let connack = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(4))
+                .await
+                .expect("read connack");
+            assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+
+            let evt = monoio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("event timeout")
+                .expect("event Some");
+            match evt {
+                Event::SensorV1 {
+                    temperature,
+                    pressure,
+                } => {
+                    assert_eq!(temperature, 2500);
+                    assert_eq!(pressure, 1013);
+                }
+            }
+
+            let _ = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(6))
+                .await
+                .expect("read to eof (bounded)");
+            let join_res = monoio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .expect("join timeout");
+            assert!(join_res.is_ok(), "handler returned error: {join_res:?}");
+        });
+    }
+
+    #[test]
+    fn closes_immediately_after_overlong_connack_flush_with_nothing_buffered() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) =
+                spawn_handler_test_io(5, 30, Duration::from_secs(2), None).await;
+
+            tcp_write_all(&mut client, &V3_CONNECT_TEST_KA1)
+                .await
+                .expect("connect write");
+
+            let connack = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(4))
+                .await
+                .expect("read connack");
+            assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+            let connack_at = std::time::Instant::now();
+
+            let _ = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(3))
+                .await
+                .expect("read to eof (bounded)");
+            let join_res = monoio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .expect("join timeout");
+            assert!(join_res.is_ok(), "handler returned error: {join_res:?}");
+
+            let after_connack = connack_at.elapsed();
+            // A fresh post-flush window would close ~1.5s after the CONNACK.
+            assert!(
+                after_connack <= Duration::from_secs(1),
+                "close took {after_connack:?} after CONNACK — a fresh idle window was granted"
+            );
+        });
+    }
+
+    #[test]
+    fn closes_after_overlong_flush_when_only_incomplete_packet_buffered() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            // Complete CONNECT plus one byte of a PUBLISH header — an incomplete
+            // frame is not a packet, so it grants no fresh window.
+            let mut buffered = Vec::new();
+            buffered.extend_from_slice(&V3_CONNECT_TEST_KA1);
+            buffered.push(0x30);
+            assert_eq!(buffered.len(), 19);
+            let (mut client, mut rx, handle) =
+                spawn_handler_test_io(5, 30, Duration::from_secs(2), Some(buffered)).await;
+
+            let connack = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(4))
+                .await
+                .expect("read connack");
+            assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+            let connack_at = std::time::Instant::now();
+
+            let _ = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(3))
+                .await
+                .expect("read to eof (bounded)");
+            let join_res = monoio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .expect("join timeout");
+            assert!(join_res.is_ok(), "handler returned error: {join_res:?}");
+
+            let after_connack = connack_at.elapsed();
+            assert!(
+                after_connack <= Duration::from_secs(1),
+                "close took {after_connack:?} after CONNACK — a fresh idle window was granted"
+            );
+
+            let evt = monoio::time::timeout(Duration::from_millis(300), rx.recv()).await;
+            assert!(evt.is_err(), "expected no event from an incomplete frame");
+        });
+    }
+
+    #[test]
+    fn closes_at_config_capped_window_from_connect_receipt_under_slow_flush() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            // v3 ka=60 with idle_timeout_secs=2 → negotiated window is the config
+            // cap (2s), not 1.5×60. The 1s write delay keeps the flush inside it.
+            let (mut client, _rx, handle) =
+                spawn_handler_test_io(5, 2, Duration::from_secs(1), None).await;
+
+            tcp_write_all(&mut client, &V3_CONNECT_FIRST_9)
+                .await
+                .expect("write 9-byte prefix");
+            monoio::time::sleep(Duration::from_secs(1)).await;
+            let connect_done = std::time::Instant::now();
+            tcp_write_all(&mut client, &V3_CONNECT_LAST_9)
+                .await
+                .expect("write remaining 9 bytes");
+
+            let connack = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(3))
+                .await
+                .expect("read connack");
+            assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+
+            let _ = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(6))
+                .await
+                .expect("read to eof (bounded)");
+            let join_res = monoio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .expect("join timeout");
+            assert!(join_res.is_ok(), "handler returned error: {join_res:?}");
+
+            let from_connect = connect_done.elapsed();
+            // Excludes both wrong anchors: connection creation closes at ~1.0s,
+            // CONNACK completion at ~3.0s. An uncapped 90s window never closes.
+            assert!(
+                (Duration::from_millis(1700)..=Duration::from_millis(2600)).contains(&from_connect),
+                "elapsed from CONNECT receipt {from_connect:?} outside 1.7s..=2.6s window"
+            );
+        });
+    }
+
+    #[test]
+    fn v5_refusal_connack_capabilities_match_accept_connack() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            // Accept path: v5 CONNECT with a client id.
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            tcp_write_all(&mut client, &encode_v5_connect(60, "dev5"))
+                .await
+                .expect("v5 connect write");
+            let mut reader = V5Reader::new();
+            let accept = match reader.next(&mut client).await {
+                Some(MqttPacket::V5(PacketV5::ConnectAck(ack))) => ack,
+                other => panic!("expected v5 CONNACK, got {other:?}"),
+            };
+            assert!(matches!(accept.reason_code, V5ConnectAckReason::Success));
+            tcp_write_all(&mut client, &DISCONNECT)
+                .await
+                .expect("disconnect write");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(join_res.is_ok(), "handler returned error: {join_res:?}");
+
+            // Decoder-level refusal path: v5 CONNECT with empty id, no clean start.
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            let mut enc = MqttEncoder::v5();
+            let pkt = MqttPacket::V5(PacketV5::Connect(Box::<rmqtt_codec::v5::Connect>::default()));
+            let mut buf = BytesMut::new();
+            enc.encode(pkt, &mut buf).expect("encode v5 CONNECT empty");
+            tcp_write_all(&mut client, &buf).await.expect("write");
+            let mut reader = V5Reader::new();
+            let refusal = match reader.next(&mut client).await {
+                Some(MqttPacket::V5(PacketV5::ConnectAck(ack))) => ack,
+                other => panic!("expected v5 CONNACK, got {other:?}"),
+            };
+            assert!(matches!(
+                refusal.reason_code,
+                V5ConnectAckReason::ClientIdentifierNotValid
+            ));
+            let _ = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(2))
+                .await
+                .expect("eof");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(join_res.is_ok(), "handler returned error: {join_res:?}");
+
+            // One constructor owns the capability policy — the two wire CONNACKs
+            // cannot diverge, whatever value a later feature gives max_qos.
+            assert_eq!(refusal.max_qos, accept.max_qos, "max_qos diverged");
+            assert_eq!(
+                refusal.retain_available, accept.retain_available,
+                "retain_available diverged"
+            );
+            assert_eq!(
+                refusal.wildcard_subscription_available, accept.wildcard_subscription_available,
+                "wildcard_subscription_available diverged"
+            );
+            assert_eq!(
+                refusal.shared_subscription_available, accept.shared_subscription_available,
+                "shared_subscription_available diverged"
+            );
+            assert_eq!(
+                refusal.subscription_identifiers_available,
+                accept.subscription_identifiers_available,
+                "subscription_identifiers_available diverged"
+            );
+            assert_eq!(
+                refusal.session_expiry_interval_secs, accept.session_expiry_interval_secs,
+                "session_expiry_interval_secs diverged"
+            );
+            assert_eq!(
+                refusal.session_present, accept.session_present,
+                "session_present diverged"
+            );
+        });
+    }
+
+    #[test]
+    fn connack_flush_timeout_respects_shared_handshake_budget() {
+        let mut rt = build_runtime();
+        let start = std::time::Instant::now();
+        rt.block_on(async {
+            // 3s budget consumed by a 2s fragmentation wait; the 1.5s write delay
+            // then exceeds what is left, so the CONNACK never reaches the client.
+            let (mut client, _rx, handle) =
+                spawn_handler_test_io(3, 30, Duration::from_millis(1500), None).await;
+
+            tcp_write_all(&mut client, &V3_CONNECT_FIRST_9)
+                .await
+                .expect("write 9-byte prefix");
+            monoio::time::sleep(Duration::from_secs(2)).await;
+            tcp_write_all(&mut client, &V3_CONNECT_KA1_LAST_9)
+                .await
+                .expect("write remaining 9 bytes");
+
+            let got = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(6))
+                .await
+                .expect("read to eof (bounded)");
+            assert!(
+                got.is_empty(),
+                "expected zero response bytes after shared budget expiry, got {got:?}"
+            );
+
+            let join_res = monoio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Err(Error::Timeout)),
+                "expected Err(Error::Timeout), got {join_res:?}"
+            );
+        });
+        let elapsed = start.elapsed();
+        assert!(
+            (Duration::from_millis(2700)..=Duration::from_millis(4200)).contains(&elapsed),
+            "elapsed {elapsed:?} outside 2.7s..=4.2s window (shared handshake budget)"
+        );
     }
 }

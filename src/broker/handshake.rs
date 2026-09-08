@@ -121,7 +121,12 @@ pub(crate) fn evaluate_connect(
 }
 
 /// Honest v5 CONNACK: truthful capability announcement per AC-15.
-fn honest_v5_connack(reason: V5ConnectAckReason) -> rmqtt_codec::v5::ConnectAck {
+///
+/// Single constructor for both the accept path (this module's
+/// `evaluate_connect`) and the decoder-level refusal path in
+/// `handler::handle_client_io` — capability fields cannot diverge
+/// between the two when later features raise `max_qos`.
+pub(crate) fn honest_v5_connack(reason: V5ConnectAckReason) -> rmqtt_codec::v5::ConnectAck {
     rmqtt_codec::v5::ConnectAck {
         reason_code: reason,
         max_qos: QoS::AtMostOnce,
