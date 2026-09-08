@@ -189,12 +189,12 @@ impl<T> LocalSender<T> {
     }
 }
 
-struct LocalReceiver<T> {
+pub(crate) struct LocalReceiver<T> {
     channel: Rc<LocalChannel<T>>,
 }
 
 impl<T> LocalReceiver<T> {
-    async fn recv(&mut self) -> Option<T> {
+    pub(crate) async fn recv(&mut self) -> Option<T> {
         loop {
             {
                 let mut buffer = self.channel.buffer.borrow_mut();
@@ -208,7 +208,7 @@ impl<T> LocalReceiver<T> {
     }
 }
 
-fn local_channel<T>(capacity: usize) -> (LocalSender<T>, LocalReceiver<T>) {
+pub(crate) fn local_channel<T>(capacity: usize) -> (LocalSender<T>, LocalReceiver<T>) {
     let channel = LocalChannel::new(capacity);
     (
         LocalSender {

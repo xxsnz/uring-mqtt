@@ -10,6 +10,7 @@ use tokio_util::codec::Encoder as TokioEncoder;
 use super::version::ProtocolVersion;
 
 // Re-export commonly used types
+pub use rmqtt_codec::error::DecodeError;
 pub use rmqtt_codec::v3::{ConnectAck, ConnectAckReason, Packet as PacketV3};
 pub use rmqtt_codec::v5::Packet as PacketV5;
 pub use rmqtt_codec::MqttPacket;
@@ -56,7 +57,7 @@ impl Decoder for MqttDecoder {
         match TokioDecoder::decode(&mut self.inner, src) {
             Ok(Some(packet)) => Ok(Decoded::Some(packet)),
             Ok(None) => Ok(Decoded::Insufficient),
-            Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
+            Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
         }
     }
 }
@@ -81,6 +82,14 @@ impl MqttEncoder {
     pub fn v3() -> Self {
         Self {
             inner: MqttCodec::V3(V3Codec::default()),
+        }
+    }
+
+    /// Create an encoder for MQTT 5.0.
+    #[cfg(test)]
+    pub fn v5() -> Self {
+        Self {
+            inner: MqttCodec::V5(V5Codec::default()),
         }
     }
 }
@@ -219,5 +228,43 @@ mod tests {
         // Should return Insufficient
         let result = MonoioDecoder::decode(&mut decoder, &mut buf).unwrap();
         assert!(matches!(result, Decoded::Insufficient));
+    }
+
+    #[test]
+    fn test_encode_v5_connack_client_identifier_not_valid() {
+        use rmqtt_codec::types::QoS;
+        use rmqtt_codec::v5::{ConnectAck, ConnectAckReason};
+        let ack = ConnectAck {
+            reason_code: ConnectAckReason::ClientIdentifierNotValid,
+            session_present: false,
+            session_expiry_interval_secs: Some(0),
+            max_qos: QoS::AtMostOnce,
+            retain_available: true,
+            wildcard_subscription_available: false,
+            subscription_identifiers_available: false,
+            shared_subscription_available: false,
+            ..Default::default()
+        };
+        let mut encoder = MqttEncoder::v5();
+        let mut buf = BytesMut::new();
+        let pkt = MqttPacket::V5(PacketV5::ConnectAck(Box::new(ack)));
+        MonoioEncoder::encode(&mut encoder, pkt, &mut buf).expect("encode");
+        eprintln!("v5 connack bytes ({}): {:02x?}", buf.len(), &buf[..]);
+        assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn test_encode_v3_connack_identifier_rejected() {
+        use rmqtt_codec::v3::ConnectAckReason;
+        let ack = super::ConnectAck {
+            return_code: ConnectAckReason::IdentifierRejected,
+            session_present: false,
+        };
+        let mut encoder = MqttEncoder::v3();
+        let mut buf = BytesMut::new();
+        let pkt = MqttPacket::V3(PacketV3::ConnectAck(ack));
+        MonoioEncoder::encode(&mut encoder, pkt, &mut buf).expect("encode");
+        eprintln!("v3 connack bytes ({}): {:02x?}", buf.len(), &buf[..]);
+        assert_eq!(buf.len(), 4);
     }
 }

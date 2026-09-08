@@ -1,4 +1,5 @@
 mod handler;
+pub(crate) mod handshake;
 pub(crate) mod worker;
 
 use crate::error::Error;
