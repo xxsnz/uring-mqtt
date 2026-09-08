@@ -375,6 +375,9 @@ mod tests {
         /// Bytes of `first_read` already handed out.
         consumed: usize,
         write_delay: Duration,
+        /// This many initial writes skip `write_delay` (e.g. a fast CONNACK
+        /// before a stalled PINGRESP).
+        undelayed_writes: usize,
         inner: S,
     }
 
@@ -408,12 +411,20 @@ mod tests {
 
     impl<S: AsyncWriteRent> AsyncWriteRent for TestIo<S> {
         async fn write<T: IoBuf>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
-            monoio::time::sleep(self.write_delay).await;
+            if self.undelayed_writes > 0 {
+                self.undelayed_writes -= 1;
+            } else {
+                monoio::time::sleep(self.write_delay).await;
+            }
             self.inner.write(buf).await
         }
 
         async fn writev<T: IoVecBuf>(&mut self, buf_vec: T) -> monoio::BufResult<usize, T> {
-            monoio::time::sleep(self.write_delay).await;
+            if self.undelayed_writes > 0 {
+                self.undelayed_writes -= 1;
+            } else {
+                monoio::time::sleep(self.write_delay).await;
+            }
             self.inner.writev(buf_vec).await
         }
 
@@ -431,6 +442,7 @@ mod tests {
         connection_timeout_secs: u64,
         idle_timeout_secs: u64,
         write_delay: Duration,
+        undelayed_writes: usize,
         first_read: Option<Vec<u8>>,
     ) -> (
         TcpStream,
@@ -447,6 +459,7 @@ mod tests {
                 first_read,
                 consumed: 0,
                 write_delay,
+                undelayed_writes,
                 inner: stream,
             };
             handle_client_io(
@@ -1283,44 +1296,31 @@ mod tests {
     fn closes_blocked_writer_when_idle_deadline_passes() {
         let mut rt = build_runtime();
         rt.block_on(async {
-            let (mut client, _rx, handle) = spawn_handler(5, 30).await;
-            // CONNECT ka=1 → idle 1.5 s.
-            tcp_write_all(&mut client, &V3_CONNECT_TEST_KA1)
-                .await
-                .expect("connect write");
+            // Scripted CONNECT (ka=1 → idle 1.5s) plus one PINGREQ; the CONNACK
+            // write is undelayed, then the PINGRESP write stalls for 10s — a
+            // blocked writer as a precondition, not TCP-buffer luck (the old
+            // flood variant went green or hung with the runner's buffer sizes).
+            let mut prefix = V3_CONNECT_TEST_KA1.to_vec();
+            prefix.extend_from_slice(&PINGREQ);
+            let (client, _rx, handle) =
+                spawn_handler_test_io(5, 30, Duration::from_secs(10), 1, Some(prefix)).await;
 
-            // Flood PINGREQs without reading — kernel buffers fill, server PINGRESP flush blocks.
-            let pingreq_block: Vec<u8> = PINGREQ.iter().cycle().take(8192).copied().collect();
-            let flood_start = std::time::Instant::now();
-            let mut written = 0usize;
-            while flood_start.elapsed() < Duration::from_secs(3) && written < 2 * 1024 * 1024 {
-                match monoio::time::timeout(
-                    Duration::from_millis(100),
-                    tcp_write_all(&mut client, &pingreq_block),
-                )
-                .await
-                {
-                    Ok(Ok(())) => {
-                        written += pingreq_block.len();
-                    }
-                    // A timed-out write means the pipe is saturated, not that the
-                    // flood is over — keep pushing so the server's unread PINGRESP
-                    // backlog outgrows the return path and its flush blocks.
-                    Err(_) => {}
-                    Ok(Err(_)) => break,
-                }
-            }
-            // Stay silent AND unread: idle deadline (1.5 s) elapses mid-flush → bounded
-            // send_and_flush returns Elapsed → handler returns Err(Error::Timeout).
-            let join_res = monoio::time::timeout(Duration::from_secs(5), handle)
+            // Idle deadline (1.5s) elapses mid-flush → bounded send_and_flush
+            // returns Elapsed → handler returns Err(Error::Timeout).
+            let start = std::time::Instant::now();
+            let join_res = monoio::time::timeout(Duration::from_secs(4), handle)
                 .await
                 .expect("join timeout");
+            let elapsed = start.elapsed();
             assert!(
                 matches!(join_res, Err(Error::Timeout)),
                 "expected Err(Error::Timeout), got {join_res:?}"
             );
+            assert!(
+                (Duration::from_millis(1300)..=Duration::from_millis(2500)).contains(&elapsed),
+                "elapsed {elapsed:?} outside 1.3s..=2.5s window (1.5s idle deadline)"
+            );
 
-            // Now drop the client.
             drop(client);
         });
     }
@@ -1332,7 +1332,7 @@ mod tests {
             // 1s write delay → the CONNACK flush completes ~1s after the CONNECT
             // decode, inside the 1.5s negotiated window (ka=1).
             let (mut client, _rx, handle) =
-                spawn_handler_test_io(5, 30, Duration::from_secs(1), None).await;
+                spawn_handler_test_io(5, 30, Duration::from_secs(1), 0, None).await;
 
             tcp_write_all(&mut client, &V3_CONNECT_FIRST_9)
                 .await
@@ -1377,7 +1377,7 @@ mod tests {
             buffered.extend_from_slice(&PUBLISH_QOS0_T);
             assert_eq!(buffered.len(), 27);
             let (mut client, mut rx, handle) =
-                spawn_handler_test_io(5, 30, Duration::from_secs(2), Some(buffered)).await;
+                spawn_handler_test_io(5, 30, Duration::from_secs(2), 0, Some(buffered)).await;
 
             let connack = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(4))
                 .await
@@ -1413,7 +1413,7 @@ mod tests {
         let mut rt = build_runtime();
         rt.block_on(async {
             let (mut client, _rx, handle) =
-                spawn_handler_test_io(5, 30, Duration::from_secs(2), None).await;
+                spawn_handler_test_io(5, 30, Duration::from_secs(2), 0, None).await;
 
             tcp_write_all(&mut client, &V3_CONNECT_TEST_KA1)
                 .await
@@ -1453,7 +1453,7 @@ mod tests {
             buffered.push(0x30);
             assert_eq!(buffered.len(), 19);
             let (mut client, mut rx, handle) =
-                spawn_handler_test_io(5, 30, Duration::from_secs(2), Some(buffered)).await;
+                spawn_handler_test_io(5, 30, Duration::from_secs(2), 0, Some(buffered)).await;
 
             let connack = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(4))
                 .await
@@ -1487,7 +1487,7 @@ mod tests {
             // v3 ka=60 with idle_timeout_secs=2 → negotiated window is the config
             // cap (2s), not 1.5×60. The 1s write delay keeps the flush inside it.
             let (mut client, _rx, handle) =
-                spawn_handler_test_io(5, 2, Duration::from_secs(1), None).await;
+                spawn_handler_test_io(5, 2, Duration::from_secs(1), 0, None).await;
 
             tcp_write_all(&mut client, &V3_CONNECT_FIRST_9)
                 .await
@@ -1607,7 +1607,7 @@ mod tests {
             // 3s budget consumed by a 2s fragmentation wait; the 1.5s write delay
             // then exceeds what is left, so the CONNACK never reaches the client.
             let (mut client, _rx, handle) =
-                spawn_handler_test_io(3, 30, Duration::from_millis(1500), None).await;
+                spawn_handler_test_io(3, 30, Duration::from_millis(1500), 0, None).await;
 
             tcp_write_all(&mut client, &V3_CONNECT_FIRST_9)
                 .await
