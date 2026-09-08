@@ -43,6 +43,7 @@ default = []
 [[example]]
 name = "simple_broker"
 path = "examples/simple_broker.rs"
+test = true
 
 [lints.rust]
 unsafe_code = "forbid"
