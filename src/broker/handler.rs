@@ -5,7 +5,7 @@ use monoio::net::TcpStream;
 use monoio_codec::Framed;
 use std::time::Duration;
 
-use super::worker::LocalSender;
+use super::worker::EventSender;
 use super::Event;
 use crate::broker::handshake::{self, ConnectDecision};
 use crate::codec::mqtt::{
@@ -16,13 +16,20 @@ use crate::connection::ConnectionState;
 use crate::error::Error;
 use rmqtt_codec::v5::ConnectAckReason as V5ConnectAckReason;
 
+/// What a completed (non-error) client session amounted to.
+#[derive(Debug)]
+pub(crate) enum SessionOutcome {
+    Served,
+    Refused,
+}
+
 /// Handle a single MQTT client connection.
 pub async fn handle_client(
     stream: TcpStream,
-    event_tx: LocalSender<Event>,
+    event_tx: EventSender,
     connection_timeout_secs: u64,
     idle_timeout_secs: u64,
-) -> Result<(), Error> {
+) -> Result<SessionOutcome, Error> {
     let peer_addr = stream.peer_addr().map_err(Error::Io)?;
     handle_client_io(
         stream,
@@ -39,10 +46,10 @@ pub async fn handle_client(
 async fn handle_client_io<IO>(
     stream: IO,
     peer_addr: std::net::SocketAddr,
-    event_tx: LocalSender<Event>,
+    event_tx: EventSender,
     connection_timeout_secs: u64,
     idle_timeout_secs: u64,
-) -> Result<(), Error>
+) -> Result<SessionOutcome, Error>
 where
     IO: AsyncReadRent + AsyncWriteRent,
 {
@@ -68,7 +75,7 @@ where
             tracing::warn!("handshake violation: first packet was not CONNECT ({peer_addr}): {e}");
             return Err(Error::Io(e));
         }
-        Ok(None) => return Err(Error::Protocol("Connection closed during handshake".into())),
+        Ok(None) => return Err(Error::ClientClosed),
         Err(_) => return Err(Error::Timeout),
     };
 
@@ -96,14 +103,14 @@ where
                     ))),
                 };
                 bounded_send(&mut framed, refusal, remaining()).await?;
-                return Ok(());
+                return Ok(SessionOutcome::Refused);
             }
             // Every other decoder rejection is a protocol violation closed without a
             // reply; Q8 requires it visible at default level, not only at debug.
             tracing::warn!("handshake violation: malformed CONNECT from {peer_addr}: {e}");
             return Err(Error::Io(e));
         }
-        Ok(None) => return Err(Error::Protocol("Connection closed during handshake".into())),
+        Ok(None) => return Err(Error::ClientClosed),
         Err(_) => return Err(Error::Timeout),
     };
     // Idle-window anchor: CONNECT receipt, so a slow CONNACK flush cannot
@@ -128,7 +135,7 @@ where
             };
             tracing::warn!("CONNECT refused: {reason} from {peer_addr}");
             bounded_send(&mut framed, connack, remaining()).await?;
-            return Ok(());
+            return Ok(SessionOutcome::Refused);
         }
         ConnectDecision::Accept {
             connack,
@@ -145,14 +152,14 @@ where
         }
     }
 
-    Ok(())
+    Ok(SessionOutcome::Served)
 }
 
 /// Main packet loop — idle deadline anchored to the last received packet.
 async fn run_packet_loop<IO>(
     framed: &mut Framed<IO, CodecPair>,
     state: &mut ConnectionState,
-    event_tx: LocalSender<Event>,
+    event_tx: EventSender,
     idle_timeout: Duration,
     peer_addr: std::net::SocketAddr,
 ) -> Result<(), Error>
@@ -302,7 +309,7 @@ fn parse_sensor_data(data: &[u8]) -> Option<Event> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::broker::worker::{local_channel, LocalReceiver};
+    use crate::broker::worker::{event_channel, EventReceiver};
     use bytes::BytesMut;
     use monoio::buf::{IoBuf, IoBufMut, IoVecBuf, IoVecBufMut};
     use monoio::io::{AsyncReadRent, AsyncWriteRent};
@@ -352,12 +359,12 @@ mod tests {
         idle_timeout_secs: u64,
     ) -> (
         TcpStream,
-        LocalReceiver<Event>,
-        monoio::task::JoinHandle<Result<(), Error>>,
+        EventReceiver,
+        monoio::task::JoinHandle<Result<SessionOutcome, Error>>,
     ) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("local_addr");
-        let (tx, rx) = local_channel::<Event>(16);
+        let (tx, rx) = event_channel(0);
         let handle = monoio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
             handle_client(stream, tx, connection_timeout_secs, idle_timeout_secs).await
@@ -446,12 +453,12 @@ mod tests {
         first_read: Option<Vec<u8>>,
     ) -> (
         TcpStream,
-        LocalReceiver<Event>,
-        monoio::task::JoinHandle<Result<(), Error>>,
+        EventReceiver,
+        monoio::task::JoinHandle<Result<SessionOutcome, Error>>,
     ) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("local_addr");
-        let (tx, rx) = local_channel::<Event>(16);
+        let (tx, rx) = event_channel(0);
         let handle = monoio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
             let peer_addr = stream.peer_addr().map_err(Error::Io)?;
@@ -641,11 +648,17 @@ mod tests {
             let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
                 .await
                 .expect("join timeout");
-            assert!(join_res.is_ok(), "handler returned error: {join_res:?}");
+            assert!(
+                matches!(join_res, Ok(SessionOutcome::Served)),
+                "expected Ok(SessionOutcome::Served), got {join_res:?}"
+            );
 
             // No second event in the next 300 ms.
             let second = monoio::time::timeout(Duration::from_millis(300), rx.recv()).await;
-            assert!(second.is_err(), "expected no second event, got one");
+            assert!(
+                matches!(second, Ok(None)),
+                "expected no second event, got {second:?}"
+            );
         });
     }
 
@@ -811,7 +824,40 @@ mod tests {
             let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
                 .await
                 .expect("join timeout");
-            assert!(join_res.is_ok(), "handler returned error: {join_res:?}");
+            assert!(
+                matches!(join_res, Ok(SessionOutcome::Refused)),
+                "expected Ok(SessionOutcome::Refused), got {join_res:?}"
+            );
+        });
+    }
+
+    /// AC-23 — decoder-level `InvalidClientId` refusal yields
+    /// `SessionOutcome::Refused`. Asserts the outcome enum discriminates the
+    /// refusal path (the wire CONNACK is identical to the existing
+    /// `replies_identifier_rejected_to_v3_empty_id_without_clean_session`
+    /// test).
+    #[test]
+    fn invalid_client_id_refusal_yields_refused_outcome() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            tcp_write_all(&mut client, &V3_CONNECT_EMPTY_NO_CLEAN)
+                .await
+                .expect("write empty-id no-clean");
+            let got = tcp_read_n(&mut client, 4).await.expect("read refusal");
+            assert_eq!(
+                got,
+                vec![0x20, 0x02, 0x00, 0x02],
+                "expected refusal CONNACK"
+            );
+            let _ = tcp_read_to_eof(&mut client).await.expect("eof");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Ok(SessionOutcome::Refused)),
+                "expected Ok(SessionOutcome::Refused), got {join_res:?}"
+            );
         });
     }
 
@@ -883,6 +929,125 @@ mod tests {
         let sink: LogSink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         LOG_SINK.with(|slot| *slot.borrow_mut() = Some(sink.clone()));
         sink
+    }
+
+    #[test]
+    fn drop_warns_on_first_and_every_hundredth() {
+        let sink = capture_warn_logs();
+        let (tx, _rx) = event_channel(7);
+
+        // Fill the bounded facade to capacity.
+        for i in 0..crate::broker::worker::EVENT_CHANNEL_CAPACITY {
+            tx.send(Event::SensorV1 {
+                temperature: i16::try_from(i).expect("fits i16"),
+                pressure: 0,
+            });
+        }
+        // First overflow: drop #1 → warn.
+        tx.send(Event::SensorV1 {
+            temperature: -1,
+            pressure: 0,
+        });
+        // Overflow #2..#100: only #100 should additionally warn.
+        for _ in 0..99 {
+            tx.send(Event::SensorV1 {
+                temperature: -1,
+                pressure: 0,
+            });
+        }
+        assert_eq!(tx.dropped_total(), 100);
+
+        // Give the tracing subscriber a moment to flush any pending writes
+        // (the writer is synchronous and inline, but the sink mutex and a
+        // possible scheduling handoff want one extra boundary check).
+        let logs = {
+            let bytes = sink.lock().expect("log buffer").clone();
+            String::from_utf8(bytes).expect("utf8 logs")
+        };
+        assert!(
+            logs.contains("worker 7") && logs.contains("1 dropped total"),
+            "first-drop warn missing worker id or count, got: {logs}"
+        );
+        assert!(
+            logs.contains("100 dropped total"),
+            "every-100th warn missing, got: {logs}"
+        );
+        let drop_warn_lines = logs.lines().filter(|l| l.contains("dropped total")).count();
+        assert_eq!(
+            drop_warn_lines, 2,
+            "expected exactly two drop-warn lines, got {drop_warn_lines}: {logs}"
+        );
+    }
+
+    #[test]
+    fn closed_receiver_discard_is_not_counted_or_warned() {
+        // Case (a): fresh channel, drop receiver, send.
+        let sink_a = capture_warn_logs();
+        {
+            let (tx, rx) = event_channel(11);
+            drop(rx);
+            tx.send(Event::SensorV1 {
+                temperature: 0,
+                pressure: 0,
+            });
+            assert_eq!(
+                tx.dropped_total(),
+                0,
+                "closed-receiver discard must not increment the counter"
+            );
+        }
+        let logs_a =
+            String::from_utf8(sink_a.lock().expect("log buffer").clone()).expect("utf8 logs");
+        assert!(
+            !logs_a.contains("dropped total"),
+            "closed-receiver discard must not emit a drop-warn, got: {logs_a}"
+        );
+
+        // Case (b): overflow into a still-open channel, then drop the receiver
+        // and confirm further sends do not raise the counter.
+        let sink_b = capture_warn_logs();
+        {
+            let (tx, rx) = event_channel(11);
+            for i in 0..crate::broker::worker::EVENT_CHANNEL_CAPACITY {
+                tx.send(Event::SensorV1 {
+                    temperature: i16::try_from(i).expect("fits i16"),
+                    pressure: 0,
+                });
+            }
+            tx.send(Event::SensorV1 {
+                temperature: -1,
+                pressure: 0,
+            });
+            tx.send(Event::SensorV1 {
+                temperature: -2,
+                pressure: 0,
+            });
+            assert_eq!(tx.dropped_total(), 2, "two overflows → counter 2");
+
+            drop(rx);
+            // Receiver gone: closure check must take precedence over fullness.
+            tx.send(Event::SensorV1 {
+                temperature: -3,
+                pressure: 0,
+            });
+            assert_eq!(
+                tx.dropped_total(),
+                2,
+                "closed-receiver discards must not add to dropped total"
+            );
+        }
+        let logs_b =
+            String::from_utf8(sink_b.lock().expect("log buffer").clone()).expect("utf8 logs");
+        // Two overflows: warn at #1, next cadence boundary is #100 → exactly
+        // one warn line containing "dropped total" in this channel's lifetime.
+        let drop_warn_lines_b = logs_b
+            .lines()
+            .filter(|l| l.contains("dropped total"))
+            .count();
+        assert_eq!(
+            drop_warn_lines_b, 1,
+            "expected exactly one drop-warn line for case (b), got {drop_warn_lines_b}: {logs_b}"
+        );
     }
 
     #[test]
@@ -1286,8 +1451,35 @@ mod tests {
                 .await
                 .expect("join timeout");
             assert!(
-                matches!(join_res, Err(Error::Protocol(_))),
-                "expected Err(Error::Protocol), got {join_res:?}"
+                matches!(join_res, Err(Error::ClientClosed)),
+                "expected Err(Error::ClientClosed), got {join_res:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn truncated_connect_close_is_io_error_not_client_closed() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(5, 30).await;
+            // First 14 of V3_CONNECT_TEST's 18 bytes: past version detection
+            // (byte 8 = level byte), mid-CONNECT (waiting on client_id bytes
+            // 14..18). EOF arrives with partial CONNECT buffered, so
+            // monoio-codec's `decode_eof` yields Io(Other, ...) — not the
+            // clean-EOF ClientClosed variant.
+            let prefix: [u8; 14] = V3_CONNECT_TEST[..14]
+                .try_into()
+                .expect("V3_CONNECT_TEST prefix fits [u8; 14]");
+            tcp_write_all(&mut client, &prefix)
+                .await
+                .expect("write truncated connect");
+            drop(client);
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Err(Error::Io(_))),
+                "expected Err(Error::Io(_)), got {join_res:?}"
             );
         });
     }
@@ -1476,7 +1668,10 @@ mod tests {
             );
 
             let evt = monoio::time::timeout(Duration::from_millis(300), rx.recv()).await;
-            assert!(evt.is_err(), "expected no event from an incomplete frame");
+            assert!(
+                matches!(evt, Ok(None)),
+                "expected no event from an incomplete frame, got {evt:?}"
+            );
         });
     }
 

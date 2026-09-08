@@ -14,6 +14,7 @@ rust-version = "1.89"
 # Monoio runtime with io_uring support
 monoio = { version = "0.2", features = ["iouring", "legacy", "sync", "macros", "bytes"] }
 monoio-codec = "0.3"
+local-sync = "0.1.1"
 
 # MQTT protocol codec
 rmqtt-codec = "0.2"

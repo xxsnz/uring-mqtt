@@ -259,6 +259,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
+name = "local-sync"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3865cc3ed16dd99f3b89098478647a558a5a2f6dc5f0b45d7867d75da80050ef"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+ "futures-util",
+]
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -817,6 +828,7 @@ name = "uring-mqtt"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "local-sync",
  "monoio",
  "monoio-codec",
  "parking_lot",
