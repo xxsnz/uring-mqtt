@@ -203,7 +203,7 @@ impl MqttBroker {
 /// premature-disconnect error if the ready channel closes with workers missing
 /// (decision = `false` in both error cases). Send errors on the go side are
 /// ignored — the worker may have already exited.
-pub(crate) fn supervise_startup(
+fn supervise_startup(
     ready_rx: &std::sync::mpsc::Receiver<(usize, Result<(), Error>)>,
     go_txs: &[std::sync::mpsc::Sender<bool>],
     num_workers: usize,

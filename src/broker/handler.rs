@@ -41,6 +41,17 @@ pub async fn handle_client(
     .await
 }
 
+/// Log a transport failure on a handshake read: routine hangups at debug,
+/// non-routine anomalies at warn. Genuine decoder rejections are handled
+/// separately at the call site so their violation wording stays verbatim.
+fn log_handshake_transport_error(peer_addr: std::net::SocketAddr, err: &Error) {
+    if err.is_routine_disconnect() {
+        tracing::debug!("client disconnected during handshake ({peer_addr}): {err}");
+    } else {
+        tracing::warn!("handshake transport error ({peer_addr}): {err}");
+    }
+}
+
 /// IO-generic body of `handle_client`. The public entry keeps the
 /// monomorphic `TcpStream` signature; tests substitute a `TestIo` wrapper.
 async fn handle_client_io<IO>(
@@ -70,10 +81,20 @@ where
     let version = match monoio::time::timeout(remaining(), framed.next()).await {
         Ok(Some(Ok(v))) => v,
         Ok(Some(Err(e))) => {
-            // VersionCodec rejects any first packet that is not CONNECT, so this is
-            // the boundary where "first packet was not CONNECT" actually surfaces.
-            tracing::warn!("handshake violation: first packet was not CONNECT ({peer_addr}): {e}");
-            return Err(Error::Io(e));
+            if e.get_ref()
+                .and_then(|s| s.downcast_ref::<DecodeError>())
+                .is_some()
+            {
+                // VersionCodec rejects any first packet that is not CONNECT, so this is
+                // the boundary where "first packet was not CONNECT" actually surfaces.
+                tracing::warn!(
+                    "handshake violation: first packet was not CONNECT ({peer_addr}): {e}"
+                );
+                return Err(Error::Io(e));
+            }
+            let err = Error::Io(e);
+            log_handshake_transport_error(peer_addr, &err);
+            return Err(err);
         }
         Ok(None) => return Err(Error::ClientClosed),
         Err(_) => return Err(Error::Timeout),
@@ -105,10 +126,18 @@ where
                 bounded_send(&mut framed, refusal, remaining()).await?;
                 return Ok(SessionOutcome::Refused);
             }
-            // Every other decoder rejection is a protocol violation closed without a
-            // reply; Q8 requires it visible at default level, not only at debug.
-            tracing::warn!("handshake violation: malformed CONNECT from {peer_addr}: {e}");
-            return Err(Error::Io(e));
+            if e.get_ref()
+                .and_then(|s| s.downcast_ref::<DecodeError>())
+                .is_some()
+            {
+                // Every other decoder rejection is a protocol violation closed without a
+                // reply; Q8 requires it visible at default level, not only at debug.
+                tracing::warn!("handshake violation: malformed CONNECT from {peer_addr}: {e}");
+                return Err(Error::Io(e));
+            }
+            let err = Error::Io(e);
+            log_handshake_transport_error(peer_addr, &err);
+            return Err(err);
         }
         Ok(None) => return Err(Error::ClientClosed),
         Err(_) => return Err(Error::Timeout),
@@ -335,6 +364,13 @@ mod tests {
         0x10, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x01, 0x00, 0x3C, 0x00, 0x04, b't',
         b'e', b's', b't',
     ];
+    /// v3 CONNECT shape with protocol name "MQTX" → `VersionCodec` rejects with
+    /// `DecodeError::InvalidProtocol`. Byte index 7 is the only difference from
+    /// `V3_CONNECT_TEST`.
+    const V3_CONNECT_BAD_PROTOCOL_NAME: [u8; 18] = [
+        0x10, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'X', 0x04, 0x00, 0x00, 0x3C, 0x00, 0x04, b't',
+        b'e', b's', b't',
+    ];
     /// v3 CONNECT: empty id, clean_session=false → decoder emits `InvalidClientId`.
     const V3_CONNECT_EMPTY_NO_CLEAN: [u8; 14] = [
         0x10, 0x0C, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x00, 0x00, 0x3C, 0x00, 0x00,
@@ -385,6 +421,10 @@ mod tests {
         /// This many initial writes skip `write_delay` (e.g. a fast CONNACK
         /// before a stalled PINGRESP).
         undelayed_writes: usize,
+        /// If `Some(kind)`, the first read AFTER the `first_read` prefix has
+        /// been fully drained yields this io error and clears the field.
+        /// Lets tests inject an arbitrary transport failure mid-handshake.
+        read_error: Option<std::io::ErrorKind>,
         inner: S,
     }
 
@@ -396,19 +436,20 @@ mod tests {
                 }
                 _ => None,
             };
-            match pending {
+            if let Some(pending) = pending {
                 // Delegate to monoio's own `impl AsyncReadRent for &[u8]` — the
                 // crate forbids unsafe, so no hand-filling of the IoBufMut.
-                Some(pending) => {
-                    let mut slice: &[u8] = &pending;
-                    let (res, buf) = slice.read(buf).await;
-                    if let Ok(n) = res {
-                        self.consumed += n;
-                    }
-                    (res, buf)
+                let mut slice: &[u8] = &pending;
+                let (res, buf) = slice.read(buf).await;
+                if let Ok(n) = res {
+                    self.consumed += n;
                 }
-                None => self.inner.read(buf).await,
+                return (res, buf);
             }
+            if let Some(kind) = self.read_error.take() {
+                return (Err(std::io::Error::from(kind)), buf);
+            }
+            self.inner.read(buf).await
         }
 
         async fn readv<T: IoVecBufMut>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
@@ -451,6 +492,7 @@ mod tests {
         write_delay: Duration,
         undelayed_writes: usize,
         first_read: Option<Vec<u8>>,
+        read_error: Option<std::io::ErrorKind>,
     ) -> (
         TcpStream,
         EventReceiver,
@@ -467,6 +509,7 @@ mod tests {
                 consumed: 0,
                 write_delay,
                 undelayed_writes,
+                read_error,
                 inner: stream,
             };
             handle_client_io(
@@ -912,15 +955,17 @@ mod tests {
         }
     }
 
-    /// Start capturing this thread's warn-level logs. The subscriber is installed
+    /// Start capturing this thread's logs down to DEBUG. The subscriber is installed
     /// globally and only once: tests run in parallel and `tracing` caches callsite
     /// interest process-wide, so a thread-scoped subscriber loses that race and the
-    /// callsite stays disabled. Max level WARN also proves default-level visibility.
-    fn capture_warn_logs() -> LogSink {
+    /// callsite stays disabled. DEBUG is the capture floor — each test asserts the
+    /// parsed level of the lines it cares about via `has_line_at` / `count_lines_at`,
+    /// so message text can never fake a level.
+    fn capture_logs() -> LogSink {
         static INIT: std::sync::Once = std::sync::Once::new();
         INIT.call_once(|| {
             let subscriber = tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::WARN)
+                .with_max_level(tracing::Level::DEBUG)
                 .with_ansi(false)
                 .with_writer(ThreadLogWriter)
                 .finish();
@@ -931,9 +976,27 @@ mod tests {
         sink
     }
 
+    /// True iff at least one captured line parses to `level` as its second
+    /// whitespace-separated field (the tracing-subscriber full format is
+    /// `<timestamp> <LEVEL> <target>: <message>`) AND contains every needle.
+    /// Parsing the level field prevents message text from faking a level.
+    fn has_line_at(logs: &str, level: &str, needles: &[&str]) -> bool {
+        logs.lines().any(|l| {
+            l.split_whitespace().nth(1) == Some(level) && needles.iter().all(|n| l.contains(n))
+        })
+    }
+
+    /// Count captured lines that parse to `level` and contain `needle`.
+    /// Parsing the level field prevents message text from faking a level.
+    fn count_lines_at(logs: &str, level: &str, needle: &str) -> usize {
+        logs.lines()
+            .filter(|l| l.split_whitespace().nth(1) == Some(level) && l.contains(needle))
+            .count()
+    }
+
     #[test]
     fn drop_warns_on_first_and_every_hundredth() {
-        let sink = capture_warn_logs();
+        let sink = capture_logs();
         let (tx, _rx) = event_channel(7);
 
         // Fill the bounded facade to capacity.
@@ -972,7 +1035,7 @@ mod tests {
             logs.contains("100 dropped total"),
             "every-100th warn missing, got: {logs}"
         );
-        let drop_warn_lines = logs.lines().filter(|l| l.contains("dropped total")).count();
+        let drop_warn_lines = count_lines_at(&logs, "WARN", "dropped total");
         assert_eq!(
             drop_warn_lines, 2,
             "expected exactly two drop-warn lines, got {drop_warn_lines}: {logs}"
@@ -982,7 +1045,7 @@ mod tests {
     #[test]
     fn closed_receiver_discard_is_not_counted_or_warned() {
         // Case (a): fresh channel, drop receiver, send.
-        let sink_a = capture_warn_logs();
+        let sink_a = capture_logs();
         {
             let (tx, rx) = event_channel(11);
             drop(rx);
@@ -1005,7 +1068,7 @@ mod tests {
 
         // Case (b): overflow into a still-open channel, then drop the receiver
         // and confirm further sends do not raise the counter.
-        let sink_b = capture_warn_logs();
+        let sink_b = capture_logs();
         {
             let (tx, rx) = event_channel(11);
             for i in 0..crate::broker::worker::EVENT_CHANNEL_CAPACITY {
@@ -1040,10 +1103,7 @@ mod tests {
             String::from_utf8(sink_b.lock().expect("log buffer").clone()).expect("utf8 logs");
         // Two overflows: warn at #1, next cadence boundary is #100 → exactly
         // one warn line containing "dropped total" in this channel's lifetime.
-        let drop_warn_lines_b = logs_b
-            .lines()
-            .filter(|l| l.contains("dropped total"))
-            .count();
+        let drop_warn_lines_b = count_lines_at(&logs_b, "WARN", "dropped total");
         assert_eq!(
             drop_warn_lines_b, 1,
             "expected exactly one drop-warn line for case (b), got {drop_warn_lines_b}: {logs_b}"
@@ -1052,10 +1112,11 @@ mod tests {
 
     #[test]
     fn warns_at_default_level_when_first_packet_is_not_connect() {
-        let sink = capture_warn_logs();
+        let sink = capture_logs();
         let mut rt = build_runtime();
         rt.block_on(async {
             let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            let peer = client.local_addr().expect("local_addr").to_string();
             tcp_write_all(&mut client, &PINGREQ)
                 .await
                 .expect("write pingreq");
@@ -1067,24 +1128,34 @@ mod tests {
                 .await
                 .expect("join timeout");
             assert!(join_res.is_err(), "expected Err, got Ok");
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert!(
+                has_line_at(
+                    &logs,
+                    "WARN",
+                    &["handshake violation: first packet was not CONNECT", &peer],
+                ),
+                "missing WARN-level violation log with reason and complete peer address on one line, got: {logs}"
+            );
+            assert!(
+                !logs.contains("handshake transport error"),
+                "a decoder rejection must not also be labelled a transport error, got: {logs}"
+            );
+            assert!(
+                !logs.contains("client disconnected during handshake"),
+                "a decoder rejection must not be labelled a routine disconnect, got: {logs}"
+            );
         });
-        let logs = String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
-        assert!(
-            logs.contains("handshake violation: first packet was not CONNECT"),
-            "missing warn-level violation log, got: {logs}"
-        );
-        assert!(
-            logs.contains("127.0.0.1:"),
-            "violation log lacks peer address, got: {logs}"
-        );
     }
 
     #[test]
     fn warns_at_default_level_when_connect_is_malformed() {
-        let sink = capture_warn_logs();
+        let sink = capture_logs();
         let mut rt = build_runtime();
         rt.block_on(async {
             let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            let peer = client.local_addr().expect("local_addr").to_string();
             tcp_write_all(&mut client, &V3_CONNECT_RESERVED_FLAG)
                 .await
                 .expect("write malformed connect");
@@ -1096,16 +1167,414 @@ mod tests {
                 .await
                 .expect("join timeout");
             assert!(join_res.is_err(), "expected Err, got Ok");
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert!(
+                has_line_at(
+                    &logs,
+                    "WARN",
+                    &["handshake violation: malformed CONNECT", &peer],
+                ),
+                "missing WARN-level malformed-CONNECT log with reason and complete peer address on one line, got: {logs}"
+            );
+            assert!(
+                !logs.contains("handshake transport error"),
+                "a decoder rejection must not also be labelled a transport error, got: {logs}"
+            );
+            assert!(
+                !logs.contains("client disconnected during handshake"),
+                "a decoder rejection must not be labelled a routine disconnect, got: {logs}"
+            );
         });
-        let logs = String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
-        assert!(
-            logs.contains("handshake violation: malformed CONNECT"),
-            "missing warn-level malformed-CONNECT log, got: {logs}"
-        );
-        assert!(
-            logs.contains("127.0.0.1:"),
-            "malformed-CONNECT log lacks peer address, got: {logs}"
-        );
+    }
+
+    /// Phase-1 transport anomaly: 8 bytes written (version cannot resolve until
+    /// the 9th byte), client then drops (FIN). monoio-codec's `decode_eof` yields
+    /// `Io(Other, "bytes remaining on stream")` — non-routine, so the arm must
+    /// warn as `"handshake transport error"` and NOT as a violation.
+    #[test]
+    fn first_read_anomaly_warns_as_transport_error_not_violation() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            let peer = client.local_addr().expect("local_addr").to_string();
+            tcp_write_all(&mut client, &V3_CONNECT_FIRST_8)
+                .await
+                .expect("write 8-byte prefix");
+            // FIN — the version-decoder's next read sees EOF mid-packet.
+            drop(client);
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Err(Error::Io(ref e)) if e.kind() == std::io::ErrorKind::Other),
+                "expected Err(Error::Io(Other)) preserving monoio-codec's decode_eof kind, got {join_res:?}"
+            );
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert!(
+                has_line_at(&logs, "WARN", &["handshake transport error", &peer]),
+                "missing WARN-level transport-error log with complete peer address on one line, got: {logs}"
+            );
+            assert!(
+                !logs.contains("handshake violation"),
+                "transport anomaly must not be labelled a handshake violation, got: {logs}"
+            );
+        });
+    }
+
+    /// Phase-1 transport routine hangup: nothing written, the read sees a
+    /// peer reset (ECONNRESET). Classified routine by `is_routine_disconnect`,
+    /// so the arm must debug-log the disconnect and emit no info-or-higher
+    /// event — regardless of message wording.
+    #[test]
+    fn first_read_reset_is_routine_and_not_a_violation() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (client, _rx, handle) = spawn_handler_test_io(
+                2,
+                30,
+                Duration::ZERO,
+                0,
+                None,
+                Some(std::io::ErrorKind::ConnectionReset),
+            )
+            .await;
+            let peer = client.local_addr().expect("local_addr").to_string();
+            drop(client);
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Err(Error::Io(ref e)) if e.kind() == std::io::ErrorKind::ConnectionReset),
+                "expected Err(Error::Io(ConnectionReset)), got {join_res:?}"
+            );
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert!(
+                has_line_at(&logs, "DEBUG", &["client disconnected during handshake", &peer]),
+                "missing DEBUG-level routine-disconnect log with complete peer address, got: {logs}"
+            );
+            // No info-or-higher event regardless of wording: handler is the only
+            // code running on this thread, so any warn/info/error line is a
+            // regression.
+            for level in ["WARN", "INFO", "ERROR"] {
+                let any = logs
+                    .lines()
+                    .any(|l| l.split_whitespace().nth(1) == Some(level));
+                assert!(
+                    !any,
+                    "routine handshake hangup emitted a {level}-level line, got: {logs}"
+                );
+            }
+        });
+    }
+
+    /// Phase-3 transport routine hangup: 9-byte prefix resolves the version,
+    /// then the CONNECT read sees a peer reset. Routine, so the arm must
+    /// debug-log and emit no info-or-higher event.
+    #[test]
+    fn connect_read_reset_is_routine_and_not_malformed() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (client, _rx, handle) = spawn_handler_test_io(
+                2,
+                30,
+                Duration::ZERO,
+                0,
+                Some(V3_CONNECT_FIRST_9.to_vec()),
+                Some(std::io::ErrorKind::ConnectionReset),
+            )
+            .await;
+            let peer = client.local_addr().expect("local_addr").to_string();
+            drop(client);
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Err(Error::Io(ref e)) if e.kind() == std::io::ErrorKind::ConnectionReset),
+                "expected Err(Error::Io(ConnectionReset)), got {join_res:?}"
+            );
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert!(
+                has_line_at(&logs, "DEBUG", &["client disconnected during handshake", &peer]),
+                "missing DEBUG-level routine-disconnect log with complete peer address, got: {logs}"
+            );
+            for level in ["WARN", "INFO", "ERROR"] {
+                let any = logs
+                    .lines()
+                    .any(|l| l.split_whitespace().nth(1) == Some(level));
+                assert!(
+                    !any,
+                    "routine CONNECT-read hangup emitted a {level}-level line, got: {logs}"
+                );
+            }
+        });
+    }
+
+    /// Phase-3 transport anomaly: 9-byte prefix resolves the version, the
+    /// CONNECT read sees `ConnectionAborted` (non-routine). Must warn as
+    /// "handshake transport error" with the peer address — never as a
+    /// violation — and preserve the kind on the returned `Error::Io`.
+    #[test]
+    fn connect_read_abort_warns_as_transport_error_not_malformed() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (client, _rx, handle) = spawn_handler_test_io(
+                2,
+                30,
+                Duration::ZERO,
+                0,
+                Some(V3_CONNECT_FIRST_9.to_vec()),
+                Some(std::io::ErrorKind::ConnectionAborted),
+            )
+            .await;
+            let peer = client.local_addr().expect("local_addr").to_string();
+            drop(client);
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Err(Error::Io(ref e)) if e.kind() == std::io::ErrorKind::ConnectionAborted),
+                "expected Err(Error::Io(ConnectionAborted)), got {join_res:?}"
+            );
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert!(
+                has_line_at(&logs, "WARN", &["handshake transport error", &peer]),
+                "missing WARN-level transport-error log with complete peer address, got: {logs}"
+            );
+            assert!(
+                !logs.contains("handshake violation"),
+                "transport anomaly must not be labelled a handshake violation, got: {logs}"
+            );
+        });
+    }
+
+    /// Phase-1 routine hangup on the OTHER routine kind: `BrokenPipe` is the
+    /// second `io::ErrorKind` `Error::is_routine_disconnect` accepts, so it must
+    /// take the same debug path as `ConnectionReset` (AC-3, AC-9) and propagate
+    /// its kind unchanged (AC-8).
+    #[test]
+    fn first_read_broken_pipe_is_routine_and_not_a_violation() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (client, _rx, handle) = spawn_handler_test_io(
+                2,
+                30,
+                Duration::ZERO,
+                0,
+                None,
+                Some(std::io::ErrorKind::BrokenPipe),
+            )
+            .await;
+            let peer = client.local_addr().expect("local_addr").to_string();
+            drop(client);
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Err(Error::Io(ref e)) if e.kind() == std::io::ErrorKind::BrokenPipe),
+                "expected Err(Error::Io(BrokenPipe)), got {join_res:?}"
+            );
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert!(
+                has_line_at(
+                    &logs,
+                    "DEBUG",
+                    &["client disconnected during handshake", &peer],
+                ),
+                "missing DEBUG-level routine-disconnect log with complete peer address, got: {logs}"
+            );
+            for level in ["WARN", "INFO", "ERROR"] {
+                let any = logs
+                    .lines()
+                    .any(|l| l.split_whitespace().nth(1) == Some(level));
+                assert!(
+                    !any,
+                    "routine handshake hangup emitted a {level}-level line, got: {logs}"
+                );
+            }
+        });
+    }
+
+    /// Phase-3 routine hangup on `BrokenPipe`: the 9-byte prefix resolves the
+    /// version, then the CONNECT read breaks. Same debug path as the reset case
+    /// (AC-6, AC-9), kind preserved (AC-8).
+    #[test]
+    fn connect_read_broken_pipe_is_routine_and_not_malformed() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (client, _rx, handle) = spawn_handler_test_io(
+                2,
+                30,
+                Duration::ZERO,
+                0,
+                Some(V3_CONNECT_FIRST_9.to_vec()),
+                Some(std::io::ErrorKind::BrokenPipe),
+            )
+            .await;
+            let peer = client.local_addr().expect("local_addr").to_string();
+            drop(client);
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Err(Error::Io(ref e)) if e.kind() == std::io::ErrorKind::BrokenPipe),
+                "expected Err(Error::Io(BrokenPipe)), got {join_res:?}"
+            );
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert!(
+                has_line_at(
+                    &logs,
+                    "DEBUG",
+                    &["client disconnected during handshake", &peer],
+                ),
+                "missing DEBUG-level routine-disconnect log with complete peer address, got: {logs}"
+            );
+            for level in ["WARN", "INFO", "ERROR"] {
+                let any = logs
+                    .lines()
+                    .any(|l| l.split_whitespace().nth(1) == Some(level));
+                assert!(
+                    !any,
+                    "routine CONNECT-read hangup emitted a {level}-level line, got: {logs}"
+                );
+            }
+        });
+    }
+
+    /// The Phase-1 split must key on the typed `DecodeError` source, never on
+    /// `io::ErrorKind`. A transport failure carrying the SAME kind the decoder
+    /// uses (`InvalidData`) but no typed source is still a transport error: an
+    /// `InvalidData`-kind heuristic would mislabel it a handshake violation.
+    #[test]
+    fn first_read_invalid_data_transport_error_is_not_a_violation() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (client, _rx, handle) = spawn_handler_test_io(
+                2,
+                30,
+                Duration::ZERO,
+                0,
+                None,
+                Some(std::io::ErrorKind::InvalidData),
+            )
+            .await;
+            let peer = client.local_addr().expect("local_addr").to_string();
+            drop(client);
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Err(Error::Io(ref e)) if e.kind() == std::io::ErrorKind::InvalidData),
+                "expected Err(Error::Io(InvalidData)), got {join_res:?}"
+            );
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert!(
+                has_line_at(&logs, "WARN", &["handshake transport error", &peer]),
+                "missing WARN-level transport-error log with complete peer address, got: {logs}"
+            );
+            assert!(
+                !logs.contains("handshake violation"),
+                "a sourceless InvalidData transport error must not be labelled a handshake violation, got: {logs}"
+            );
+        });
+    }
+
+    /// Same typed-source proof at the Phase-3 arm: `InvalidData` without a
+    /// `DecodeError` source is a transport error, not a malformed CONNECT.
+    #[test]
+    fn connect_read_invalid_data_transport_error_is_not_malformed() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (client, _rx, handle) = spawn_handler_test_io(
+                2,
+                30,
+                Duration::ZERO,
+                0,
+                Some(V3_CONNECT_FIRST_9.to_vec()),
+                Some(std::io::ErrorKind::InvalidData),
+            )
+            .await;
+            let peer = client.local_addr().expect("local_addr").to_string();
+            drop(client);
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Err(Error::Io(ref e)) if e.kind() == std::io::ErrorKind::InvalidData),
+                "expected Err(Error::Io(InvalidData)), got {join_res:?}"
+            );
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert!(
+                has_line_at(&logs, "WARN", &["handshake transport error", &peer]),
+                "missing WARN-level transport-error log with complete peer address, got: {logs}"
+            );
+            assert!(
+                !logs.contains("handshake violation"),
+                "a sourceless InvalidData transport error must not be labelled a handshake violation, got: {logs}"
+            );
+        });
+    }
+
+    /// The second decoder-rejection variant reaching the Phase-1 arm on the real
+    /// wire: protocol name "MQTX" → `DecodeError::InvalidProtocol`. It is a
+    /// decoder rejection, so it keeps the (frozen, Q4) violation warn and must
+    /// NOT be routed through the transport helper.
+    #[test]
+    fn bad_protocol_name_warns_as_violation_not_transport_error() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            let peer = client.local_addr().expect("local_addr").to_string();
+            tcp_write_all(&mut client, &V3_CONNECT_BAD_PROTOCOL_NAME)
+                .await
+                .expect("write bad protocol name");
+            let got = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(2))
+                .await
+                .expect("read to eof");
+            assert!(got.is_empty(), "expected zero response bytes, got {got:?}");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Err(Error::Io(ref e)) if e.kind() == std::io::ErrorKind::InvalidData),
+                "expected Err(Error::Io(InvalidData)) from the decoder rejection, got {join_res:?}"
+            );
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert!(
+                has_line_at(
+                    &logs,
+                    "WARN",
+                    &["handshake violation: first packet was not CONNECT", &peer],
+                ),
+                "missing WARN-level violation log with reason and complete peer address, got: {logs}"
+            );
+            assert!(
+                !logs.contains("handshake transport error"),
+                "a decoder rejection must not be labelled a transport error, got: {logs}"
+            );
+            assert!(
+                !logs.contains("client disconnected during handshake"),
+                "a decoder rejection must not be labelled a routine disconnect, got: {logs}"
+            );
+        });
     }
 
     #[test]
@@ -1495,7 +1964,7 @@ mod tests {
             let mut prefix = V3_CONNECT_TEST_KA1.to_vec();
             prefix.extend_from_slice(&PINGREQ);
             let (client, _rx, handle) =
-                spawn_handler_test_io(5, 30, Duration::from_secs(10), 1, Some(prefix)).await;
+                spawn_handler_test_io(5, 30, Duration::from_secs(10), 1, Some(prefix), None).await;
 
             // Idle deadline (1.5s) elapses mid-flush → bounded send_and_flush
             // returns Elapsed → handler returns Err(Error::Timeout).
@@ -1524,7 +1993,7 @@ mod tests {
             // 1s write delay → the CONNACK flush completes ~1s after the CONNECT
             // decode, inside the 1.5s negotiated window (ka=1).
             let (mut client, _rx, handle) =
-                spawn_handler_test_io(5, 30, Duration::from_secs(1), 0, None).await;
+                spawn_handler_test_io(5, 30, Duration::from_secs(1), 0, None, None).await;
 
             tcp_write_all(&mut client, &V3_CONNECT_FIRST_9)
                 .await
@@ -1569,7 +2038,7 @@ mod tests {
             buffered.extend_from_slice(&PUBLISH_QOS0_T);
             assert_eq!(buffered.len(), 27);
             let (mut client, mut rx, handle) =
-                spawn_handler_test_io(5, 30, Duration::from_secs(2), 0, Some(buffered)).await;
+                spawn_handler_test_io(5, 30, Duration::from_secs(2), 0, Some(buffered), None).await;
 
             let connack = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(4))
                 .await
@@ -1605,7 +2074,7 @@ mod tests {
         let mut rt = build_runtime();
         rt.block_on(async {
             let (mut client, _rx, handle) =
-                spawn_handler_test_io(5, 30, Duration::from_secs(2), 0, None).await;
+                spawn_handler_test_io(5, 30, Duration::from_secs(2), 0, None, None).await;
 
             tcp_write_all(&mut client, &V3_CONNECT_TEST_KA1)
                 .await
@@ -1645,7 +2114,7 @@ mod tests {
             buffered.push(0x30);
             assert_eq!(buffered.len(), 19);
             let (mut client, mut rx, handle) =
-                spawn_handler_test_io(5, 30, Duration::from_secs(2), 0, Some(buffered)).await;
+                spawn_handler_test_io(5, 30, Duration::from_secs(2), 0, Some(buffered), None).await;
 
             let connack = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(4))
                 .await
@@ -1682,7 +2151,7 @@ mod tests {
             // v3 ka=60 with idle_timeout_secs=2 → negotiated window is the config
             // cap (2s), not 1.5×60. The 1s write delay keeps the flush inside it.
             let (mut client, _rx, handle) =
-                spawn_handler_test_io(5, 2, Duration::from_secs(1), 0, None).await;
+                spawn_handler_test_io(5, 2, Duration::from_secs(1), 0, None, None).await;
 
             tcp_write_all(&mut client, &V3_CONNECT_FIRST_9)
                 .await
@@ -1802,7 +2271,7 @@ mod tests {
             // 3s budget consumed by a 2s fragmentation wait; the 1.5s write delay
             // then exceeds what is left, so the CONNACK never reaches the client.
             let (mut client, _rx, handle) =
-                spawn_handler_test_io(3, 30, Duration::from_millis(1500), 0, None).await;
+                spawn_handler_test_io(3, 30, Duration::from_millis(1500), 0, None, None).await;
 
             tcp_write_all(&mut client, &V3_CONNECT_FIRST_9)
                 .await

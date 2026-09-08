@@ -35,7 +35,7 @@ impl Decoder for VersionDecoder {
         match TokioDecoder::decode(&mut self.inner, src) {
             Ok(Some(version)) => Ok(Decoded::Some(version)),
             Ok(None) => Ok(Decoded::Insufficient),
-            Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
+            Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
         }
     }
 }
@@ -144,5 +144,48 @@ mod tests {
 
         assert!(v3_str.contains("MQTT3"));
         assert!(v5_str.contains("MQTT5"));
+    }
+
+    #[test]
+    fn rejected_first_byte_error_carries_typed_decode_error_source() {
+        let mut decoder = VersionDecoder::new();
+        let mut buf = BytesMut::from(&[0xC0_u8, 0x00][..]);
+
+        let err = MonoioDecoder::decode(&mut decoder, &mut buf).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let source = err
+            .get_ref()
+            .and_then(|s| s.downcast_ref::<rmqtt_codec::error::DecodeError>());
+        assert!(
+            matches!(
+                source,
+                Some(rmqtt_codec::error::DecodeError::UnsupportedPacketType)
+            ),
+            "expected originating UnsupportedPacketType variant, got {source:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_protocol_name_error_carries_invalid_protocol_source() {
+        let mut decoder = VersionDecoder::new();
+        let mut buf = BytesMut::from(
+            &[
+                0x10_u8, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'X', 0x04, 0x00, 0x00, 0x3C, 0x00,
+                0x04, b't', b'e', b's', b't',
+            ][..],
+        );
+
+        let err = MonoioDecoder::decode(&mut decoder, &mut buf).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let source = err
+            .get_ref()
+            .and_then(|s| s.downcast_ref::<rmqtt_codec::error::DecodeError>());
+        assert!(
+            matches!(
+                source,
+                Some(rmqtt_codec::error::DecodeError::InvalidProtocol)
+            ),
+            "expected originating InvalidProtocol variant, got {source:?}"
+        );
     }
 }
