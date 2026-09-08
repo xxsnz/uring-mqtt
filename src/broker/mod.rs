@@ -5,6 +5,11 @@ pub(crate) mod worker;
 use crate::error::Error;
 use std::sync::Arc;
 
+/// Default `drain_timeout_secs` for `BrokerConfig::new`. Five seconds gives
+/// active clients time to disconnect cleanly while bounding the worker's
+/// teardown window.
+pub(crate) const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 5;
+
 /// Configuration for the MQTT broker.
 #[derive(Clone)]
 pub struct BrokerConfig {
@@ -16,6 +21,9 @@ pub struct BrokerConfig {
     pub connection_timeout_secs: u64,
     /// Idle timeout in seconds
     pub idle_timeout_secs: u64,
+    /// Grace period in seconds for draining active connections after shutdown
+    /// is signaled; stragglers are force-closed when it expires.
+    pub drain_timeout_secs: u64,
     /// Number of worker threads (defaults to CPU count)
     pub num_workers: Option<usize>,
     /// TCP listen backlog
@@ -29,6 +37,7 @@ impl BrokerConfig {
             max_connections_per_worker: 1000,
             connection_timeout_secs: 10,
             idle_timeout_secs: 300,
+            drain_timeout_secs: DEFAULT_DRAIN_TIMEOUT_SECS,
             num_workers: None,
             backlog: 1024,
         }
@@ -46,6 +55,11 @@ impl BrokerConfig {
 
     pub fn idle_timeout_secs(mut self, secs: u64) -> Self {
         self.idle_timeout_secs = secs;
+        self
+    }
+
+    pub fn drain_timeout_secs(mut self, secs: u64) -> Self {
+        self.drain_timeout_secs = secs;
         self
     }
 
@@ -76,34 +90,125 @@ pub enum Event {
 /// Callback type for handling events per worker.
 pub type EventCallback = Arc<dyn Fn(Event) + Send + Sync>;
 
+/// Cloneable cross-thread shutdown trigger. Signal = take + drop the
+/// main-side socketpair ends (EOF is the level-persistent wake).
+///
+/// One-shot and per broker instance: after the first [`shutdown`](Self::shutdown)
+/// every clone is a permanent no-op. A restarted server needs its own
+/// handle, and process-global signal handlers must be re-targeted by the
+/// embedder.
+#[derive(Clone)]
+pub struct ShutdownHandle {
+    signal_ends: std::sync::Arc<std::sync::Mutex<Option<Vec<std::os::unix::net::UnixStream>>>>,
+}
+
+impl ShutdownHandle {
+    /// Signal shutdown to every worker owned by the parent broker. Idempotent:
+    /// subsequent calls (same handle, any clone, any thread, concurrent or
+    /// not) are no-ops.
+    pub fn shutdown(&self) {
+        let taken = self
+            .signal_ends
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        // Guard's scope ends here — drop happens before the ends are dropped,
+        // so no concurrent lock holder can re-observe the Option.
+        if taken.is_some() {
+            tracing::info!("shutdown signaled to workers");
+        }
+        drop(taken);
+    }
+}
+
+/// Running ingest server. Returned only after startup succeeded; owns the
+/// worker lifecycle through shutdown. Send. NOT Clone.
+pub struct BrokerHandle {
+    trigger: ShutdownHandle,
+    handles: Vec<std::thread::JoinHandle<Result<(), Error>>>,
+}
+
+impl BrokerHandle {
+    /// Clone the shutdown trigger so another thread (e.g. a signal-handler
+    /// caller) can request shutdown independently of this handle.
+    pub fn shutdown_handle(&self) -> ShutdownHandle {
+        self.trigger.clone()
+    }
+
+    /// Convenience: trigger shutdown via this handle's own trigger. Idempotent.
+    pub fn shutdown(&self) {
+        self.trigger.shutdown();
+    }
+
+    /// Wait for every worker thread to exit, aggregating their terminal
+    /// results. Does NOT itself signal shutdown — call [`shutdown`](Self::shutdown)
+    /// (or drop the handle) first if the embedder wants the workers to stop.
+    ///
+    /// The first worker error wins; a thread panic surfaces as
+    /// [`Error::Worker("worker thread panicked".into())`].
+    ///
+    /// # Panics
+    /// Panics if invoked from inside a worker thread or from within an event
+    /// callback on a worker thread — the call would self-join.
+    pub fn join(mut self) -> Result<(), Error> {
+        let mut worker_err: Option<Error> = None;
+        for handle in self.handles.drain(..) {
+            match handle.join() {
+                Err(_) => {
+                    tracing::error!("Worker thread panicked");
+                    worker_err =
+                        worker_err.or(Some(Error::Worker("worker thread panicked".into())));
+                }
+                Ok(Err(e)) => worker_err = worker_err.or(Some(e)),
+                Ok(Ok(())) => {}
+            }
+        }
+        worker_err.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for BrokerHandle {
+    /// Signal shutdown and join every remaining worker. Results are logged
+    /// at warn and discarded — the handle has already been moved out of by
+    /// the time an embedder could observe them. Blocks up to the drain
+    /// deadline plus scheduling slack.
+    fn drop(&mut self) {
+        self.trigger.shutdown();
+        for handle in self.handles.drain(..) {
+            match handle.join() {
+                Err(_) => tracing::warn!("BrokerHandle::drop: worker thread panicked"),
+                Ok(Err(e)) => tracing::warn!("BrokerHandle::drop: worker returned error: {e}"),
+                Ok(Ok(())) => {}
+            }
+        }
+    }
+}
+
 /// High-performance MQTT broker using Monoio io_uring runtime.
 pub struct MqttBroker;
 
 impl MqttBroker {
-    /// Run the MQTT broker with the given configuration.
-    ///
-    /// This function spawns one worker thread per CPU core (or as configured),
-    /// each with its own io_uring event loop. Connections are distributed
-    /// across workers via SO_REUSEPORT.
-    ///
-    /// # Arguments
-    /// * `config` - Broker configuration
-    ///
-    /// # Returns
-    /// Returns when all workers have exited (typically never in normal operation)
-    pub fn run(config: BrokerConfig) -> Result<(), Error> {
-        Self::run_with_callback(config, None)
+    /// Start the MQTT ingest server. Returns once every worker has passed
+    /// its startup barrier (runtime built, listener bound, state spawned) or
+    /// an `Err` if any worker failed startup — the first error wins and the
+    /// preserved join-and-return path is followed before the error escapes.
+    pub fn start(config: BrokerConfig) -> Result<BrokerHandle, Error> {
+        Self::start_with_callback(config, None)
     }
 
-    /// Run the MQTT broker with an event callback.
+    /// Start the MQTT ingest server with an optional event callback.
     ///
-    /// # Arguments
-    /// * `config` - Broker configuration
-    /// * `callback` - Optional callback invoked for each event (called from worker thread)
-    pub fn run_with_callback(
+    /// # Callback contract
+    /// The callback runs on worker threads. It must return promptly: blocking
+    /// stalls that worker's event processing AND its shutdown. A panic inside
+    /// the callback unwinds the worker thread (monoio's task harness does not
+    /// catch it) and surfaces from [`BrokerHandle::join`] as
+    /// [`Error::Worker(_)`]. Never call [`BrokerHandle::join`] or drop a
+    /// [`BrokerHandle`] from inside an event callback.
+    pub fn start_with_callback(
         config: BrokerConfig,
         callback: Option<EventCallback>,
-    ) -> Result<(), Error> {
+    ) -> Result<BrokerHandle, Error> {
         let num_workers = config.num_workers.unwrap_or_else(|| {
             std::thread::available_parallelism().map_or(4, std::num::NonZero::get)
         });
@@ -118,6 +223,20 @@ impl MqttBroker {
             num_workers
         );
 
+        // Create all per-worker shutdown socketpairs before any thread exists,
+        // so a `?` here is clean (no in-flight workers to join on failure).
+        // The worker-end moves into the worker thread; the main-end stays on
+        // this thread and is owned by the returned `BrokerHandle` until it
+        // signals shutdown (the handle's `Drop` calls `shutdown` on drop).
+        let mut worker_ends = Vec::with_capacity(num_workers);
+        let mut signal_ends = Vec::with_capacity(num_workers);
+        for _ in 0..num_workers {
+            let (main_end, worker_end) =
+                std::os::unix::net::UnixStream::pair().map_err(Error::Io)?;
+            signal_ends.push(main_end);
+            worker_ends.push(worker_end);
+        }
+
         // Startup barrier: every worker's fallible setup (runtime build, bind,
         // state/channel/processor spawn) completes before we fan out go/abort.
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -131,6 +250,7 @@ impl MqttBroker {
             let (go_tx, go_rx) = std::sync::mpsc::channel();
             go_txs.push(go_tx);
             let ready_tx = ready_tx.clone();
+            let worker_end = worker_ends.remove(0);
 
             match std::thread::Builder::new()
                 .name(format!("mqtt-worker-{worker_id}"))
@@ -151,7 +271,7 @@ impl MqttBroker {
                         }
                     };
                     runtime.block_on(worker::run_worker(
-                        worker_id, config, callback, ready_tx, go_rx,
+                        worker_id, config, callback, ready_tx, go_rx, worker_end,
                     ))
                 }) {
                 Ok(h) => handles.push(h),
@@ -181,19 +301,37 @@ impl MqttBroker {
             return Err(e);
         }
 
-        let mut worker_err: Option<Error> = None;
-        for handle in handles {
-            match handle.join() {
-                Err(_) => {
-                    tracing::error!("Worker thread panicked");
-                    worker_err =
-                        worker_err.or(Some(Error::Worker("worker thread panicked".into())));
-                }
-                Ok(Err(e)) => worker_err = worker_err.or(Some(e)),
-                Ok(Ok(())) => {}
-            }
-        }
-        worker_err.map_or(Ok(()), Err)
+        Ok(BrokerHandle {
+            trigger: ShutdownHandle {
+                signal_ends: std::sync::Arc::new(std::sync::Mutex::new(Some(signal_ends))),
+            },
+            handles,
+        })
+    }
+
+    /// Run the MQTT broker with the given configuration. Equivalent to
+    /// `start(config)?.join()` — blocks until every worker exits.
+    ///
+    /// # Arguments
+    /// * `config` - Broker configuration
+    ///
+    /// # Returns
+    /// Returns when all workers have exited (typically never in normal operation)
+    pub fn run(config: BrokerConfig) -> Result<(), Error> {
+        Self::run_with_callback(config, None)
+    }
+
+    /// Run the MQTT broker with an event callback. Equivalent to
+    /// `start_with_callback(config, callback)?.join()`.
+    ///
+    /// # Arguments
+    /// * `config` - Broker configuration
+    /// * `callback` - Optional callback invoked for each event (called from worker thread)
+    pub fn run_with_callback(
+        config: BrokerConfig,
+        callback: Option<EventCallback>,
+    ) -> Result<(), Error> {
+        Self::start_with_callback(config, callback)?.join()
     }
 }
 
@@ -243,7 +381,7 @@ fn supervise_startup(
 mod tests {
     use super::*;
     use std::io::{Read, Write};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     /// Bind a std listener to an ephemeral port and return the port. Single
     /// attempt only — the tiny race against another process grabbing the port
@@ -284,6 +422,7 @@ mod tests {
         assert_eq!(config.max_connections_per_worker, 1000);
         assert_eq!(config.connection_timeout_secs, 10);
         assert_eq!(config.idle_timeout_secs, 300);
+        assert_eq!(config.drain_timeout_secs, 5);
         assert!(config.num_workers.is_none());
         assert_eq!(config.backlog, 1024);
     }
@@ -301,12 +440,14 @@ mod tests {
             .max_connections_per_worker(500)
             .connection_timeout_secs(5)
             .idle_timeout_secs(120)
+            .drain_timeout_secs(20)
             .num_workers(4)
             .backlog(512);
 
         assert_eq!(config.max_connections_per_worker, 500);
         assert_eq!(config.connection_timeout_secs, 5);
         assert_eq!(config.idle_timeout_secs, 120);
+        assert_eq!(config.drain_timeout_secs, 20);
         assert_eq!(config.num_workers, Some(4));
         assert_eq!(config.backlog, 512);
     }
@@ -660,5 +801,604 @@ mod tests {
         assert_eq!(go1_rx.try_recv(), Ok(false));
         assert_eq!(go2_rx.try_recv(), Ok(false));
         assert_eq!(go3_rx.try_recv(), Ok(false));
+    }
+
+    // ─────────────────── T3 public-API lifecycle tests ───────────────────
+    //
+    // Every test below runs its WHOLE handle-owning body — `start`, client
+    // sockets, assertions, `join`/`drop` — inside ONE spawned harness thread
+    // that sends its outcome over a channel. The outer test only does
+    // `recv_timeout` (10–15s) and asserts on the received outcome. A panic
+    // inside the harness thread disconnects the channel and fails the outer
+    // `recv_timeout` bounded, so an assert-unwind reaching a blocking `Drop`
+    // can never hang the suite. The outer thread never owns a `BrokerHandle`.
+    // Every client socket read sets a read timeout first.
+
+    /// AC-5 — once `MqttBroker::start` returns `Ok`, a client must complete
+    /// CONNECT → CONNACK on the first connect attempt (no retry loop).
+    #[test]
+    fn client_connects_without_retry_after_start_returns() {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), Error>>();
+        let _h = std::thread::Builder::new()
+            .name("t3-ac5-start-returns".into())
+            .spawn(move || {
+                let outcome = (|| -> Result<(), Error> {
+                    let port = find_free_port();
+                    let addr_str = format!("127.0.0.1:{port}");
+                    let addr: std::net::SocketAddr = addr_str.parse().expect("parse addr");
+                    let config = BrokerConfig::new(addr_str).num_workers(1);
+
+                    let handle = MqttBroker::start(config)?;
+                    // SINGLE connect attempt — no retry loop.
+                    let mut client =
+                        std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+                            .map_err(Error::Io)?;
+                    client
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .map_err(Error::Io)?;
+                    client.write_all(&V3_CONNECT_TEST).map_err(Error::Io)?;
+                    let mut connack = [0u8; 4];
+                    client.read_exact(&mut connack).map_err(Error::Io)?;
+                    assert_eq!(connack, [0x20, 0x02, 0x00, 0x00]);
+                    drop(client);
+
+                    handle.shutdown();
+                    handle.join()
+                })();
+                let _ = tx.send(outcome);
+            })
+            .expect("spawn harness");
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Ok(())) => {}
+            other => panic!("expected Ok(()) from harness, got {other:?}"),
+        }
+    }
+
+    /// AC-2 — `BrokerHandle::join` returns no earlier than drain completes
+    /// and no later than `drain_timeout_secs` plus scheduling slack. A held
+    /// connection pins the drain to the full 1s deadline; the lower bound
+    /// defeats a detaching `join` (which would return instantly).
+    #[test]
+    fn shutdown_then_join_returns_within_drain_deadline() {
+        let (tx, rx) =
+            std::sync::mpsc::channel::<(Result<(), Error>, Duration, std::io::Result<usize>)>();
+        let _h = std::thread::Builder::new()
+            .name("t3-ac2-shutdown-join-deadline".into())
+            .spawn(move || {
+                let outcome = (|| -> Result<(), Error> {
+                    let port = find_free_port();
+                    let addr_str = format!("127.0.0.1:{port}");
+                    let addr: std::net::SocketAddr = addr_str.parse().expect("parse addr");
+                    let config = BrokerConfig::new(addr_str)
+                        .drain_timeout_secs(1)
+                        .num_workers(1);
+
+                    let handle = MqttBroker::start(config)?;
+
+                    let mut client =
+                        std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+                            .map_err(Error::Io)?;
+                    client
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .map_err(Error::Io)?;
+                    client.write_all(&V3_CONNECT_TEST).map_err(Error::Io)?;
+                    let mut connack = [0u8; 4];
+                    client.read_exact(&mut connack).map_err(Error::Io)?;
+                    assert_eq!(connack, [0x20, 0x02, 0x00, 0x00]);
+
+                    // Clock started BEFORE the shutdown signal so descheduling
+                    // cannot fake a lower-bound failure.
+                    let t0 = Instant::now();
+                    handle.shutdown();
+                    let join_result = handle.join();
+                    let dt = t0.elapsed();
+
+                    // Now read with a 2s timeout — a still-open connection
+                    // proves the worker force-closed it after the drain
+                    // deadline expired.
+                    client
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .map_err(Error::Io)?;
+                    let mut tail = [0u8; 1];
+                    let read_outcome = client.read(&mut tail);
+
+                    let _ = tx.send((join_result, dt, read_outcome));
+                    Ok(())
+                })();
+                if outcome.is_err() {
+                    // Send a sentinel so the outer recv_timeout doesn't block.
+                    let _ = tx.send((
+                        Err(Error::Worker("harness setup failed".into())),
+                        Duration::ZERO,
+                        Err(std::io::Error::other("harness setup failed")),
+                    ));
+                }
+            })
+            .expect("spawn harness");
+        let Ok((join_result, dt, read_outcome)) = rx.recv_timeout(Duration::from_secs(15)) else {
+            panic!("harness did not report within 15s")
+        };
+        match join_result {
+            Ok(()) => {}
+            Err(e) => panic!("join returned Err: {e}"),
+        }
+        assert!(
+            dt >= Duration::from_millis(900),
+            "join returned too fast ({dt:?}); a detaching join or instant drop would fail this bound"
+        );
+        assert!(
+            dt <= Duration::from_secs(4),
+            "join returned too slow ({dt:?}); upper bound is 4s with 3s slack"
+        );
+        match read_outcome {
+            Ok(0) => {} // EOF — force-closed
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+                ) => {}
+            other => {
+                panic!("held client did not observe EOF/reset within bounded window: {other:?}")
+            }
+        }
+    }
+
+    /// AC-6 — bind collision on any worker yields `Err(Error::Io(AddrInUse))`.
+    /// Occupier pattern (mirrors `run_returns_err_when_bind_fails`); the
+    /// bounded harness-thread `recv_timeout` is the join-on-error-path guard.
+    #[test]
+    fn start_returns_err_when_bind_fails() {
+        let port = find_free_port();
+        let addr = format!("127.0.0.1:{port}");
+        let occupier = std::net::TcpListener::bind(&addr).expect("std bind");
+
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), Error>>();
+        let config = BrokerConfig::new(addr).num_workers(2);
+        let _h = std::thread::Builder::new()
+            .name("t3-ac6-start-bind-fails".into())
+            .spawn(move || {
+                // An unexpected `Ok` handle is dropped HERE, inside the
+                // harness thread — the outcome crossing the channel is
+                // handle-free, so a blocking `Drop` can never run on the
+                // test thread after `recv_timeout` returned.
+                let outcome = match MqttBroker::start(config) {
+                    Ok(handle) => {
+                        drop(handle);
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                };
+                let _ = tx.send(outcome);
+            })
+            .expect("spawn harness");
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Err(Error::Io(ref e))) if e.kind() == std::io::ErrorKind::AddrInUse => {}
+            Ok(Err(other)) => panic!("expected Err(Io(AddrInUse)), got Err({other:?})"),
+            Ok(Ok(())) => {
+                panic!("expected Err(Io(AddrInUse)), got Ok(_) — handle dropped inside harness")
+            }
+            _ => panic!("harness did not report within 10s"),
+        }
+        drop(occupier);
+    }
+
+    /// AC-7 — repeated `shutdown` on the same handle, on clones, and on
+    /// concurrent threads is a no-op (no panic, no error, no second effect).
+    #[test]
+    fn repeated_and_concurrent_shutdown_calls_are_noops() {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), Error>>();
+        let _h = std::thread::Builder::new()
+            .name("t3-ac7-repeated-shutdown".into())
+            .spawn(move || {
+                let outcome = (|| -> Result<(), Error> {
+                    let port = find_free_port();
+                    let addr_str = format!("127.0.0.1:{port}");
+                    let config = BrokerConfig::new(addr_str).num_workers(1);
+
+                    let handle = MqttBroker::start(config)?;
+
+                    let trig1 = handle.shutdown_handle();
+                    let trig2 = handle.shutdown_handle();
+
+                    // Two std threads call `.shutdown()` simultaneously on
+                    // different clones.
+                    let t1 = std::thread::spawn(move || trig1.shutdown());
+                    let t2 = std::thread::spawn(move || trig2.shutdown());
+                    t1.join().expect("thread 1 join");
+                    t2.join().expect("thread 2 join");
+
+                    // A third call on the handle's own trigger after the first
+                    // two fired is also a no-op.
+                    handle.shutdown();
+
+                    handle.join()
+                })();
+                let _ = tx.send(outcome);
+            })
+            .expect("spawn harness");
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Ok(())) => {}
+            other => panic!("expected Ok(()) from harness, got {other:?}"),
+        }
+    }
+
+    /// AC-8 — dropping a `BrokerHandle` signals shutdown, joins every worker
+    /// before returning, and frees the port for an immediate restart. The
+    /// lower bound defeats a fast-drop-detach; the upper bound catches a
+    /// hang. The held client's read after drop proves the force-close
+    /// completed (EOF/reset, not a timeout).
+    #[test]
+    fn dropping_handle_shuts_server_down_and_allows_restart() {
+        let (tx, rx) =
+            std::sync::mpsc::channel::<(Duration, std::io::Result<usize>, Result<(), Error>)>();
+        let _h = std::thread::Builder::new()
+            .name("t3-ac8-drop-restart".into())
+            .spawn(move || {
+                let outcome = (|| -> Result<(), Error> {
+                    let port = find_free_port();
+                    let addr_str = format!("127.0.0.1:{port}");
+                    let addr: std::net::SocketAddr = addr_str.parse().expect("parse addr");
+                    let config = BrokerConfig::new(addr_str)
+                        .drain_timeout_secs(1)
+                        .num_workers(1);
+
+                    let handle = MqttBroker::start(config.clone())?;
+
+                    let mut client =
+                        std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+                            .map_err(Error::Io)?;
+                    client
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .map_err(Error::Io)?;
+                    client.write_all(&V3_CONNECT_TEST).map_err(Error::Io)?;
+                    let mut connack = [0u8; 4];
+                    client.read_exact(&mut connack).map_err(Error::Io)?;
+                    assert_eq!(connack, [0x20, 0x02, 0x00, 0x00]);
+
+                    let t0 = Instant::now();
+                    drop(handle);
+                    let dt = t0.elapsed();
+
+                    client
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .map_err(Error::Io)?;
+                    let mut tail = [0u8; 1];
+                    let read_outcome = client.read(&mut tail);
+                    drop(client);
+
+                    // Restart on the SAME port (production listeners use
+                    // reuse_addr + reuse_port — a plain std rebind would
+                    // false-fail on post-close TCP states).
+                    let restart_handle = MqttBroker::start(config)?;
+                    let mut restart_client =
+                        std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+                            .map_err(Error::Io)?;
+                    restart_client
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .map_err(Error::Io)?;
+                    restart_client
+                        .write_all(&V3_CONNECT_TEST)
+                        .map_err(Error::Io)?;
+                    let mut restart_connack = [0u8; 4];
+                    restart_client
+                        .read_exact(&mut restart_connack)
+                        .map_err(Error::Io)?;
+                    assert_eq!(restart_connack, [0x20, 0x02, 0x00, 0x00]);
+                    drop(restart_client);
+                    restart_handle.shutdown();
+                    let restart_result = restart_handle.join();
+
+                    let _ = tx.send((dt, read_outcome, restart_result));
+                    Ok(())
+                })();
+                if outcome.is_err() {
+                    let _ = tx.send((
+                        Duration::ZERO,
+                        Err(std::io::Error::other("harness setup failed")),
+                        Err(Error::Worker("harness setup failed".into())),
+                    ));
+                }
+            })
+            .expect("spawn harness");
+        let Ok((dt, read_outcome, restart_result)) = rx.recv_timeout(Duration::from_secs(15))
+        else {
+            panic!("harness did not report within 15s")
+        };
+        assert!(
+            dt >= Duration::from_millis(900),
+            "Drop returned too fast ({dt:?}); a no-op Drop would fail this bound"
+        );
+        assert!(
+            dt <= Duration::from_secs(4),
+            "Drop returned too slow ({dt:?}); upper bound is 4s with 3s slack"
+        );
+        match read_outcome {
+            Ok(0) => {} // EOF — force-closed
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+                ) => {}
+            other => {
+                panic!("held client did not observe EOF/reset within bounded window: {other:?}")
+            }
+        }
+        match restart_result {
+            Ok(()) => {}
+            Err(e) => panic!("restarted broker's join returned Err: {e}"),
+        }
+    }
+
+    /// AC-11 — a callback that panics unwinds the worker thread; `join`
+    /// surfaces it as `Error::Worker(_)`.
+    #[test]
+    fn callback_panic_surfaces_as_join_error() {
+        let port = find_free_port();
+        let addr_str = format!("127.0.0.1:{port}");
+        let addr: std::net::SocketAddr = addr_str.parse().expect("parse addr");
+        let config = BrokerConfig::new(addr_str).num_workers(1);
+        let cb: EventCallback = std::sync::Arc::new(|_event: Event| {
+            panic!("test callback panic");
+        });
+
+        // The outer `Result` separates setup failure (`Err(String)`) from the
+        // `join` result under test (`Ok(_)`): a startup or client-setup failure
+        // must never be readable as successful panic-propagation coverage.
+        let (tx, rx) = std::sync::mpsc::channel::<Result<Result<(), Error>, String>>();
+        let _h = std::thread::Builder::new()
+            .name("t3-ac11-callback-panic".into())
+            .spawn(move || {
+                let outcome = (|| -> Result<Result<(), Error>, String> {
+                    let handle = MqttBroker::start_with_callback(config, Some(cb))
+                        .map_err(|e| format!("startup failed before the callback ran: {e}"))?;
+
+                    let mut client =
+                        std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+                            .map_err(|e| format!("client connect failed: {e}"))?;
+                    client
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .map_err(|e| format!("set_read_timeout failed: {e}"))?;
+                    client
+                        .write_all(&V3_CONNECT_TEST)
+                        .map_err(|e| format!("CONNECT write failed: {e}"))?;
+                    let mut connack = [0u8; 4];
+                    client
+                        .read_exact(&mut connack)
+                        .map_err(|e| format!("CONNACK read failed: {e}"))?;
+                    assert_eq!(connack, [0x20, 0x02, 0x00, 0x00]);
+
+                    // Write a PUBLISH — the worker decodes it, invokes the
+                    // callback, the callback panics, the worker thread unwinds.
+                    let publish: [u8; 9] = [0x30, 0x07, 0x00, 0x01, b't', 0x09, 0xC4, 0x03, 0xF5];
+                    client
+                        .write_all(&publish)
+                        .map_err(|e| format!("PUBLISH write failed: {e}"))?;
+
+                    // Shutdown is harmless on a dead worker — the EOF signal
+                    // is a no-op once the worker is gone.
+                    handle.shutdown();
+                    Ok(handle.join())
+                })();
+                let _ = tx.send(outcome);
+            })
+            .expect("spawn harness");
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Ok(Err(Error::Worker(_)))) => {}
+            other => panic!("expected Ok(Err(Worker(_))) from harness, got {other:?}"),
+        }
+    }
+
+    /// The lifecycle types are part of the crate-root surface an embedder
+    /// writes against (`uring_mqtt::BrokerHandle`), and the thread-safety
+    /// bounds are load-bearing: `ShutdownHandle` is cloned into a signal
+    /// handler (`Send + 'static`) and triggered from any thread, and
+    /// `BrokerHandle` moves to whichever thread joins it. Dropping either
+    /// re-export or either auto-trait breaks embedders at compile time —
+    /// nothing else in the suite names these paths.
+    #[test]
+    fn lifecycle_types_are_re_exported_and_thread_safe() {
+        const fn assert_send<T: Send>() {}
+        const fn assert_send_sync_clone<T: Send + Sync + Clone>() {}
+
+        assert_send::<crate::BrokerHandle>();
+        assert_send_sync_clone::<crate::ShutdownHandle>();
+
+        let start: fn(crate::BrokerConfig) -> Result<crate::BrokerHandle, Error> =
+            crate::MqttBroker::start;
+        let _ = start;
+    }
+
+    /// AC-2 upper half — with NO active connections the drain completes on
+    /// the first `recv` (every done-sender is already gone), so `join` must
+    /// return promptly rather than sitting out `drain_timeout_secs`. The 30s
+    /// deadline against a 5s bound fails any implementation that always waits
+    /// for the timer.
+    #[test]
+    fn shutdown_with_no_connections_returns_well_before_the_deadline() {
+        let (tx, rx) = std::sync::mpsc::channel::<(Result<(), Error>, Duration)>();
+        let _h = std::thread::Builder::new()
+            .name("t3-ac2-empty-drain".into())
+            .spawn(move || {
+                let outcome = (|| -> Result<(), Error> {
+                    let port = find_free_port();
+                    let addr_str = format!("127.0.0.1:{port}");
+                    let config = BrokerConfig::new(addr_str)
+                        .drain_timeout_secs(30)
+                        .num_workers(1);
+
+                    let handle = MqttBroker::start(config)?;
+
+                    let t0 = Instant::now();
+                    handle.shutdown();
+                    let join_result = handle.join();
+                    let dt = t0.elapsed();
+
+                    let _ = tx.send((join_result, dt));
+                    Ok(())
+                })();
+                if outcome.is_err() {
+                    // Sentinel: an Err result AND a duration past every bound.
+                    let _ = tx.send((
+                        Err(Error::Worker("harness setup failed".into())),
+                        Duration::from_secs(3600),
+                    ));
+                }
+            })
+            .expect("spawn harness");
+        let Ok((join_result, dt)) = rx.recv_timeout(Duration::from_secs(15)) else {
+            panic!("harness did not report within 15s")
+        };
+        match join_result {
+            Ok(()) => {}
+            Err(e) => panic!("join returned Err: {e}"),
+        }
+        assert!(
+            dt <= Duration::from_secs(5),
+            "empty drain took {dt:?}; the worker waited out the 30s deadline \
+             instead of returning on the immediately-closed done-channel"
+        );
+    }
+
+    /// AC-1 + AC-2 across the worker fan-out — one signal must reach EVERY
+    /// worker. Three SO_REUSEPORT co-bound workers, one held client pinning a
+    /// single worker's drain to the full 1s deadline: `join` returns bounded,
+    /// and afterwards no listener survives (a fresh connect is refused within
+    /// the teardown window). A signal delivered to only the first worker
+    /// leaves a live listener and fails the refusal probe.
+    #[test]
+    fn every_worker_shuts_down_in_a_multi_worker_server() {
+        let (tx, rx) = std::sync::mpsc::channel::<(Result<(), Error>, Duration, bool)>();
+        let _h = std::thread::Builder::new()
+            .name("t3-ac1-multi-worker-shutdown".into())
+            .spawn(move || {
+                let outcome = (|| -> Result<(), Error> {
+                    let port = find_free_port();
+                    let addr_str = format!("127.0.0.1:{port}");
+                    let addr: std::net::SocketAddr = addr_str.parse().expect("parse addr");
+                    let config = BrokerConfig::new(addr_str)
+                        .drain_timeout_secs(1)
+                        .num_workers(3);
+
+                    let handle = MqttBroker::start(config)?;
+
+                    let mut client =
+                        std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+                            .map_err(Error::Io)?;
+                    client
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .map_err(Error::Io)?;
+                    client.write_all(&V3_CONNECT_TEST).map_err(Error::Io)?;
+                    let mut connack = [0u8; 4];
+                    client.read_exact(&mut connack).map_err(Error::Io)?;
+                    assert_eq!(connack, [0x20, 0x02, 0x00, 0x00]);
+
+                    let t0 = Instant::now();
+                    handle.shutdown();
+                    let join_result = handle.join();
+                    let dt = t0.elapsed();
+                    drop(client);
+
+                    // No listener may survive on any worker: monoio defers the
+                    // fd close, so allow a bounded teardown window.
+                    let mut all_gone = false;
+                    for _ in 0..20 {
+                        if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(50))
+                            .is_err()
+                        {
+                            all_gone = true;
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+
+                    let _ = tx.send((join_result, dt, all_gone));
+                    Ok(())
+                })();
+                if outcome.is_err() {
+                    let _ = tx.send((
+                        Err(Error::Worker("harness setup failed".into())),
+                        Duration::ZERO,
+                        false,
+                    ));
+                }
+            })
+            .expect("spawn harness");
+        let Ok((join_result, dt, all_gone)) = rx.recv_timeout(Duration::from_secs(15)) else {
+            panic!("harness did not report within 15s")
+        };
+        match join_result {
+            Ok(()) => {}
+            Err(e) => panic!("join returned Err: {e}"),
+        }
+        assert!(
+            dt >= Duration::from_millis(900),
+            "join returned too fast ({dt:?}); the held client pins one worker's \
+             drain to the full 1s deadline"
+        );
+        assert!(
+            dt <= Duration::from_secs(4),
+            "join returned too slow ({dt:?}); upper bound is 4s with 3s slack"
+        );
+        assert!(
+            all_gone,
+            "a listener survived shutdown — the signal did not reach every worker"
+        );
+    }
+
+    /// AC-7 strengthened — the trigger clones rendezvous on a barrier so the
+    /// two `shutdown()` calls genuinely overlap (spawning two threads alone
+    /// lets the first finish before the second starts), and a clone that
+    /// OUTLIVES the broker stays a permanent no-op instead of panicking on a
+    /// server whose workers are already gone.
+    #[test]
+    fn barrier_synced_and_post_join_shutdown_calls_are_noops() {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), Error>>();
+        let _h = std::thread::Builder::new()
+            .name("t3-ac7-barrier-shutdown".into())
+            .spawn(move || {
+                let outcome = (|| -> Result<(), Error> {
+                    let port = find_free_port();
+                    let addr_str = format!("127.0.0.1:{port}");
+                    let config = BrokerConfig::new(addr_str).num_workers(1);
+
+                    let handle = MqttBroker::start(config)?;
+
+                    let trig1 = handle.shutdown_handle();
+                    let trig2 = handle.shutdown_handle();
+                    // Taken before shutdown, used after the broker is gone.
+                    let survivor = handle.shutdown_handle();
+
+                    // Rendezvous: both triggers enter `shutdown()` together.
+                    let barrier = Arc::new(std::sync::Barrier::new(3));
+                    let b1 = barrier.clone();
+                    let b2 = barrier.clone();
+                    let t1 = std::thread::spawn(move || {
+                        b1.wait();
+                        trig1.shutdown();
+                    });
+                    let t2 = std::thread::spawn(move || {
+                        b2.wait();
+                        trig2.shutdown();
+                    });
+                    barrier.wait();
+                    t1.join().expect("thread 1 join");
+                    t2.join().expect("thread 2 join");
+
+                    let join_result = handle.join();
+
+                    // The stale clone must be inert now that every worker and
+                    // the owning handle are gone.
+                    survivor.shutdown();
+                    survivor.shutdown();
+
+                    join_result
+                })();
+                let _ = tx.send(outcome);
+            })
+            .expect("spawn harness");
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Ok(())) => {}
+            other => panic!("expected Ok(()) from harness, got {other:?}"),
+        }
     }
 }

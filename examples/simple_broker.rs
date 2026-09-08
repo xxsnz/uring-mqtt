@@ -40,8 +40,6 @@ fn main() -> Result<(), uring_mqtt::Error> {
         .idle_timeout_secs(300);
 
     tracing::info!("Starting MQTT broker on 0.0.0.0:1883");
-    tracing::info!("Press Ctrl+C to stop");
-    tracing::info!("Set RUST_LOG=uring_mqtt=debug for connection diagnostics");
 
     // Create event callback
     let counter = event_count.clone();
@@ -64,8 +62,21 @@ fn main() -> Result<(), uring_mqtt::Error> {
         }
     });
 
-    // Run broker (blocks until shutdown)
-    MqttBroker::run_with_callback(config, Some(callback))
+    // Start broker (returns once startup completes; handle owns the lifecycle)
+    let handle = MqttBroker::start_with_callback(config, Some(callback))?;
+    let trigger = handle.shutdown_handle();
+
+    // One-shot per server instance: ctrlc registers once per process, and a used
+    // ShutdownHandle is a permanent no-op — restart the process to restart the server.
+    // Registered before the readiness lines: a launcher reacting to them could otherwise
+    // signal while the default action still terminates the process, skipping the drain.
+    ctrlc::set_handler(move || trigger.shutdown())
+        .map_err(|e| uring_mqtt::Error::Worker(format!("install ctrl-c handler: {e}")))?;
+
+    tracing::info!("Press Ctrl+C to stop");
+    tracing::info!("Set RUST_LOG=uring_mqtt=debug for connection diagnostics");
+
+    handle.join()
 }
 
 #[cfg(test)]

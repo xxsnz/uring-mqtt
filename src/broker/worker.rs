@@ -1,3 +1,4 @@
+use monoio::io::{AsyncReadRent, Canceller};
 use monoio::net::{ListenerConfig, TcpListener};
 use std::cell::Cell;
 use std::rc::Rc;
@@ -162,12 +163,14 @@ pub(crate) fn event_channel(worker_id: usize) -> (EventSender, EventReceiver) {
 /// own report (panic → drop → channel disconnect). Blocking `go_rx.recv()` is
 /// safe — nothing else progresses on this runtime until the accept loop
 /// starts.
+#[allow(clippy::too_many_lines)] // shutdown/drain machinery (watcher, cancelable_accept, done-channel, abort select, deadline force-close) pushes the body past the pedantic 100-line boundary; mirrors handler.rs's identical allowance
 pub async fn run_worker(
     worker_id: usize,
     config: BrokerConfig,
     callback: Option<EventCallback>,
     ready_tx: std::sync::mpsc::Sender<(usize, Result<(), Error>)>,
     go_rx: std::sync::mpsc::Receiver<bool>,
+    shutdown_signal: std::os::unix::net::UnixStream,
 ) -> Result<(), Error> {
     tracing::info!("Worker {} starting", worker_id);
 
@@ -181,6 +184,19 @@ pub async fn run_worker(
 
     let listener = match TcpListener::bind_with_config(&config.bind_addr, &listener_config) {
         Ok(l) => l,
+        Err(e) => {
+            let _ = ready_tx.send((worker_id, Err(e.into())));
+            drop(ready_tx);
+            return Ok(());
+        }
+    };
+
+    // EOF on this stream is the shutdown signal — the watcher task below
+    // owns the converted stream and sets `shutdown_requested` on any read
+    // completion. Conversion sits after the bind and before the ready
+    // report, mirroring the bind-error arm.
+    let shutdown_stream = match monoio::net::UnixStream::from_std(shutdown_signal) {
+        Ok(s) => s,
         Err(e) => {
             let _ = ready_tx.send((worker_id, Err(e.into())));
             drop(ready_tx);
@@ -222,12 +238,39 @@ pub async fn run_worker(
     }
     // Ok(true) falls through to the accept loop.
 
+    // Per-worker shutdown machinery: done-channel (sender drops are the
+    // drain signal), abort semaphore (close() broadcasts the force-close),
+    // and the shared `shutdown_requested` flag the watcher sets on EOF.
+    let (done_tx, mut done_rx) = local_sync::mpsc::unbounded::channel::<()>();
+    let abort = Rc::new(local_sync::semaphore::Semaphore::new(0));
+    let shutdown_requested = Rc::new(Cell::new(false));
+
+    // Watcher: any completion on the shutdown stream (EOF, byte, error)
+    // flips the flag and cancels the in-flight accept. The accept loop
+    // awaits cancellation to completion — never drops a future mid-accept,
+    // which would leak its fd (monoio uring/lifecycle.rs:74).
+    let canceller = Canceller::new();
+    let accept_cancel = canceller.handle();
+    {
+        let flag = shutdown_requested.clone();
+        let mut signal = shutdown_stream;
+        monoio::spawn(async move {
+            let (_res, _buf) = signal.read(vec![0u8; 1]).await;
+            flag.set(true);
+            let _ = canceller.cancel();
+        });
+    }
+
     // Accept loop
     let mut connection_counter: u64 = 0;
 
     loop {
-        match listener.accept().await {
+        match listener.cancelable_accept(accept_cancel.clone()).await {
             Ok((stream, addr)) => {
+                if shutdown_requested.get() {
+                    drop(stream);
+                    break;
+                }
                 if !state.try_acquire() {
                     tracing::warn!(
                         "Worker {}: connection limit reached, rejecting {}",
@@ -255,29 +298,68 @@ pub async fn run_worker(
                 let event_tx_clone = event_tx.clone();
                 let connection_timeout = config.connection_timeout_secs;
                 let idle_timeout = config.idle_timeout_secs;
+                let done_tx_clone = done_tx.clone();
+                let abort_clone = abort.clone();
 
-                // Spawn connection handler (local task, stays on this core)
+                // Spawn connection handler (local task, stays on this core).
+                // The `biased` select gives the abort semaphore priority so a
+                // force-close can wake a parked handler without racing a
+                // slow I/O completion.
                 monoio::spawn(async move {
-                    match handle_client(stream, event_tx_clone, connection_timeout, idle_timeout)
-                        .await
-                    {
-                        Ok(super::handler::SessionOutcome::Refused) => state_clone.note_refused(),
-                        Ok(super::handler::SessionOutcome::Served) => {}
-                        Err(e) => {
-                            if !e.is_routine_disconnect() {
-                                tracing::debug!("Client {} error: {:?}", addr, e);
+                    monoio::select! {
+                        biased;
+                        res = handle_client(stream, event_tx_clone, connection_timeout, idle_timeout) => {
+                            match res {
+                                Ok(super::handler::SessionOutcome::Refused) => state_clone.note_refused(),
+                                Ok(super::handler::SessionOutcome::Served) => {}
+                                Err(e) => {
+                                    if !e.is_routine_disconnect() {
+                                        tracing::debug!("Client {} error: {:?}", addr, e);
+                                    }
+                                }
                             }
                         }
+                        _ = abort_clone.acquire() => {}
                     }
                     state_clone.release();
+                    drop(done_tx_clone);
                 });
             }
             Err(e) => {
+                if shutdown_requested.get() {
+                    break;
+                }
                 tracing::error!("Worker {}: accept error: {}", worker_id, e);
                 monoio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         }
     }
+
+    // Shutdown path: stop accepting, drop the master done-sender, drain.
+    tracing::info!(
+        "Worker {} shutting down: draining {} active connections",
+        worker_id,
+        state.active_count()
+    );
+    drop(listener);
+    drop(done_tx);
+    let drain_secs = config
+        .drain_timeout_secs
+        .min(crate::broker::handshake::MAX_TIMEOUT_SECS);
+    let graceful = monoio::time::timeout(std::time::Duration::from_secs(drain_secs), async {
+        while done_rx.recv().await.is_some() {}
+    })
+    .await;
+    if graceful.is_err() {
+        tracing::warn!(
+            "Worker {} drain deadline expired: force-closing {} connections",
+            worker_id,
+            state.active_count()
+        );
+        abort.close();
+        while done_rx.recv().await.is_some() {}
+    }
+    Ok(())
 }
 
 /// Process events from the local channel.
@@ -573,6 +655,8 @@ mod tests {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (go_tx, go_rx) = std::sync::mpsc::channel();
         let (res_tx, res_rx) = std::sync::mpsc::channel();
+        let (sig_main, sig_worker) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let _sig_main = sig_main;
 
         let worker_thread = std::thread::Builder::new()
             .name("worker-park-test".into())
@@ -581,7 +665,7 @@ mod tests {
                     .enable_timer()
                     .build()
                     .expect("runtime build");
-                let r = rt.block_on(run_worker(0, config, None, ready_tx, go_rx));
+                let r = rt.block_on(run_worker(0, config, None, ready_tx, go_rx, sig_worker));
                 let _ = res_tx.send(r);
             })
             .expect("spawn worker");
@@ -677,6 +761,8 @@ mod tests {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (go_tx, go_rx) = std::sync::mpsc::channel::<bool>();
         let (res_tx, res_rx) = std::sync::mpsc::channel();
+        let (sig_main, sig_worker) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let _sig_main = sig_main;
 
         let worker_thread = std::thread::Builder::new()
             .name("worker-go-drop-test".into())
@@ -685,7 +771,7 @@ mod tests {
                     .enable_timer()
                     .build()
                     .expect("runtime build");
-                let r = rt.block_on(run_worker(3, config, None, ready_tx, go_rx));
+                let r = rt.block_on(run_worker(3, config, None, ready_tx, go_rx, sig_worker));
                 let _ = res_tx.send(r);
             })
             .expect("spawn worker");
@@ -732,6 +818,13 @@ mod tests {
         let cfg_a = BrokerConfig::new(p2.to_string());
         let cfg_b = BrokerConfig::new(p1.to_string());
 
+        let (sig_a_main, sig_a_worker) =
+            std::os::unix::net::UnixStream::pair().expect("socketpair a");
+        let (sig_b_main, sig_b_worker) =
+            std::os::unix::net::UnixStream::pair().expect("socketpair b");
+        let _sig_a_main = sig_a_main;
+        let _sig_b_main = sig_b_main;
+
         let thread_a = std::thread::Builder::new()
             .name("mixed-healthy".into())
             .spawn(move || {
@@ -739,7 +832,7 @@ mod tests {
                     .enable_timer()
                     .build()
                     .expect("rt a");
-                let r = rt.block_on(run_worker(0, cfg_a, None, ready_a, go_a_rx));
+                let r = rt.block_on(run_worker(0, cfg_a, None, ready_a, go_a_rx, sig_a_worker));
                 let _ = res_a_tx.send(r);
             })
             .expect("spawn a");
@@ -750,7 +843,7 @@ mod tests {
                     .enable_timer()
                     .build()
                     .expect("rt b");
-                let r = rt.block_on(run_worker(1, cfg_b, None, ready_b, go_b_rx));
+                let r = rt.block_on(run_worker(1, cfg_b, None, ready_b, go_b_rx, sig_b_worker));
                 let _ = res_b_tx.send(r);
             })
             .expect("spawn b");
@@ -828,6 +921,13 @@ mod tests {
         // panic during WorkerState construction (pre-report).
         let cfg_b = BrokerConfig::new(p2.to_string()).max_connections_per_worker(usize::MAX);
 
+        let (sig_a_main, sig_a_worker) =
+            std::os::unix::net::UnixStream::pair().expect("socketpair a");
+        let (sig_b_main, sig_b_worker) =
+            std::os::unix::net::UnixStream::pair().expect("socketpair b");
+        let _sig_a_main = sig_a_main;
+        let _sig_b_main = sig_b_main;
+
         let thread_a = std::thread::Builder::new()
             .name("panic-test-healthy".into())
             .spawn(move || {
@@ -835,7 +935,7 @@ mod tests {
                     .enable_timer()
                     .build()
                     .expect("rt a");
-                let r = rt.block_on(run_worker(0, cfg_a, None, ready_a, go_a_rx));
+                let r = rt.block_on(run_worker(0, cfg_a, None, ready_a, go_a_rx, sig_a_worker));
                 let _ = res_a_tx.send(r);
             })
             .expect("spawn a");
@@ -847,7 +947,7 @@ mod tests {
                     .build()
                     .expect("rt b");
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    rt.block_on(run_worker(1, cfg_b, None, ready_b, go_b_rx))
+                    rt.block_on(run_worker(1, cfg_b, None, ready_b, go_b_rx, sig_b_worker))
                 }));
                 let _ = res_b_tx.send(r);
             })
@@ -889,5 +989,501 @@ mod tests {
         thread_a.join().expect("join a");
         let _ = thread_b.join(); // panic payload — don't assert success
         sup_thread.join().expect("join sup");
+    }
+
+    // -- graceful-shutdown tests (task 2) ---------------------------------
+    //
+    // MQTT CONNECT/CONNACK fixtures, copied byte-for-byte from
+    // `src/broker/mod.rs:466` (per PLAN.md — fixtures are test-module-local
+    // and not importable). These are the only legal handshake for v3
+    // CONNACK `[0x20,0x02,0x00,0x00]`.
+    const V3_CONNECT_BYTES: [u8; 18] = [
+        0x10, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x00, 0x00, 0x3C, 0x00, 0x04, b't',
+        b'e', b's', b't',
+    ];
+    const V3_CONNACK_BYTES: [u8; 4] = [0x20, 0x02, 0x00, 0x00];
+    const PINGREQ_BYTES: [u8; 2] = [0xC0, 0x00];
+    const PINGRESP_BYTES: [u8; 2] = [0xD0, 0x00];
+
+    /// Drain a fixed-length MQTT reply from `stream`, padding with zero bytes
+    /// if the read returns short. Treats any read error other than
+    /// `WouldBlock`/`TimedOut` as fatal — those two mean "no bytes yet".
+    fn read_exact_or_zero(
+        stream: &mut std::net::TcpStream,
+        buf: &mut [u8],
+    ) -> std::io::Result<usize> {
+        let mut read_total = 0usize;
+        while read_total < buf.len() {
+            match stream.read(&mut buf[read_total..]) {
+                Ok(0) => return Ok(0),
+                Ok(n) => read_total += n,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    if read_total == 0 {
+                        return Err(e);
+                    }
+                    // Zero the unread tail so the assertion sees the expected
+                    // payload — the wire read was short, not absent.
+                    for slot in &mut buf[read_total..] {
+                        *slot = 0;
+                    }
+                    return Ok(read_total);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(read_total)
+    }
+
+    /// AC-1 — EOF on the shutdown signal stream must end the worker. The
+    /// harness drops the main end of the socketpair after `go(true)`; the
+    /// worker observes EOF and returns `Ok(())`. A retry-bind oracle proves
+    /// the listener's fd was released (matching the abort test shape).
+    #[test]
+    fn shutdown_signal_stops_accept_and_worker_returns() {
+        let std_pick = StdTcpListener::bind("127.0.0.1:0").expect("std bind free");
+        let addr: std::net::SocketAddr = std_pick.local_addr().expect("local_addr");
+        drop(std_pick);
+
+        let config = BrokerConfig::new(addr.to_string());
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        let (res_tx, res_rx) = std::sync::mpsc::channel();
+        let (sig_main, sig_worker) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+
+        let worker_thread = std::thread::Builder::new()
+            .name("shutdown-eof-test".into())
+            .spawn(move || {
+                let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+                    .enable_timer()
+                    .build()
+                    .expect("runtime build");
+                let r = rt.block_on(run_worker(0, config, None, ready_tx, go_rx, sig_worker));
+                let _ = res_tx.send(r);
+            })
+            .expect("spawn worker");
+
+        // Worker reports readiness.
+        match ready_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok((0, Ok(()))) => {}
+            other => panic!("expected (0, Ok(())), got {other:?}"),
+        }
+
+        // Green light: worker enters the accept loop.
+        go_tx.send(true).expect("go true");
+
+        // Signal: drop the main end of the socketpair → worker reads EOF.
+        drop(sig_main);
+
+        // Worker must return Ok(()) within 5s of the signal.
+        match res_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(())) => {}
+            other => panic!("expected Ok(Ok(())), got {other:?}"),
+        }
+
+        // Port released: plain std bind (no reuse_port) succeeds after a
+        // bounded retry window for monoio's deferred fd close.
+        worker_thread.join().expect("worker join");
+        let mut rebound = false;
+        for _ in 0..20 {
+            if StdTcpListener::bind(addr).is_ok() {
+                rebound = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(rebound, "port did not release after worker shutdown");
+    }
+
+    /// AC-3 (+ AC-1 during-drain refusal) — once shutdown is signaled, the
+    /// worker stops accepting new connections (poll-connect fails) but keeps
+    /// serving the held one (PINGREQ→PINGRESP round-trip), then exits cleanly
+    /// when the held client disconnects.
+    #[test]
+    fn worker_serves_active_connection_during_drain_and_refuses_new_ones() {
+        let std_pick = StdTcpListener::bind("127.0.0.1:0").expect("std bind free");
+        let addr: std::net::SocketAddr = std_pick.local_addr().expect("local_addr");
+        drop(std_pick);
+
+        // 30s drain so the test is bounded by the client drop, not the timer.
+        let config = BrokerConfig::new(addr.to_string()).drain_timeout_secs(30);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        let (res_tx, res_rx) = std::sync::mpsc::channel();
+        let (sig_main, sig_worker) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+
+        let worker_thread = std::thread::Builder::new()
+            .name("drain-serves-held-test".into())
+            .spawn(move || {
+                let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+                    .enable_timer()
+                    .build()
+                    .expect("runtime build");
+                let r = rt.block_on(run_worker(0, config, None, ready_tx, go_rx, sig_worker));
+                let _ = res_tx.send(r);
+            })
+            .expect("spawn worker");
+
+        match ready_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok((0, Ok(()))) => {}
+            other => panic!("expected (0, Ok(())), got {other:?}"),
+        }
+        go_tx.send(true).expect("go true");
+
+        // Connect, complete CONNECT/CONNACK — held client established.
+        let mut client = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+            .expect("client connect");
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("client read timeout");
+        client
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .expect("client write timeout");
+        client.write_all(&V3_CONNECT_BYTES).expect("write CONNECT");
+        let mut connack = [0u8; 4];
+        let n = read_exact_or_zero(&mut client, &mut connack).expect("read CONNACK");
+        assert_eq!(n, 4, "short CONNACK read");
+        assert_eq!(connack, V3_CONNACK_BYTES);
+
+        // Signal: drop the main end.
+        drop(sig_main);
+
+        // Probe: new connects must be refused (listener dropped). Up to
+        // 40×50ms — gives the worker time to drop the listener after EOF.
+        let mut refused = false;
+        for _ in 0..40 {
+            if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(50)).is_err() {
+                refused = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(refused, "worker kept accepting after shutdown signal");
+
+        // Held client still served: PINGREQ → PINGRESP.
+        client.write_all(&PINGREQ_BYTES).expect("write PINGREQ");
+        let mut pingresp = [0u8; 2];
+        let n = read_exact_or_zero(&mut client, &mut pingresp).expect("read PINGRESP");
+        assert_eq!(n, 2, "short PINGRESP read");
+        assert_eq!(pingresp, PINGRESP_BYTES);
+
+        // Drop the held client → drain completes on the last disconnect.
+        drop(client);
+
+        match res_rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(Ok(())) => {}
+            other => panic!("expected Ok(Ok(())), got {other:?}"),
+        }
+
+        worker_thread.join().expect("worker join");
+    }
+
+    /// AC-4 — when the drain deadline expires with stragglers still held,
+    /// every straggler must see EOF or reset on its socket within a bounded
+    /// window after the worker returns. Two stragglers exercise the abort
+    /// semaphore's broadcast (single-waker implementations hang on the
+    /// second).
+    #[test]
+    fn worker_force_closes_all_idle_connections_at_drain_deadline() {
+        let std_pick = StdTcpListener::bind("127.0.0.1:0").expect("std bind free");
+        let addr: std::net::SocketAddr = std_pick.local_addr().expect("local_addr");
+        drop(std_pick);
+
+        // 1s drain so the test is bounded by the timer.
+        let config = BrokerConfig::new(addr.to_string()).drain_timeout_secs(1);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        let (res_tx, res_rx) = std::sync::mpsc::channel();
+        let (sig_main, sig_worker) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+
+        let worker_thread = std::thread::Builder::new()
+            .name("drain-force-close-test".into())
+            .spawn(move || {
+                let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+                    .enable_timer()
+                    .build()
+                    .expect("runtime build");
+                let r = rt.block_on(run_worker(0, config, None, ready_tx, go_rx, sig_worker));
+                let _ = res_tx.send(r);
+            })
+            .expect("spawn worker");
+
+        match ready_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok((0, Ok(()))) => {}
+            other => panic!("expected (0, Ok(())), got {other:?}"),
+        }
+        go_tx.send(true).expect("go true");
+
+        // Two clients, both CONNECT/CONNACK — establish and hold.
+        let mut clients = Vec::new();
+        for _ in 0..2 {
+            let mut c = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+                .expect("client connect");
+            c.set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout");
+            c.set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("write timeout");
+            c.write_all(&V3_CONNECT_BYTES).expect("write CONNECT");
+            let mut connack = [0u8; 4];
+            let n = read_exact_or_zero(&mut c, &mut connack).expect("read CONNACK");
+            assert_eq!(n, 4, "short CONNACK read");
+            assert_eq!(connack, V3_CONNACK_BYTES);
+            clients.push(c);
+        }
+
+        // Signal shutdown.
+        drop(sig_main);
+
+        // Worker must return Ok(()) within 5s (deadline=1s + slack).
+        match res_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(())) => {}
+            other => panic!("expected Ok(Ok(())), got {other:?}"),
+        }
+
+        // Both held clients must observe EOF or reset — WouldBlock/TimedOut
+        // means the fd leaked (the abort semaphore did not wake this waiter).
+        // Give each read the full 2s window after the worker result lands
+        // (the runtime drop releases fds on the worker thread, which
+        // precedes the harness `res_tx` send).
+        for (idx, c) in clients.iter_mut().enumerate() {
+            let mut buf = [0u8; 8];
+            match c.read(&mut buf) {
+                Ok(0) => {} // EOF — clean force-close
+                Ok(n) => panic!("client {idx} read {n} bytes after force-close"),
+                Err(e) => match e.kind() {
+                    std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionAborted => {} // reset — fine
+                    other_kind => panic!(
+                        "client {idx} read returned {other_kind:?} after force-close: \
+                         connection not force-closed: fds leaked"
+                    ),
+                },
+            }
+        }
+
+        worker_thread.join().expect("worker join");
+    }
+
+    /// Regression guard for the drain clamp — absurdly large drain values
+    /// must not panic when converted to a `Duration`. The value here fits in
+    /// `Instant` (so monoio does not take its far-future fallback) but
+    /// overflows millisecond arithmetic.
+    #[test]
+    fn absurd_drain_timeout_is_clamped_not_panicking() {
+        let std_pick = StdTcpListener::bind("127.0.0.1:0").expect("std bind free");
+        let addr: std::net::SocketAddr = std_pick.local_addr().expect("local_addr");
+        drop(std_pick);
+
+        // Fits Instant (~u64::MAX/1_000 seconds), overflows any ×1_000
+        // millisecond arithmetic that would panic instead of clamping.
+        let absurd_secs: u64 = u64::MAX / 1_000 + 1;
+        let config = BrokerConfig::new(addr.to_string()).drain_timeout_secs(absurd_secs);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        let (res_tx, res_rx) = std::sync::mpsc::channel();
+        let (sig_main, sig_worker) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+
+        let worker_thread = std::thread::Builder::new()
+            .name("drain-clamp-test".into())
+            .spawn(move || {
+                let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+                    .enable_timer()
+                    .build()
+                    .expect("runtime build");
+                let r = rt.block_on(run_worker(0, config, None, ready_tx, go_rx, sig_worker));
+                let _ = res_tx.send(r);
+            })
+            .expect("spawn worker");
+
+        match ready_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok((0, Ok(()))) => {}
+            other => panic!("expected (0, Ok(())), got {other:?}"),
+        }
+        go_tx.send(true).expect("go true");
+
+        // Hold a connection open so the drain actually polls the timer.
+        let mut client = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+            .expect("client connect");
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout");
+        client
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .expect("write timeout");
+        client.write_all(&V3_CONNECT_BYTES).expect("write CONNECT");
+        let mut connack = [0u8; 4];
+        let n = read_exact_or_zero(&mut client, &mut connack).expect("read CONNACK");
+        assert_eq!(n, 4, "short CONNACK read");
+        assert_eq!(connack, V3_CONNACK_BYTES);
+
+        // Signal shutdown.
+        drop(sig_main);
+
+        // Probe: new connects refused (drain entered, timer polled, no panic).
+        let mut refused = false;
+        for _ in 0..40 {
+            if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(50)).is_err() {
+                refused = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(refused, "worker kept accepting after shutdown signal");
+
+        // Drop the held client — drain completes.
+        drop(client);
+
+        // A panic (instead of a clean return) surfaces as a channel
+        // disconnect and fails this match.
+        match res_rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(Ok(())) => {}
+            other => panic!("expected Ok(Ok(())), got {other:?}"),
+        }
+
+        worker_thread.join().expect("worker join");
+    }
+
+    /// AC-1, level-persistence — the shutdown signal fired BEFORE the worker
+    /// reached its accept loop must still stop it. The main end is dropped
+    /// while the worker is parked on `go_rx`, so the EOF is already pending
+    /// when the watcher issues its first read. An edge-triggered design that
+    /// only reacts to a signal arriving after loop entry parks forever here
+    /// and fails the bounded worker-result wait.
+    #[test]
+    fn shutdown_signaled_before_accept_loop_still_stops_worker() {
+        let std_pick = StdTcpListener::bind("127.0.0.1:0").expect("std bind free");
+        let addr: std::net::SocketAddr = std_pick.local_addr().expect("local_addr");
+        drop(std_pick);
+
+        let config = BrokerConfig::new(addr.to_string());
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        let (res_tx, res_rx) = std::sync::mpsc::channel();
+        let (sig_main, sig_worker) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+
+        let worker_thread = std::thread::Builder::new()
+            .name("shutdown-before-go-test".into())
+            .spawn(move || {
+                let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+                    .enable_timer()
+                    .build()
+                    .expect("runtime build");
+                let r = rt.block_on(run_worker(0, config, None, ready_tx, go_rx, sig_worker));
+                let _ = res_tx.send(r);
+            })
+            .expect("spawn worker");
+
+        match ready_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok((0, Ok(()))) => {}
+            other => panic!("expected (0, Ok(())), got {other:?}"),
+        }
+
+        // Signal BEFORE the green light: the worker is still parked on the
+        // startup barrier and has not spawned its watcher yet.
+        drop(sig_main);
+        go_tx.send(true).expect("go true");
+
+        match res_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(())) => {}
+            other => panic!("expected Ok(Ok(())), got {other:?}"),
+        }
+
+        worker_thread.join().expect("worker join");
+        let mut rebound = false;
+        for _ in 0..20 {
+            if StdTcpListener::bind(addr).is_ok() {
+                rebound = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(rebound, "port did not release after worker shutdown");
+    }
+
+    /// AC-4 boundary (decision Q3 / pre-mortem ruling 1) — `drain_timeout_secs(0)`
+    /// is the documented way for an embedder to close immediately. A held
+    /// straggler must be force-closed without waiting out any grace period,
+    /// and the worker must still return `Ok(())`. The 3s upper bound is far
+    /// below the 5s default, so an implementation ignoring the configured
+    /// zero fails it; the client read must be EOF/reset, never a timeout.
+    #[test]
+    fn zero_drain_timeout_force_closes_straggler_immediately() {
+        let std_pick = StdTcpListener::bind("127.0.0.1:0").expect("std bind free");
+        let addr: std::net::SocketAddr = std_pick.local_addr().expect("local_addr");
+        drop(std_pick);
+
+        let config = BrokerConfig::new(addr.to_string()).drain_timeout_secs(0);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        let (res_tx, res_rx) = std::sync::mpsc::channel();
+        let (sig_main, sig_worker) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+
+        let worker_thread = std::thread::Builder::new()
+            .name("drain-zero-timeout-test".into())
+            .spawn(move || {
+                let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+                    .enable_timer()
+                    .build()
+                    .expect("runtime build");
+                let r = rt.block_on(run_worker(0, config, None, ready_tx, go_rx, sig_worker));
+                let _ = res_tx.send(r);
+            })
+            .expect("spawn worker");
+
+        match ready_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok((0, Ok(()))) => {}
+            other => panic!("expected (0, Ok(())), got {other:?}"),
+        }
+        go_tx.send(true).expect("go true");
+
+        let mut client = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+            .expect("client connect");
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout");
+        client
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .expect("write timeout");
+        client.write_all(&V3_CONNECT_BYTES).expect("write CONNECT");
+        let mut connack = [0u8; 4];
+        let n = read_exact_or_zero(&mut client, &mut connack).expect("read CONNACK");
+        assert_eq!(n, 4, "short CONNACK read");
+        assert_eq!(connack, V3_CONNACK_BYTES);
+
+        // Clock started BEFORE the signal so descheduling cannot fake a pass.
+        let t0 = std::time::Instant::now();
+        drop(sig_main);
+
+        match res_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(())) => {}
+            other => panic!("expected Ok(Ok(())), got {other:?}"),
+        }
+        let dt = t0.elapsed();
+        assert!(
+            dt <= Duration::from_secs(3),
+            "zero drain timeout still waited {dt:?}; a grace period was applied"
+        );
+
+        // The straggler must be force-closed: EOF or reset, never a timeout
+        // (a timeout means the fd leaked open).
+        let mut buf = [0u8; 8];
+        match client.read(&mut buf) {
+            Ok(0) => {}
+            Ok(n) => panic!("client read {n} bytes after force-close"),
+            Err(e) => match e.kind() {
+                std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionAborted => {}
+                other_kind => panic!(
+                    "client read returned {other_kind:?} after force-close: \
+                     connection not force-closed: fds leaked"
+                ),
+            },
+        }
+
+        worker_thread.join().expect("worker join");
     }
 }
