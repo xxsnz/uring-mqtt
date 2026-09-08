@@ -23,6 +23,9 @@ pub(crate) enum SessionOutcome {
     Refused,
 }
 
+const TIMEOUT_CTX_CONNACK_FLUSH: &str = "handshake timeout during CONNACK flush";
+const TIMEOUT_CTX_PINGRESP_FLUSH: &str = "idle timeout during PINGRESP flush";
+
 /// Handle a single MQTT client connection.
 pub async fn handle_client(
     stream: TcpStream,
@@ -54,6 +57,7 @@ fn log_handshake_transport_error(peer_addr: std::net::SocketAddr, err: &Error) {
 
 /// IO-generic body of `handle_client`. The public entry keeps the
 /// monomorphic `TcpStream` signature; tests substitute a `TestIo` wrapper.
+#[allow(clippy::too_many_lines)] // per-arm timeout diagnostics push the body to the pedantic 100-line boundary
 async fn handle_client_io<IO>(
     stream: IO,
     peer_addr: std::net::SocketAddr,
@@ -97,7 +101,10 @@ where
             return Err(err);
         }
         Ok(None) => return Err(Error::ClientClosed),
-        Err(_) => return Err(Error::Timeout),
+        Err(_) => {
+            tracing::debug!("handshake timeout during version detect ({peer_addr})");
+            return Err(Error::Timeout);
+        }
     };
 
     tracing::debug!("Detected protocol version: {:?}", version);
@@ -123,7 +130,14 @@ where
                         handshake::honest_v5_connack(V5ConnectAckReason::ClientIdentifierNotValid),
                     ))),
                 };
-                bounded_send(&mut framed, refusal, remaining()).await?;
+                bounded_send(
+                    &mut framed,
+                    refusal,
+                    remaining(),
+                    peer_addr,
+                    TIMEOUT_CTX_CONNACK_FLUSH,
+                )
+                .await?;
                 return Ok(SessionOutcome::Refused);
             }
             if e.get_ref()
@@ -140,7 +154,10 @@ where
             return Err(err);
         }
         Ok(None) => return Err(Error::ClientClosed),
-        Err(_) => return Err(Error::Timeout),
+        Err(_) => {
+            tracing::debug!("handshake timeout during CONNECT read ({peer_addr})");
+            return Err(Error::Timeout);
+        }
     };
     // Idle-window anchor: CONNECT receipt, so a slow CONNACK flush cannot
     // extend the first idle interval.
@@ -163,7 +180,14 @@ where
                 _ => "unknown".to_string(),
             };
             tracing::warn!("CONNECT refused: {reason} from {peer_addr}");
-            bounded_send(&mut framed, connack, remaining()).await?;
+            bounded_send(
+                &mut framed,
+                connack,
+                remaining(),
+                peer_addr,
+                TIMEOUT_CTX_CONNACK_FLUSH,
+            )
+            .await?;
             return Ok(SessionOutcome::Refused);
         }
         ConnectDecision::Accept {
@@ -172,7 +196,14 @@ where
             keep_alive_secs,
             idle_timeout,
         } => {
-            bounded_send(&mut framed, connack, remaining()).await?;
+            bounded_send(
+                &mut framed,
+                connack,
+                remaining(),
+                peer_addr,
+                TIMEOUT_CTX_CONNACK_FLUSH,
+            )
+            .await?;
             state.client_id = client_id;
             state.keep_alive = keep_alive_secs;
             state.last_packet_time = connect_received_at;
@@ -225,14 +256,26 @@ where
                     MqttPacket::V3(PacketV3::PingRequest) => {
                         let remaining =
                             idle_timeout.saturating_sub(state.last_packet_time.elapsed());
-                        bounded_send(framed, MqttPacket::V3(PacketV3::PingResponse), remaining)
-                            .await?;
+                        bounded_send(
+                            framed,
+                            MqttPacket::V3(PacketV3::PingResponse),
+                            remaining,
+                            peer_addr,
+                            TIMEOUT_CTX_PINGRESP_FLUSH,
+                        )
+                        .await?;
                     }
                     MqttPacket::V5(PacketV5::PingRequest) => {
                         let remaining =
                             idle_timeout.saturating_sub(state.last_packet_time.elapsed());
-                        bounded_send(framed, MqttPacket::V5(PacketV5::PingResponse), remaining)
-                            .await?;
+                        bounded_send(
+                            framed,
+                            MqttPacket::V5(PacketV5::PingResponse),
+                            remaining,
+                            peer_addr,
+                            TIMEOUT_CTX_PINGRESP_FLUSH,
+                        )
+                        .await?;
                     }
                     MqttPacket::V3(PacketV3::Connect(_)) | MqttPacket::V5(PacketV5::Connect(_)) => {
                         tracing::warn!(
@@ -259,7 +302,7 @@ where
                 break;
             }
             Err(_) => {
-                tracing::debug!("Client idle timeout");
+                tracing::debug!("client idle timeout ({peer_addr})");
                 break;
             }
         }
@@ -272,6 +315,8 @@ async fn bounded_send<IO>(
     framed: &mut Framed<IO, CodecPair>,
     pkt: MqttPacket,
     deadline: Duration,
+    peer_addr: std::net::SocketAddr,
+    timeout_context: &'static str,
 ) -> Result<(), Error>
 where
     IO: AsyncWriteRent,
@@ -280,7 +325,10 @@ where
     match monoio::time::timeout(deadline, send_fut).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(Error::Io(e)),
-        Err(_) => Err(Error::Timeout),
+        Err(_) => {
+            tracing::debug!("{timeout_context} ({peer_addr})");
+            Err(Error::Timeout)
+        }
     }
 }
 
@@ -648,6 +696,7 @@ mod tests {
 
     #[test]
     fn pipelined_connect_publish_pingreq_gets_connack_then_pingresp() {
+        let sink = capture_logs();
         let mut rt = build_runtime();
         rt.block_on(async {
             let (mut client, mut rx, handle) = spawn_handler(2, 30).await;
@@ -702,6 +751,16 @@ mod tests {
                 matches!(second, Ok(None)),
                 "expected no second event, got {second:?}"
             );
+
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            for level in ["DEBUG", "WARN", "INFO", "ERROR"] {
+                assert_eq!(
+                    count_lines_at(&logs, level, "timeout"),
+                    0,
+                    "healthy DISCONNECT-terminated session emitted a {level}-level timeout line, got: {logs}"
+                );
+            }
         });
     }
 
@@ -1316,6 +1375,60 @@ mod tests {
         });
     }
 
+    /// Phase-3 timeout: 9-byte prefix resolves the version, then the CONNECT
+    /// read never completes. Must debug-log the phase and peer, and emit no
+    /// info-or-higher event, before returning `Err(Error::Timeout)`.
+    #[test]
+    fn connect_read_timeout_is_logged_at_debug_with_peer() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (client, _rx, handle) = spawn_handler_test_io(
+                1,
+                30,
+                Duration::ZERO,
+                0,
+                Some(V3_CONNECT_FIRST_9.to_vec()),
+                None,
+            )
+            .await;
+            let peer = client.local_addr().expect("local_addr").to_string();
+            let join_res = monoio::time::timeout(Duration::from_secs(3), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Err(Error::Timeout)),
+                "expected Err(Error::Timeout), got {join_res:?}"
+            );
+            drop(client);
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert_eq!(
+                count_lines_at(&logs, "DEBUG", "timeout"),
+                1,
+                "expected exactly one DEBUG timeout line, got: {logs}"
+            );
+            assert_eq!(
+                count_lines_at(&logs, "DEBUG", "handshake timeout during CONNECT read"),
+                1,
+                "expected exactly one DEBUG CONNECT-read timeout line, got: {logs}"
+            );
+            assert!(
+                has_line_at(&logs, "DEBUG", &["handshake timeout during CONNECT read", &peer]),
+                "missing DEBUG-level CONNECT-read timeout log with complete peer address, got: {logs}"
+            );
+            for level in ["WARN", "INFO", "ERROR"] {
+                let any = logs
+                    .lines()
+                    .any(|l| l.split_whitespace().nth(1) == Some(level));
+                assert!(
+                    !any,
+                    "CONNECT-read timeout emitted a {level}-level line, got: {logs}"
+                );
+            }
+        });
+    }
+
     /// Phase-3 transport anomaly: 9-byte prefix resolves the version, the
     /// CONNECT read sees `ConnectionAborted` (non-routine). Must warn as
     /// "handshake transport error" with the peer address — never as a
@@ -1777,10 +1890,12 @@ mod tests {
 
     #[test]
     fn closes_at_1_5x_of_two_second_keepalive() {
+        let sink = capture_logs();
         let mut rt = build_runtime();
         let start = std::time::Instant::now();
         rt.block_on(async {
             let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            let peer = client.local_addr().expect("local_addr").to_string();
             // CONNECT ka=2 → negotiated idle deadline = 2 × 1.5 = 3s.
             tcp_write_all(&mut client, &V3_CONNECT_TEST_KA2)
                 .await
@@ -1793,6 +1908,31 @@ mod tests {
                 .await
                 .expect("join timeout");
             assert!(join_res.is_ok(), "handler returned error: {join_res:?}");
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert_eq!(
+                count_lines_at(&logs, "DEBUG", "timeout"),
+                1,
+                "expected exactly one DEBUG timeout line, got: {logs}"
+            );
+            assert_eq!(
+                count_lines_at(&logs, "DEBUG", "client idle timeout"),
+                1,
+                "expected exactly one DEBUG client-idle-timeout line, got: {logs}"
+            );
+            assert!(
+                has_line_at(&logs, "DEBUG", &["client idle timeout", &peer]),
+                "missing DEBUG-level client-idle-timeout log with complete peer address, got: {logs}"
+            );
+            for level in ["WARN", "INFO", "ERROR"] {
+                let any = logs
+                    .lines()
+                    .any(|l| l.split_whitespace().nth(1) == Some(level));
+                assert!(
+                    !any,
+                    "idle-deadline expiry emitted a {level}-level line, got: {logs}"
+                );
+            }
         });
         let elapsed = start.elapsed();
         // Disjoint from the Task-2 ka=1 window (1.3s..=2.3s): a single hardcoded
@@ -1881,12 +2021,14 @@ mod tests {
 
     #[test]
     fn closes_silent_client_when_handshake_budget_expires() {
+        let sink = capture_logs();
         let mut rt = build_runtime();
         let start = std::time::Instant::now();
         rt.block_on(async {
             // connection_timeout_secs=1; the client connects and never speaks,
             // so the budget must expire during version detection.
             let (mut client, _rx, handle) = spawn_handler(1, 30).await;
+            let peer = client.local_addr().expect("local_addr").to_string();
 
             let got = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(5))
                 .await
@@ -1900,6 +2042,32 @@ mod tests {
                 matches!(join_res, Err(Error::Timeout)),
                 "expected Err(Error::Timeout), got {join_res:?}"
             );
+
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert_eq!(
+                count_lines_at(&logs, "DEBUG", "timeout"),
+                1,
+                "expected exactly one DEBUG timeout line, got: {logs}"
+            );
+            assert_eq!(
+                count_lines_at(&logs, "DEBUG", "handshake timeout during version detect"),
+                1,
+                "expected exactly one DEBUG version-detect timeout line, got: {logs}"
+            );
+            assert!(
+                has_line_at(&logs, "DEBUG", &["handshake timeout during version detect", &peer]),
+                "missing DEBUG-level version-detect timeout log with complete peer address, got: {logs}"
+            );
+            for level in ["WARN", "INFO", "ERROR"] {
+                let any = logs
+                    .lines()
+                    .any(|l| l.split_whitespace().nth(1) == Some(level));
+                assert!(
+                    !any,
+                    "handshake budget expiry emitted a {level}-level line, got: {logs}"
+                );
+            }
         });
         let elapsed = start.elapsed();
         assert!(
@@ -1955,6 +2123,7 @@ mod tests {
 
     #[test]
     fn closes_blocked_writer_when_idle_deadline_passes() {
+        let sink = capture_logs();
         let mut rt = build_runtime();
         rt.block_on(async {
             // Scripted CONNECT (ka=1 → idle 1.5s) plus one PINGREQ; the CONNACK
@@ -1965,6 +2134,7 @@ mod tests {
             prefix.extend_from_slice(&PINGREQ);
             let (client, _rx, handle) =
                 spawn_handler_test_io(5, 30, Duration::from_secs(10), 1, Some(prefix), None).await;
+            let peer = client.local_addr().expect("local_addr").to_string();
 
             // Idle deadline (1.5s) elapses mid-flush → bounded send_and_flush
             // returns Elapsed → handler returns Err(Error::Timeout).
@@ -1977,6 +2147,31 @@ mod tests {
                 matches!(join_res, Err(Error::Timeout)),
                 "expected Err(Error::Timeout), got {join_res:?}"
             );
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert_eq!(
+                count_lines_at(&logs, "DEBUG", "timeout"),
+                1,
+                "expected exactly one DEBUG timeout line, got: {logs}"
+            );
+            assert_eq!(
+                count_lines_at(&logs, "DEBUG", "idle timeout during PINGRESP flush"),
+                1,
+                "expected exactly one DEBUG PINGRESP-flush timeout line, got: {logs}"
+            );
+            assert!(
+                has_line_at(&logs, "DEBUG", &["idle timeout during PINGRESP flush", &peer]),
+                "missing DEBUG-level PINGRESP-flush timeout log with complete peer address, got: {logs}"
+            );
+            for level in ["WARN", "INFO", "ERROR"] {
+                let any = logs
+                    .lines()
+                    .any(|l| l.split_whitespace().nth(1) == Some(level));
+                assert!(
+                    !any,
+                    "blocked PINGRESP-flush timeout emitted a {level}-level line, got: {logs}"
+                );
+            }
             assert!(
                 (Duration::from_millis(1300)..=Duration::from_millis(2500)).contains(&elapsed),
                 "elapsed {elapsed:?} outside 1.3s..=2.5s window (1.5s idle deadline)"
@@ -2265,6 +2460,7 @@ mod tests {
 
     #[test]
     fn connack_flush_timeout_respects_shared_handshake_budget() {
+        let sink = capture_logs();
         let mut rt = build_runtime();
         let start = std::time::Instant::now();
         rt.block_on(async {
@@ -2272,6 +2468,7 @@ mod tests {
             // then exceeds what is left, so the CONNACK never reaches the client.
             let (mut client, _rx, handle) =
                 spawn_handler_test_io(3, 30, Duration::from_millis(1500), 0, None, None).await;
+            let peer = client.local_addr().expect("local_addr").to_string();
 
             tcp_write_all(&mut client, &V3_CONNECT_FIRST_9)
                 .await
@@ -2296,11 +2493,429 @@ mod tests {
                 matches!(join_res, Err(Error::Timeout)),
                 "expected Err(Error::Timeout), got {join_res:?}"
             );
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            // Phase-agnostic on purpose: the remaining 9 bytes are written after a
+            // real-clock sleep, so a scheduling slip past the budget expires the
+            // CONNECT read instead of the flush. The phase-specific CONNACK needle
+            // lives on the deterministic fixture below.
+            assert_eq!(
+                count_lines_at(&logs, "DEBUG", "timeout"),
+                1,
+                "expected exactly one DEBUG timeout line, got: {logs}"
+            );
+            assert!(
+                has_line_at(&logs, "DEBUG", &["timeout", &peer]),
+                "missing DEBUG-level timeout log with complete peer address, got: {logs}"
+            );
+            for level in ["WARN", "INFO", "ERROR"] {
+                let any = logs
+                    .lines()
+                    .any(|l| l.split_whitespace().nth(1) == Some(level));
+                assert!(
+                    !any,
+                    "shared-budget timeout emitted a {level}-level line, got: {logs}"
+                );
+            }
         });
         let elapsed = start.elapsed();
         assert!(
             (Duration::from_millis(2700)..=Duration::from_millis(4200)).contains(&elapsed),
             "elapsed {elapsed:?} outside 2.7s..=4.2s window (shared handshake budget)"
         );
+    }
+
+    /// Accept-path CONNACK flush (`bounded_send` at the `Accept` arm) with the
+    /// phase pinned structurally: the complete CONNECT is served from memory, so
+    /// version detect and the CONNECT read consume no wall clock and the 1s
+    /// budget can only expire inside the 3s-delayed flush.
+    #[test]
+    fn accept_connack_flush_timeout_debug_logs_connack_context_with_peer() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (client, _rx, handle) = spawn_handler_test_io(
+                1,
+                30,
+                Duration::from_secs(3),
+                0,
+                Some(V3_CONNECT_TEST.to_vec()),
+                None,
+            )
+            .await;
+            let peer = client.local_addr().expect("local_addr").to_string();
+
+            let join_res = monoio::time::timeout(Duration::from_secs(4), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Err(Error::Timeout)),
+                "expected Err(Error::Timeout), got {join_res:?}"
+            );
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert_eq!(
+                count_lines_at(&logs, "DEBUG", "timeout"),
+                1,
+                "expected exactly one DEBUG timeout line, got: {logs}"
+            );
+            assert_eq!(
+                count_lines_at(&logs, "DEBUG", "handshake timeout during CONNACK flush"),
+                1,
+                "expected exactly one DEBUG CONNACK-flush timeout line, got: {logs}"
+            );
+            assert!(
+                has_line_at(
+                    &logs,
+                    "DEBUG",
+                    &["handshake timeout during CONNACK flush", &peer]
+                ),
+                "missing DEBUG-level CONNACK-flush timeout log with complete peer address, got: {logs}"
+            );
+            for level in ["WARN", "INFO", "ERROR"] {
+                let any = logs
+                    .lines()
+                    .any(|l| l.split_whitespace().nth(1) == Some(level));
+                assert!(
+                    !any,
+                    "accept CONNACK-flush timeout emitted a {level}-level line, got: {logs}"
+                );
+            }
+
+            drop(client);
+        });
+    }
+
+    #[test]
+    fn decoder_refusal_connack_flush_timeout_debug_logs_timeout_and_keeps_refusal_warn() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (client, _rx, handle) = spawn_handler_test_io(
+                1,
+                30,
+                Duration::from_secs(3),
+                0,
+                Some(V3_CONNECT_EMPTY_NO_CLEAN.to_vec()),
+                None,
+            )
+            .await;
+            let peer = client.local_addr().expect("local_addr").to_string();
+
+            let join_res = monoio::time::timeout(Duration::from_secs(4), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Err(Error::Timeout)),
+                "expected Err(Error::Timeout), got {join_res:?}"
+            );
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert!(
+                has_line_at(&logs, "WARN", &["CONNECT refused: invalid client id", &peer]),
+                "missing WARN-level refusal log with complete peer address, got: {logs}"
+            );
+            assert_eq!(
+                count_lines_at(&logs, "DEBUG", "timeout"),
+                1,
+                "expected exactly one DEBUG timeout line, got: {logs}"
+            );
+            assert_eq!(
+                count_lines_at(&logs, "DEBUG", "handshake timeout during CONNACK flush"),
+                1,
+                "expected exactly one DEBUG CONNACK-flush timeout line, got: {logs}"
+            );
+            assert!(
+                has_line_at(
+                    &logs,
+                    "DEBUG",
+                    &["handshake timeout during CONNACK flush", &peer]
+                ),
+                "missing DEBUG-level CONNACK-flush timeout log with complete peer address, got: {logs}"
+            );
+            for level in ["WARN", "INFO", "ERROR"] {
+                assert_eq!(
+                    count_lines_at(&logs, level, "timeout"),
+                    0,
+                    "decoder-refusal CONNACK-flush timeout emitted a {level}-level timeout line, got: {logs}"
+                );
+            }
+
+            drop(client);
+        });
+    }
+
+    #[test]
+    fn policy_refusal_connack_flush_timeout_debug_logs_timeout_and_keeps_refusal_warn() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let mut enc = MqttEncoder::v5();
+            let connect = rmqtt_codec::v5::Connect {
+                client_id: "dev5".to_string().into(),
+                auth_method: Some("PLAIN".to_string().into()),
+                keep_alive: 60,
+                ..Default::default()
+            };
+            let mut buf = BytesMut::new();
+            enc.encode(
+                MqttPacket::V5(PacketV5::Connect(Box::new(connect))),
+                &mut buf,
+            )
+            .expect("encode");
+
+            let (client, _rx, handle) = spawn_handler_test_io(
+                1,
+                30,
+                Duration::from_secs(3),
+                0,
+                Some(buf.to_vec()),
+                None,
+            )
+            .await;
+            let peer = client.local_addr().expect("local_addr").to_string();
+
+            let join_res = monoio::time::timeout(Duration::from_secs(4), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Err(Error::Timeout)),
+                "expected Err(Error::Timeout), got {join_res:?}"
+            );
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert!(
+                has_line_at(
+                    &logs,
+                    "WARN",
+                    &["CONNECT refused: BadAuthenticationMethod", &peer]
+                ),
+                "missing WARN-level refusal log with complete peer address, got: {logs}"
+            );
+            assert_eq!(
+                count_lines_at(&logs, "DEBUG", "timeout"),
+                1,
+                "expected exactly one DEBUG timeout line, got: {logs}"
+            );
+            assert_eq!(
+                count_lines_at(&logs, "DEBUG", "handshake timeout during CONNACK flush"),
+                1,
+                "expected exactly one DEBUG CONNACK-flush timeout line, got: {logs}"
+            );
+            assert!(
+                has_line_at(
+                    &logs,
+                    "DEBUG",
+                    &["handshake timeout during CONNACK flush", &peer]
+                ),
+                "missing DEBUG-level CONNACK-flush timeout log with complete peer address, got: {logs}"
+            );
+            for level in ["WARN", "INFO", "ERROR"] {
+                assert_eq!(
+                    count_lines_at(&logs, level, "timeout"),
+                    0,
+                    "policy-refusal CONNACK-flush timeout emitted a {level}-level timeout line, got: {logs}"
+                );
+            }
+
+            drop(client);
+        });
+    }
+
+    #[test]
+    fn v5_pingresp_flush_timeout_debug_logs_idle_context_with_peer() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let mut prefix = encode_v5_connect(1, "dev5");
+            prefix.extend_from_slice(&PINGREQ);
+            let (client, _rx, handle) =
+                spawn_handler_test_io(5, 30, Duration::from_secs(10), 1, Some(prefix), None).await;
+            let peer = client.local_addr().expect("local_addr").to_string();
+
+            let join_res = monoio::time::timeout(Duration::from_secs(4), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Err(Error::Timeout)),
+                "expected Err(Error::Timeout), got {join_res:?}"
+            );
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert_eq!(
+                count_lines_at(&logs, "DEBUG", "timeout"),
+                1,
+                "expected exactly one DEBUG timeout line, got: {logs}"
+            );
+            assert_eq!(
+                count_lines_at(&logs, "DEBUG", "idle timeout during PINGRESP flush"),
+                1,
+                "expected exactly one DEBUG PINGRESP-flush timeout line, got: {logs}"
+            );
+            assert!(
+                has_line_at(&logs, "DEBUG", &["idle timeout during PINGRESP flush", &peer]),
+                "missing DEBUG-level PINGRESP-flush timeout log with complete peer address, got: {logs}"
+            );
+            for level in ["WARN", "INFO", "ERROR"] {
+                let any = logs
+                    .lines()
+                    .any(|l| l.split_whitespace().nth(1) == Some(level));
+                assert!(
+                    !any,
+                    "v5 PINGRESP-flush timeout emitted a {level}-level line, got: {logs}"
+                );
+            }
+
+            drop(client);
+        });
+    }
+
+    /// Peer attribution has to identify WHICH connection timed out: two silent
+    /// clients on the same runtime must produce two version-detect lines, each
+    /// carrying its own address. Catches what no single-connection test can — a
+    /// peer value shared across connections, or emission deduplicated
+    /// process-wide so the second connection's expiry goes unlogged.
+    #[test]
+    fn concurrent_handshake_timeouts_attribute_each_line_to_its_own_peer() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (client_a, _rx_a, handle_a) = spawn_handler(1, 30).await;
+            let (client_b, _rx_b, handle_b) = spawn_handler(1, 30).await;
+            let peer_a = client_a.local_addr().expect("local_addr").to_string();
+            let peer_b = client_b.local_addr().expect("local_addr").to_string();
+            assert_ne!(peer_a, peer_b, "both clients bound the same local address");
+
+            // Neither client speaks: both budgets expire during version detect.
+            let join_a = monoio::time::timeout(Duration::from_secs(5), handle_a)
+                .await
+                .expect("join timeout a");
+            let join_b = monoio::time::timeout(Duration::from_secs(5), handle_b)
+                .await
+                .expect("join timeout b");
+            assert!(
+                matches!(join_a, Err(Error::Timeout)),
+                "expected Err(Error::Timeout) for connection a, got {join_a:?}"
+            );
+            assert!(
+                matches!(join_b, Err(Error::Timeout)),
+                "expected Err(Error::Timeout) for connection b, got {join_b:?}"
+            );
+
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert_eq!(
+                count_lines_at(&logs, "DEBUG", "timeout"),
+                2,
+                "expected exactly one DEBUG timeout line per connection, got: {logs}"
+            );
+            assert_eq!(
+                count_lines_at(&logs, "DEBUG", "handshake timeout during version detect"),
+                2,
+                "expected exactly two DEBUG version-detect timeout lines, got: {logs}"
+            );
+            assert!(
+                has_line_at(
+                    &logs,
+                    "DEBUG",
+                    &["handshake timeout during version detect", &peer_a]
+                ),
+                "missing DEBUG-level version-detect timeout log for peer a, got: {logs}"
+            );
+            assert!(
+                has_line_at(
+                    &logs,
+                    "DEBUG",
+                    &["handshake timeout during version detect", &peer_b]
+                ),
+                "missing DEBUG-level version-detect timeout log for peer b, got: {logs}"
+            );
+            for level in ["WARN", "INFO", "ERROR"] {
+                let any = logs
+                    .lines()
+                    .any(|l| l.split_whitespace().nth(1) == Some(level));
+                assert!(
+                    !any,
+                    "concurrent handshake expiry emitted a {level}-level line, got: {logs}"
+                );
+            }
+
+            drop(client_a);
+            drop(client_b);
+        });
+    }
+
+    /// A PINGRESP that flushes inside its idle window must stay silent: the one
+    /// timeout line the session emits is the later idle-deadline expiry, with no
+    /// PINGRESP-flush context anywhere. Logging on `bounded_send`'s success path
+    /// (or attributing the idle close to the flush) fails this.
+    #[test]
+    fn successful_pingresp_flush_is_silent_and_idle_close_logs_once() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            // ka=2 → negotiated idle deadline 3s, re-anchored by the PINGREQ.
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            let peer = client.local_addr().expect("local_addr").to_string();
+
+            tcp_write_all(&mut client, &V3_CONNECT_TEST_KA2)
+                .await
+                .expect("connect write");
+            let connack = tcp_read_n(&mut client, 4).await.expect("read connack");
+            assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+
+            tcp_write_all(&mut client, &PINGREQ)
+                .await
+                .expect("pingreq write");
+            let pingresp = tcp_read_n(&mut client, 2).await.expect("read pingresp");
+            assert_eq!(pingresp, vec![0xD0, 0x00], "expected flushed PINGRESP");
+
+            // Stay silent from here: the idle deadline is the only expiry left.
+            let rest = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(6))
+                .await
+                .expect("read to eof (bounded)");
+            assert!(
+                rest.is_empty(),
+                "expected no further bytes after PINGRESP, got {rest:?}"
+            );
+            let join_res = monoio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Ok(SessionOutcome::Served)),
+                "expected Ok(SessionOutcome::Served), got {join_res:?}"
+            );
+
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert_eq!(
+                count_lines_at(&logs, "DEBUG", "timeout"),
+                1,
+                "expected exactly one DEBUG timeout line, got: {logs}"
+            );
+            assert_eq!(
+                count_lines_at(&logs, "DEBUG", "client idle timeout"),
+                1,
+                "expected exactly one DEBUG client-idle-timeout line, got: {logs}"
+            );
+            assert!(
+                has_line_at(&logs, "DEBUG", &["client idle timeout", &peer]),
+                "missing DEBUG-level client-idle-timeout log with complete peer address, got: {logs}"
+            );
+            assert_eq!(
+                count_lines_at(&logs, "DEBUG", "PINGRESP flush"),
+                0,
+                "a PINGRESP that flushed in time emitted a flush-timeout line, got: {logs}"
+            );
+            for level in ["WARN", "INFO", "ERROR"] {
+                let any = logs
+                    .lines()
+                    .any(|l| l.split_whitespace().nth(1) == Some(level));
+                assert!(
+                    !any,
+                    "served session closing on idle emitted a {level}-level line, got: {logs}"
+                );
+            }
+        });
     }
 }
