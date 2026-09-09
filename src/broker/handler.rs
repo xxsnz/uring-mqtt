@@ -384,7 +384,7 @@ fn parse_sensor_data(data: &[u8]) -> Option<Event> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::broker::worker::{event_channel, EventReceiver};
     use bytes::BytesMut;
@@ -980,7 +980,7 @@ mod tests {
         });
     }
 
-    type LogSink = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
+    pub(crate) type LogSink = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
 
     thread_local! {
         /// Per-test-thread capture buffer; `None` on threads not asserting logs.
@@ -1020,7 +1020,7 @@ mod tests {
     /// callsite stays disabled. DEBUG is the capture floor — each test asserts the
     /// parsed level of the lines it cares about via `has_line_at` / `count_lines_at`,
     /// so message text can never fake a level.
-    fn capture_logs() -> LogSink {
+    pub(crate) fn capture_logs() -> LogSink {
         static INIT: std::sync::Once = std::sync::Once::new();
         INIT.call_once(|| {
             let subscriber = tracing_subscriber::fmt()
@@ -1039,7 +1039,7 @@ mod tests {
     /// whitespace-separated field (the tracing-subscriber full format is
     /// `<timestamp> <LEVEL> <target>: <message>`) AND contains every needle.
     /// Parsing the level field prevents message text from faking a level.
-    fn has_line_at(logs: &str, level: &str, needles: &[&str]) -> bool {
+    pub(crate) fn has_line_at(logs: &str, level: &str, needles: &[&str]) -> bool {
         logs.lines().any(|l| {
             l.split_whitespace().nth(1) == Some(level) && needles.iter().all(|n| l.contains(n))
         })
@@ -1047,7 +1047,7 @@ mod tests {
 
     /// Count captured lines that parse to `level` and contain `needle`.
     /// Parsing the level field prevents message text from faking a level.
-    fn count_lines_at(logs: &str, level: &str, needle: &str) -> usize {
+    pub(crate) fn count_lines_at(logs: &str, level: &str, needle: &str) -> usize {
         logs.lines()
             .filter(|l| l.split_whitespace().nth(1) == Some(level) && l.contains(needle))
             .count()

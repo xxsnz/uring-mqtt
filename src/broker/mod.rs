@@ -107,17 +107,22 @@ impl ShutdownHandle {
     /// subsequent calls (same handle, any clone, any thread, concurrent or
     /// not) are no-ops.
     pub fn shutdown(&self) {
-        let taken = self
-            .signal_ends
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        // Guard's scope ends here — drop happens before the ends are dropped,
-        // so no concurrent lock holder can re-observe the Option.
+        let taken = self.take_signal_ends();
         if taken.is_some() {
             tracing::info!("shutdown signaled to workers");
         }
         drop(taken);
+    }
+
+    /// Take the main-side signal ends, leaving `None` behind. Returns them
+    /// undropped so the caller decides what to log before the EOF lands.
+    fn take_signal_ends(&self) -> Option<Vec<std::os::unix::net::UnixStream>> {
+        // Guard's scope ends here — drop happens before the ends are
+        // dropped, so no concurrent lock holder can re-observe the Option.
+        self.signal_ends
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 }
 
@@ -140,9 +145,23 @@ impl BrokerHandle {
         self.trigger.shutdown();
     }
 
+    /// True while every worker thread is still running. Goes false as soon
+    /// as any worker exits — after a panic, a shutdown, or a drain — so an
+    /// embedder holding this handle can notice a dead ingest server without
+    /// blocking in [`join`](Self::join). It reports worker death, not health.
+    pub fn is_running(&self) -> bool {
+        !self
+            .handles
+            .iter()
+            .any(std::thread::JoinHandle::is_finished)
+    }
+
     /// Wait for every worker thread to exit, aggregating their terminal
     /// results. Does NOT itself signal shutdown — call [`shutdown`](Self::shutdown)
     /// (or drop the handle) first if the embedder wants the workers to stop.
+    /// A worker that exits unexpectedly signals shutdown to its siblings from
+    /// its own thread, so this call returns rather than blocking on a live
+    /// sibling's accept loop.
     ///
     /// The first worker error wins; a thread panic surfaces as
     /// [`Error::Worker("worker thread panicked".into())`].
@@ -184,6 +203,34 @@ impl Drop for BrokerHandle {
     }
 }
 
+/// Fail-fast supervision for one worker thread. Dropped on normal return
+/// and on unwind alike, so a panicking worker signals shutdown to its
+/// siblings instead of leaving them parked in `cancelable_accept`.
+struct WorkerExitGuard {
+    worker_id: usize,
+    post_go: worker::PostGoFlag,
+    trigger: ShutdownHandle,
+}
+
+impl Drop for WorkerExitGuard {
+    /// Runs on normal return and on unwind alike. A worker that never
+    /// reached the go barrier leaves the signal untouched, so both
+    /// startup-error paths keep their exact behaviour.
+    fn drop(&mut self) {
+        if !self.post_go.is_armed() {
+            return;
+        }
+        let taken = self.trigger.take_signal_ends();
+        if taken.is_some() {
+            tracing::error!(
+                "worker {} exited before shutdown was signaled; shutting down remaining workers",
+                self.worker_id
+            );
+        }
+        drop(taken);
+    }
+}
+
 /// High-performance MQTT broker using Monoio io_uring runtime.
 pub struct MqttBroker;
 
@@ -204,7 +251,12 @@ impl MqttBroker {
     /// the callback unwinds the worker thread (monoio's task harness does not
     /// catch it) and surfaces from [`BrokerHandle::join`] as
     /// [`Error::Worker(_)`]. Never call [`BrokerHandle::join`] or drop a
-    /// [`BrokerHandle`] from inside an event callback.
+    /// [`BrokerHandle`] from inside an event callback. That panic also signals
+    /// shutdown to the remaining workers, so the whole ingest server stops
+    /// rather than running with a dead worker. This relies on the panic
+    /// unwinding: an application built with the `panic = "abort"` profile
+    /// setting terminates at the panic site instead, with no shutdown signal
+    /// and no drain.
     pub fn start_with_callback(
         config: BrokerConfig,
         callback: Option<EventCallback>,
@@ -236,6 +288,9 @@ impl MqttBroker {
             signal_ends.push(main_end);
             worker_ends.push(worker_end);
         }
+        let trigger = ShutdownHandle {
+            signal_ends: std::sync::Arc::new(std::sync::Mutex::new(Some(signal_ends))),
+        };
 
         // Startup barrier: every worker's fallible setup (runtime build, bind,
         // state/channel/processor spawn) completes before we fan out go/abort.
@@ -247,6 +302,7 @@ impl MqttBroker {
         for worker_id in 0..num_workers {
             let config = config.clone();
             let callback = callback.clone();
+            let trigger = trigger.clone();
             let (go_tx, go_rx) = std::sync::mpsc::channel();
             go_txs.push(go_tx);
             let ready_tx = ready_tx.clone();
@@ -255,6 +311,14 @@ impl MqttBroker {
             match std::thread::Builder::new()
                 .name(format!("mqtt-worker-{worker_id}"))
                 .spawn(move || -> Result<(), Error> {
+                    let post_go = worker::PostGoFlag::unarmed();
+                    // Declared before `runtime` so it drops after it: the guard is the
+                    // last thing to run on this thread, on return and on unwind alike.
+                    let _exit_guard = WorkerExitGuard {
+                        worker_id,
+                        post_go: post_go.clone(),
+                        trigger,
+                    };
                     let mut runtime = match monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
                         .enable_timer()
                         .build()
@@ -271,7 +335,7 @@ impl MqttBroker {
                         }
                     };
                     runtime.block_on(worker::run_worker(
-                        worker_id, config, callback, ready_tx, go_rx, worker_end,
+                        worker_id, config, callback, ready_tx, go_rx, worker_end, post_go,
                     ))
                 }) {
                 Ok(h) => handles.push(h),
@@ -301,12 +365,7 @@ impl MqttBroker {
             return Err(e);
         }
 
-        Ok(BrokerHandle {
-            trigger: ShutdownHandle {
-                signal_ends: std::sync::Arc::new(std::sync::Mutex::new(Some(signal_ends))),
-            },
-            handles,
-        })
+        Ok(BrokerHandle { trigger, handles })
     }
 
     /// Run the MQTT broker with the given configuration. Equivalent to
@@ -1129,63 +1188,404 @@ mod tests {
         }
     }
 
-    /// AC-11 — a callback that panics unwinds the worker thread; `join`
-    /// surfaces it as `Error::Worker(_)`.
     #[test]
-    fn callback_panic_surfaces_as_join_error() {
+    fn armed_exit_guard_closes_the_signal_ends_and_logs_once() {
+        let logs = crate::broker::handler::tests::capture_logs();
+        let (main_end, mut peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        peer.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set read timeout");
+        let trigger = ShutdownHandle {
+            signal_ends: std::sync::Arc::new(std::sync::Mutex::new(Some(vec![main_end]))),
+        };
+        let post_go = worker::PostGoFlag::unarmed();
+        post_go.arm();
+        let guard = WorkerExitGuard {
+            worker_id: 7,
+            post_go,
+            trigger: trigger.clone(),
+        };
+        drop(guard);
+
+        let mut byte = [0u8; 1];
+        assert_eq!(peer.read(&mut byte).expect("signal peer read"), 0);
+        let logs = String::from_utf8(logs.lock().expect("log lock").clone()).expect("log UTF-8");
+        assert!(crate::broker::handler::tests::has_line_at(
+            &logs,
+            "ERROR",
+            &["worker 7", "before shutdown was signaled"],
+        ));
+        assert_eq!(
+            crate::broker::handler::tests::count_lines_at(
+                &logs,
+                "ERROR",
+                "before shutdown was signaled",
+            ),
+            1,
+        );
+        assert!(trigger.take_signal_ends().is_none());
+    }
+
+    #[test]
+    fn unarmed_exit_guard_leaves_the_signal_ends_open() {
+        let logs = crate::broker::handler::tests::capture_logs();
+        let (main_end, mut peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        peer.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set read timeout");
+        let trigger = ShutdownHandle {
+            signal_ends: std::sync::Arc::new(std::sync::Mutex::new(Some(vec![main_end]))),
+        };
+        let post_go = worker::PostGoFlag::unarmed();
+        let guard = WorkerExitGuard {
+            worker_id: 7,
+            post_go,
+            trigger: trigger.clone(),
+        };
+        drop(guard);
+
+        let mut byte = [0u8; 1];
+        assert!(matches!(
+            peer.read(&mut byte),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+        ));
+        let logs = String::from_utf8(logs.lock().expect("log lock").clone()).expect("log UTF-8");
+        assert_eq!(
+            crate::broker::handler::tests::count_lines_at(
+                &logs,
+                "ERROR",
+                "before shutdown was signaled",
+            ),
+            0,
+        );
+        trigger.shutdown();
+        assert_eq!(peer.read(&mut byte).expect("shutdown signal peer read"), 0);
+    }
+
+    #[test]
+    fn second_armed_exit_guard_over_a_consumed_trigger_is_silent() {
+        let logs = crate::broker::handler::tests::capture_logs();
+        let (main_end, mut peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        peer.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set read timeout");
+        let trigger = ShutdownHandle {
+            signal_ends: std::sync::Arc::new(std::sync::Mutex::new(Some(vec![main_end]))),
+        };
+        let first_post_go = worker::PostGoFlag::unarmed();
+        first_post_go.arm();
+        let second_post_go = worker::PostGoFlag::unarmed();
+        second_post_go.arm();
+        drop(WorkerExitGuard {
+            worker_id: 7,
+            post_go: first_post_go,
+            trigger: trigger.clone(),
+        });
+        drop(WorkerExitGuard {
+            worker_id: 8,
+            post_go: second_post_go,
+            trigger: trigger.clone(),
+        });
+
+        let mut byte = [0u8; 1];
+        assert_eq!(peer.read(&mut byte).expect("signal peer read"), 0);
+        let logs = String::from_utf8(logs.lock().expect("log lock").clone()).expect("log UTF-8");
+        assert_eq!(
+            crate::broker::handler::tests::count_lines_at(
+                &logs,
+                "ERROR",
+                "before shutdown was signaled",
+            ),
+            1,
+        );
+        assert!(!crate::broker::handler::tests::has_line_at(
+            &logs,
+            "ERROR",
+            &["worker 8"]
+        ));
+    }
+
+    #[test]
+    fn armed_exit_guard_after_an_explicit_shutdown_is_silent() {
+        let logs = crate::broker::handler::tests::capture_logs();
+        let (main_end, mut peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        peer.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set read timeout");
+        let trigger = ShutdownHandle {
+            signal_ends: std::sync::Arc::new(std::sync::Mutex::new(Some(vec![main_end]))),
+        };
+        let post_go = worker::PostGoFlag::unarmed();
+        post_go.arm();
+        trigger.shutdown();
+        drop(WorkerExitGuard {
+            worker_id: 9,
+            post_go,
+            trigger: trigger.clone(),
+        });
+
+        let mut byte = [0u8; 1];
+        assert_eq!(peer.read(&mut byte).expect("shutdown signal peer read"), 0);
+        let logs = String::from_utf8(logs.lock().expect("log lock").clone()).expect("log UTF-8");
+        assert_eq!(
+            crate::broker::handler::tests::count_lines_at(
+                &logs,
+                "ERROR",
+                "before shutdown was signaled",
+            ),
+            0,
+        );
+    }
+
+    /// AC-1 across every end — one socketpair exists per worker, so a guard
+    /// that took the `Vec` but closed only its first element would leave
+    /// every other sibling parked in `cancelable_accept`. Each retained peer
+    /// must reach EOF, not just the first.
+    #[test]
+    fn armed_exit_guard_closes_every_signal_end() {
+        const WORKERS: usize = 3;
+
+        let mut main_ends = Vec::with_capacity(WORKERS);
+        let mut peers = Vec::with_capacity(WORKERS);
+        for _ in 0..WORKERS {
+            let (main_end, peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+            peer.set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set read timeout");
+            main_ends.push(main_end);
+            peers.push(peer);
+        }
+        let trigger = ShutdownHandle {
+            signal_ends: std::sync::Arc::new(std::sync::Mutex::new(Some(main_ends))),
+        };
+        let post_go = worker::PostGoFlag::unarmed();
+        post_go.arm();
+        drop(WorkerExitGuard {
+            worker_id: 4,
+            post_go,
+            trigger,
+        });
+
+        let mut byte = [0u8; 1];
+        for (i, peer) in peers.iter_mut().enumerate() {
+            assert_eq!(
+                peer.read(&mut byte).expect("signal peer read"),
+                0,
+                "sibling {i}'s signal end never reached EOF"
+            );
+        }
+    }
+
+    /// `shutdown`'s observable behaviour must survive the extraction of
+    /// `take_signal_ends`: the first call closes EVERY main-side end and
+    /// emits exactly one INFO line, a second call emits none, and neither
+    /// call may ever emit the guard's ERROR line.
+    #[test]
+    fn shutdown_takes_every_end_and_logs_its_info_line_once() {
+        const WORKERS: usize = 2;
+
+        let logs = crate::broker::handler::tests::capture_logs();
+        let mut main_ends = Vec::with_capacity(WORKERS);
+        let mut peers = Vec::with_capacity(WORKERS);
+        for _ in 0..WORKERS {
+            let (main_end, peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+            peer.set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set read timeout");
+            main_ends.push(main_end);
+            peers.push(peer);
+        }
+        let trigger = ShutdownHandle {
+            signal_ends: std::sync::Arc::new(std::sync::Mutex::new(Some(main_ends))),
+        };
+
+        trigger.shutdown();
+        let mut byte = [0u8; 1];
+        for (i, peer) in peers.iter_mut().enumerate() {
+            assert_eq!(
+                peer.read(&mut byte).expect("signal peer read"),
+                0,
+                "worker {i}'s signal end never reached EOF"
+            );
+        }
+        trigger.shutdown();
+
+        let logs = String::from_utf8(logs.lock().expect("log lock").clone()).expect("log UTF-8");
+        assert_eq!(
+            crate::broker::handler::tests::count_lines_at(
+                &logs,
+                "INFO",
+                "shutdown signaled to workers",
+            ),
+            1,
+        );
+        assert_eq!(
+            crate::broker::handler::tests::count_lines_at(
+                &logs,
+                "ERROR",
+                "before shutdown was signaled",
+            ),
+            0,
+        );
+    }
+
+    /// AC-6 + AC-7 — a callback panic stops a sibling before `join`, and
+    /// `join` returns the worker error without an explicit shutdown.
+    #[allow(clippy::too_many_lines)] // bounded multi-worker lifecycle harness covers discovery, trigger, and observation
+    #[test]
+    fn callback_panic_shuts_down_siblings_and_surfaces_as_join_error() {
+        const PANIC_TEMPERATURE: i16 = -1;
+        const SETUP_BUDGET: Duration = Duration::from_secs(30);
+        const OBSERVE_BUDGET: Duration = Duration::from_secs(20);
+
         let port = find_free_port();
         let addr_str = format!("127.0.0.1:{port}");
         let addr: std::net::SocketAddr = addr_str.parse().expect("parse addr");
-        let config = BrokerConfig::new(addr_str).num_workers(1);
-        let cb: EventCallback = std::sync::Arc::new(|_event: Event| {
-            panic!("test callback panic");
+        let config = BrokerConfig::new(addr_str)
+            .num_workers(2)
+            .drain_timeout_secs(1);
+        let (cb_tx, cb_rx) = std::sync::mpsc::channel::<(i16, String)>();
+        let cb: EventCallback = std::sync::Arc::new(move |event: Event| {
+            let Event::SensorV1 { temperature, .. } = event;
+            assert!(temperature != PANIC_TEMPERATURE, "test callback panic");
+            let _ = cb_tx.send((
+                temperature,
+                std::thread::current()
+                    .name()
+                    .unwrap_or("unnamed")
+                    .to_string(),
+            ));
         });
 
-        // The outer `Result` separates setup failure (`Err(String)`) from the
-        // `join` result under test (`Ok(_)`): a startup or client-setup failure
-        // must never be readable as successful panic-propagation coverage.
-        let (tx, rx) = std::sync::mpsc::channel::<Result<Result<(), Error>, String>>();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(Result<(), Error>, Duration), String>>();
         let _h = std::thread::Builder::new()
-            .name("t3-ac11-callback-panic".into())
+            .name("t3-ac11-callback-panic-siblings".into())
             .spawn(move || {
-                let outcome = (|| -> Result<Result<(), Error>, String> {
+                let outcome = (|| -> Result<(Result<(), Error>, Duration), String> {
                     let handle = MqttBroker::start_with_callback(config, Some(cb))
                         .map_err(|e| format!("startup failed before the callback ran: {e}"))?;
 
-                    let mut client =
-                        std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2))
-                            .map_err(|e| format!("client connect failed: {e}"))?;
-                    client
-                        .set_read_timeout(Some(Duration::from_secs(5)))
-                        .map_err(|e| format!("set_read_timeout failed: {e}"))?;
-                    client
-                        .write_all(&V3_CONNECT_TEST)
-                        .map_err(|e| format!("CONNECT write failed: {e}"))?;
-                    let mut connack = [0u8; 4];
-                    client
-                        .read_exact(&mut connack)
-                        .map_err(|e| format!("CONNACK read failed: {e}"))?;
-                    assert_eq!(connack, [0x20, 0x02, 0x00, 0x00]);
+                    let setup_deadline = Instant::now() + SETUP_BUDGET;
+                    let remaining = || setup_deadline.saturating_duration_since(Instant::now());
+                    let mut victim = None;
+                    let mut survivor = None;
 
-                    // Write a PUBLISH — the worker decodes it, invokes the
-                    // callback, the callback panics, the worker thread unwinds.
-                    let publish: [u8; 9] = [0x30, 0x07, 0x00, 0x01, b't', 0x09, 0xC4, 0x03, 0xF5];
-                    client
-                        .write_all(&publish)
-                        .map_err(|e| format!("PUBLISH write failed: {e}"))?;
+                    for i in 0_i16..24 {
+                        if survivor.is_some() || Instant::now() >= setup_deadline {
+                            break;
+                        }
+                        let mut client = std::net::TcpStream::connect_timeout(
+                            &addr,
+                            remaining().min(Duration::from_secs(2)),
+                        )
+                        .map_err(|e| format!("setup budget exhausted at client {i}: {e}"))?;
+                        client
+                            .set_read_timeout(Some(remaining()))
+                            .map_err(|e| format!("setup budget exhausted at client {i}: {e}"))?;
+                        client
+                            .set_write_timeout(Some(remaining()))
+                            .map_err(|e| format!("setup budget exhausted at client {i}: {e}"))?;
+                        client
+                            .write_all(&V3_CONNECT_TEST)
+                            .map_err(|e| format!("setup budget exhausted at client {i}: {e}"))?;
+                        client
+                            .set_read_timeout(Some(remaining()))
+                            .map_err(|e| format!("setup budget exhausted at client {i}: {e}"))?;
+                        let mut connack = [0u8; 4];
+                        client
+                            .read_exact(&mut connack)
+                            .map_err(|e| format!("setup budget exhausted at client {i}: {e}"))?;
+                        assert_eq!(connack, [0x20, 0x02, 0x00, 0x00]);
 
-                    // Shutdown is harmless on a dead worker — the EOF signal
-                    // is a no-op once the worker is gone.
-                    handle.shutdown();
-                    Ok(handle.join())
+                        let mut publish: [u8; 9] =
+                            [0x30, 0x07, 0x00, 0x01, b't', 0x09, 0xC4, 0x03, 0xF5];
+                        publish[5..7].copy_from_slice(&i.to_be_bytes());
+                        client
+                            .set_write_timeout(Some(remaining()))
+                            .map_err(|e| format!("setup budget exhausted at client {i}: {e}"))?;
+                        client
+                            .write_all(&publish)
+                            .map_err(|e| format!("setup budget exhausted at client {i}: {e}"))?;
+                        let (temperature, worker_name) = cb_rx
+                            .recv_timeout(setup_deadline.saturating_duration_since(Instant::now()))
+                            .map_err(|e| format!("setup budget exhausted at client {i}: {e}"))?;
+                        assert_eq!(temperature, i);
+
+                        let already_held = victim
+                            .as_ref()
+                            .is_some_and(|(_, name)| name == &worker_name)
+                            || survivor
+                                .as_ref()
+                                .is_some_and(|(_, name)| name == &worker_name);
+                        if victim.is_none() {
+                            victim = Some((client, worker_name));
+                        } else if !already_held && survivor.is_none() {
+                            survivor = Some((client, worker_name));
+                        }
+                    }
+
+                    let (mut victim, _victim_name) = victim
+                        .ok_or_else(|| "only 0 distinct workers after discovery".to_string())?;
+                    let Some((mut survivor, _survivor_name)) = survivor else {
+                        return Err("only 1 distinct worker after discovery".to_string());
+                    };
+
+                    let t0 = Instant::now();
+                    let observe_deadline = t0 + OBSERVE_BUDGET;
+                    let mut panic_publish: [u8; 9] =
+                        [0x30, 0x07, 0x00, 0x01, b't', 0x09, 0xC4, 0x03, 0xF5];
+                    panic_publish[5..7].copy_from_slice(&PANIC_TEMPERATURE.to_be_bytes());
+                    victim
+                        .set_write_timeout(Some(
+                            observe_deadline.saturating_duration_since(Instant::now()),
+                        ))
+                        .map_err(|e| format!("observation budget exhausted: {e}"))?;
+                    victim
+                        .write_all(&panic_publish)
+                        .map_err(|e| format!("observation budget exhausted: {e}"))?;
+
+                    let remaining = observe_deadline.saturating_duration_since(Instant::now());
+                    if remaining == Duration::ZERO {
+                        return Err(
+                            "survivor did not close before observation deadline".to_string()
+                        );
+                    }
+                    survivor
+                        .set_read_timeout(Some(remaining))
+                        .map_err(|e| format!("observation budget exhausted: {e}"))?;
+                    let mut byte = [0u8; 1];
+                    match survivor.read(&mut byte) {
+                        Ok(0) => {}
+                        Ok(n) => {
+                            return Err(format!("survivor read {n} bytes instead of closing"));
+                        }
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::BrokenPipe
+                            ) => {}
+                        Err(e) => {
+                            return Err(format!("survivor closed with unexpected error: {e}"));
+                        }
+                    }
+
+                    let join_result = handle.join();
+                    let elapsed = t0.elapsed();
+                    Ok((join_result, elapsed))
                 })();
-                let _ = tx.send(outcome);
+                let _ = match outcome {
+                    Ok(value) => tx.send(Ok(value)),
+                    Err(error) => tx.send(Err(error)),
+                };
             })
             .expect("spawn harness");
-        match rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(Ok(Err(Error::Worker(_)))) => {}
-            other => panic!("expected Ok(Err(Worker(_))) from harness, got {other:?}"),
-        }
+
+        let (join_result, elapsed) = match rx.recv_timeout(Duration::from_secs(90)) {
+            Ok(Ok(value)) => value,
+            Ok(Err(error)) => panic!("harness setup failed: {error}"),
+            Err(error) => panic!("harness watchdog failed: {error:?}"),
+        };
+        assert!(matches!(join_result, Err(Error::Worker(_))));
+        assert!(elapsed <= Duration::from_secs(25));
     }
 
     /// The lifecycle types are part of the crate-root surface an embedder
@@ -1400,5 +1800,138 @@ mod tests {
             Ok(Ok(())) => {}
             other => panic!("expected Ok(()) from harness, got {other:?}"),
         }
+    }
+
+    /// AC-8 — a healthy ingest server's `join` stays blocked until something
+    /// signals shutdown. Pins the contract: no future refactor may move
+    /// supervision into `join`.
+    #[test]
+    fn join_stays_blocked_until_shutdown_is_signaled() {
+        let (tx, rx) = std::sync::mpsc::channel::<(bool, bool)>();
+        let _h = std::thread::Builder::new()
+            .name("t4-ac8-join-stays-blocked".into())
+            .spawn(move || {
+                let outcome = (|| -> Result<(), Error> {
+                    let port = find_free_port();
+                    let addr_str = format!("127.0.0.1:{port}");
+                    let config = BrokerConfig::new(addr_str)
+                        .num_workers(2)
+                        .drain_timeout_secs(1);
+
+                    let handle = MqttBroker::start(config)?;
+                    let trigger = handle.shutdown_handle();
+
+                    // Inner thread: rendezvous THEN `join` — so the 3 s
+                    // blocked-ness window is not spent waiting for the
+                    // thread to be scheduled.
+                    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+                    let (jtx, jrx) = std::sync::mpsc::channel::<Result<(), Error>>();
+                    let inner = std::thread::Builder::new()
+                        .name("t4-ac8-inner-join".into())
+                        .spawn(move || {
+                            let _ = entered_tx.send(());
+                            let r = handle.join();
+                            let _ = jtx.send(r);
+                        })
+                        .expect("spawn inner");
+
+                    entered_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .map_err(|e| Error::Worker(format!("inner thread never entered: {e}")))?;
+
+                    let stayed_blocked = jrx.recv_timeout(Duration::from_secs(3)).is_err();
+
+                    trigger.shutdown();
+                    let returned_after_signal = match jrx.recv_timeout(Duration::from_secs(15)) {
+                        Ok(Ok(())) => true,
+                        Ok(Err(e)) => {
+                            return Err(Error::Worker(format!(
+                                "join returned Err after shutdown: {e}"
+                            )))
+                        }
+                        Err(e) => {
+                            return Err(Error::Worker(format!(
+                                "join did not return after shutdown: {e}"
+                            )))
+                        }
+                    };
+
+                    inner.join().expect("inner thread join");
+                    let _ = tx.send((stayed_blocked, returned_after_signal));
+                    Ok(())
+                })();
+                if outcome.is_err() {
+                    let _ = tx.send((false, false));
+                }
+            })
+            .expect("spawn harness");
+        let Ok((stayed_blocked, returned_after_signal)) = rx.recv_timeout(Duration::from_secs(45))
+        else {
+            panic!("harness did not report within 45s")
+        };
+        assert!(
+            stayed_blocked,
+            "join returned within 3 s on a healthy server with no shutdown signaled"
+        );
+        assert!(
+            returned_after_signal,
+            "join did not return within 15 s of trigger.shutdown()"
+        );
+    }
+
+    /// AC-10, AC-11 — `is_running` is `true` on a healthy server, goes
+    /// `false` within 10 s of `shutdown()`. A non-consuming, non-blocking
+    /// signal for an embedder that holds the handle and never joins.
+    #[test]
+    fn is_running_goes_false_once_a_worker_has_exited() {
+        let (tx, rx) = std::sync::mpsc::channel::<(bool, bool)>();
+        let _h = std::thread::Builder::new()
+            .name("t4-ac10-is-running".into())
+            .spawn(move || {
+                let outcome = (|| -> Result<(), Error> {
+                    let port = find_free_port();
+                    let addr_str = format!("127.0.0.1:{port}");
+                    let config = BrokerConfig::new(addr_str)
+                        .num_workers(2)
+                        .drain_timeout_secs(1);
+
+                    let handle = MqttBroker::start(config)?;
+                    let true_while_healthy = handle.is_running();
+
+                    handle.shutdown();
+
+                    // Poll up to 40 × 250 ms (10 s ceiling).
+                    let mut false_after_exit = false;
+                    for _ in 0..40 {
+                        if !handle.is_running() {
+                            false_after_exit = true;
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+
+                    // The handle is intentionally not joined here: the point
+                    // is that this signal needs no `join`. The harness
+                    // thread's `Drop` tears the server down.
+                    let _ = tx.send((true_while_healthy, false_after_exit));
+                    Ok(())
+                })();
+                if outcome.is_err() {
+                    let _ = tx.send((false, false));
+                }
+            })
+            .expect("spawn harness");
+        let Ok((true_while_healthy, false_after_exit)) = rx.recv_timeout(Duration::from_secs(45))
+        else {
+            panic!("harness did not report within 45s")
+        };
+        assert!(
+            true_while_healthy,
+            "is_running was false on a freshly started server"
+        );
+        assert!(
+            false_after_exit,
+            "is_running stayed true for more than 10 s after shutdown()"
+        );
     }
 }

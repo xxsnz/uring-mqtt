@@ -155,6 +155,25 @@ pub(crate) fn event_channel(worker_id: usize) -> (EventSender, EventReceiver) {
     )
 }
 
+/// Set by a worker once it passes the go barrier. Read by that thread's
+/// exit guard, so a worker that exits during startup never signals
+/// shutdown. Single-threaded by construction: armed and read on the
+/// worker thread, and the guard's drop strictly follows the arming.
+#[derive(Clone)]
+pub(crate) struct PostGoFlag(Rc<Cell<bool>>);
+
+impl PostGoFlag {
+    pub(crate) fn unarmed() -> Self {
+        Self(Rc::new(Cell::new(false)))
+    }
+    pub(crate) fn arm(&self) {
+        self.0.set(true);
+    }
+    pub(crate) fn is_armed(&self) -> bool {
+        self.0.get()
+    }
+}
+
 /// Run a worker thread with its own io_uring event loop.
 ///
 /// ALL fallible setup (bind, `WorkerState`, event channel, event-processor
@@ -171,6 +190,7 @@ pub async fn run_worker(
     ready_tx: std::sync::mpsc::Sender<(usize, Result<(), Error>)>,
     go_rx: std::sync::mpsc::Receiver<bool>,
     shutdown_signal: std::os::unix::net::UnixStream,
+    post_go: PostGoFlag,
 ) -> Result<(), Error> {
     tracing::info!("Worker {} starting", worker_id);
 
@@ -237,6 +257,10 @@ pub async fn run_worker(
         return Ok(());
     }
     // Ok(true) falls through to the accept loop.
+
+    // Post-go: this thread's exit guard may now signal shutdown to the
+    // siblings. Armed here so a startup abort never does.
+    post_go.arm();
 
     // Per-worker shutdown machinery: done-channel (sender drops are the
     // drain signal), abort semaphore (close() broadcasts the force-close),
@@ -665,7 +689,15 @@ mod tests {
                     .enable_timer()
                     .build()
                     .expect("runtime build");
-                let r = rt.block_on(run_worker(0, config, None, ready_tx, go_rx, sig_worker));
+                let r = rt.block_on(run_worker(
+                    0,
+                    config,
+                    None,
+                    ready_tx,
+                    go_rx,
+                    sig_worker,
+                    PostGoFlag::unarmed(),
+                ));
                 let _ = res_tx.send(r);
             })
             .expect("spawn worker");
@@ -771,7 +803,15 @@ mod tests {
                     .enable_timer()
                     .build()
                     .expect("runtime build");
-                let r = rt.block_on(run_worker(3, config, None, ready_tx, go_rx, sig_worker));
+                let r = rt.block_on(run_worker(
+                    3,
+                    config,
+                    None,
+                    ready_tx,
+                    go_rx,
+                    sig_worker,
+                    PostGoFlag::unarmed(),
+                ));
                 let _ = res_tx.send(r);
             })
             .expect("spawn worker");
@@ -788,6 +828,147 @@ mod tests {
             Ok(Ok(())) => {}
             other => panic!("expected Ok(()), got {other:?}"),
         }
+        worker_thread.join().expect("worker join");
+    }
+
+    #[test]
+    fn post_go_flag_stays_unarmed_when_startup_aborts() {
+        let std_pick = StdTcpListener::bind("127.0.0.1:0").expect("std bind free");
+        let addr: std::net::SocketAddr = std_pick.local_addr().expect("local_addr");
+        drop(std_pick);
+
+        let config = BrokerConfig::new(addr.to_string());
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        let (res_tx, res_rx) = std::sync::mpsc::channel::<(Result<(), Error>, bool)>();
+        let (sig_main, sig_worker) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+
+        let worker_thread = std::thread::Builder::new()
+            .name("post-go-startup-abort-test".into())
+            .spawn(move || {
+                let post_go = PostGoFlag::unarmed();
+                let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+                    .enable_timer()
+                    .build()
+                    .expect("runtime build");
+                let r = rt.block_on(run_worker(
+                    0,
+                    config,
+                    None,
+                    ready_tx,
+                    go_rx,
+                    sig_worker,
+                    post_go.clone(),
+                ));
+                let _ = res_tx.send((r, post_go.is_armed()));
+            })
+            .expect("spawn worker");
+
+        match ready_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok((0, Ok(()))) => {}
+            other => panic!("expected ready, got {other:?}"),
+        }
+        go_tx.send(false).expect("go false");
+        let (result, armed) = res_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker result timeout");
+        assert!(matches!(result, Ok(())));
+        assert!(!armed);
+        worker_thread.join().expect("worker join");
+        drop(sig_main);
+    }
+
+    #[test]
+    fn post_go_flag_stays_unarmed_when_the_go_channel_disconnects() {
+        let std_pick = StdTcpListener::bind("127.0.0.1:0").expect("std bind free");
+        let addr: std::net::SocketAddr = std_pick.local_addr().expect("local_addr");
+        drop(std_pick);
+
+        let config = BrokerConfig::new(addr.to_string());
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<bool>();
+        let (res_tx, res_rx) = std::sync::mpsc::channel::<(Result<(), Error>, bool)>();
+        let (sig_main, sig_worker) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+
+        let worker_thread = std::thread::Builder::new()
+            .name("post-go-go-disconnect-test".into())
+            .spawn(move || {
+                let post_go = PostGoFlag::unarmed();
+                let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+                    .enable_timer()
+                    .build()
+                    .expect("runtime build");
+                let r = rt.block_on(run_worker(
+                    1,
+                    config,
+                    None,
+                    ready_tx,
+                    go_rx,
+                    sig_worker,
+                    post_go.clone(),
+                ));
+                let _ = res_tx.send((r, post_go.is_armed()));
+            })
+            .expect("spawn worker");
+
+        match ready_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok((1, Ok(()))) => {}
+            other => panic!("expected ready, got {other:?}"),
+        }
+        drop(go_tx);
+        let (result, armed) = res_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker result timeout");
+        assert!(matches!(result, Ok(())));
+        assert!(!armed);
+        worker_thread.join().expect("worker join");
+        drop(sig_main);
+    }
+
+    #[test]
+    fn post_go_flag_is_armed_after_the_go_barrier() {
+        let std_pick = StdTcpListener::bind("127.0.0.1:0").expect("std bind free");
+        let addr: std::net::SocketAddr = std_pick.local_addr().expect("local_addr");
+        drop(std_pick);
+
+        let config = BrokerConfig::new(addr.to_string()).drain_timeout_secs(1);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        let (res_tx, res_rx) = std::sync::mpsc::channel::<(Result<(), Error>, bool)>();
+        let (sig_main, sig_worker) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+
+        let worker_thread = std::thread::Builder::new()
+            .name("post-go-armed-test".into())
+            .spawn(move || {
+                let post_go = PostGoFlag::unarmed();
+                let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+                    .enable_timer()
+                    .build()
+                    .expect("runtime build");
+                let r = rt.block_on(run_worker(
+                    2,
+                    config,
+                    None,
+                    ready_tx,
+                    go_rx,
+                    sig_worker,
+                    post_go.clone(),
+                ));
+                let _ = res_tx.send((r, post_go.is_armed()));
+            })
+            .expect("spawn worker");
+
+        match ready_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok((2, Ok(()))) => {}
+            other => panic!("expected ready, got {other:?}"),
+        }
+        go_tx.send(true).expect("go true");
+        drop(sig_main);
+        let (result, armed) = res_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker result timeout");
+        assert!(matches!(result, Ok(())));
+        assert!(armed);
         worker_thread.join().expect("worker join");
     }
 
@@ -832,7 +1013,15 @@ mod tests {
                     .enable_timer()
                     .build()
                     .expect("rt a");
-                let r = rt.block_on(run_worker(0, cfg_a, None, ready_a, go_a_rx, sig_a_worker));
+                let r = rt.block_on(run_worker(
+                    0,
+                    cfg_a,
+                    None,
+                    ready_a,
+                    go_a_rx,
+                    sig_a_worker,
+                    PostGoFlag::unarmed(),
+                ));
                 let _ = res_a_tx.send(r);
             })
             .expect("spawn a");
@@ -843,7 +1032,15 @@ mod tests {
                     .enable_timer()
                     .build()
                     .expect("rt b");
-                let r = rt.block_on(run_worker(1, cfg_b, None, ready_b, go_b_rx, sig_b_worker));
+                let r = rt.block_on(run_worker(
+                    1,
+                    cfg_b,
+                    None,
+                    ready_b,
+                    go_b_rx,
+                    sig_b_worker,
+                    PostGoFlag::unarmed(),
+                ));
                 let _ = res_b_tx.send(r);
             })
             .expect("spawn b");
@@ -935,7 +1132,15 @@ mod tests {
                     .enable_timer()
                     .build()
                     .expect("rt a");
-                let r = rt.block_on(run_worker(0, cfg_a, None, ready_a, go_a_rx, sig_a_worker));
+                let r = rt.block_on(run_worker(
+                    0,
+                    cfg_a,
+                    None,
+                    ready_a,
+                    go_a_rx,
+                    sig_a_worker,
+                    PostGoFlag::unarmed(),
+                ));
                 let _ = res_a_tx.send(r);
             })
             .expect("spawn a");
@@ -947,7 +1152,15 @@ mod tests {
                     .build()
                     .expect("rt b");
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    rt.block_on(run_worker(1, cfg_b, None, ready_b, go_b_rx, sig_b_worker))
+                    rt.block_on(run_worker(
+                        1,
+                        cfg_b,
+                        None,
+                        ready_b,
+                        go_b_rx,
+                        sig_b_worker,
+                        PostGoFlag::unarmed(),
+                    ))
                 }));
                 let _ = res_b_tx.send(r);
             })
@@ -1060,7 +1273,15 @@ mod tests {
                     .enable_timer()
                     .build()
                     .expect("runtime build");
-                let r = rt.block_on(run_worker(0, config, None, ready_tx, go_rx, sig_worker));
+                let r = rt.block_on(run_worker(
+                    0,
+                    config,
+                    None,
+                    ready_tx,
+                    go_rx,
+                    sig_worker,
+                    PostGoFlag::unarmed(),
+                ));
                 let _ = res_tx.send(r);
             })
             .expect("spawn worker");
@@ -1121,7 +1342,15 @@ mod tests {
                     .enable_timer()
                     .build()
                     .expect("runtime build");
-                let r = rt.block_on(run_worker(0, config, None, ready_tx, go_rx, sig_worker));
+                let r = rt.block_on(run_worker(
+                    0,
+                    config,
+                    None,
+                    ready_tx,
+                    go_rx,
+                    sig_worker,
+                    PostGoFlag::unarmed(),
+                ));
                 let _ = res_tx.send(r);
             })
             .expect("spawn worker");
@@ -1205,7 +1434,15 @@ mod tests {
                     .enable_timer()
                     .build()
                     .expect("runtime build");
-                let r = rt.block_on(run_worker(0, config, None, ready_tx, go_rx, sig_worker));
+                let r = rt.block_on(run_worker(
+                    0,
+                    config,
+                    None,
+                    ready_tx,
+                    go_rx,
+                    sig_worker,
+                    PostGoFlag::unarmed(),
+                ));
                 let _ = res_tx.send(r);
             })
             .expect("spawn worker");
@@ -1293,7 +1530,15 @@ mod tests {
                     .enable_timer()
                     .build()
                     .expect("runtime build");
-                let r = rt.block_on(run_worker(0, config, None, ready_tx, go_rx, sig_worker));
+                let r = rt.block_on(run_worker(
+                    0,
+                    config,
+                    None,
+                    ready_tx,
+                    go_rx,
+                    sig_worker,
+                    PostGoFlag::unarmed(),
+                ));
                 let _ = res_tx.send(r);
             })
             .expect("spawn worker");
@@ -1371,7 +1616,15 @@ mod tests {
                     .enable_timer()
                     .build()
                     .expect("runtime build");
-                let r = rt.block_on(run_worker(0, config, None, ready_tx, go_rx, sig_worker));
+                let r = rt.block_on(run_worker(
+                    0,
+                    config,
+                    None,
+                    ready_tx,
+                    go_rx,
+                    sig_worker,
+                    PostGoFlag::unarmed(),
+                ));
                 let _ = res_tx.send(r);
             })
             .expect("spawn worker");
@@ -1428,7 +1681,15 @@ mod tests {
                     .enable_timer()
                     .build()
                     .expect("runtime build");
-                let r = rt.block_on(run_worker(0, config, None, ready_tx, go_rx, sig_worker));
+                let r = rt.block_on(run_worker(
+                    0,
+                    config,
+                    None,
+                    ready_tx,
+                    go_rx,
+                    sig_worker,
+                    PostGoFlag::unarmed(),
+                ));
                 let _ = res_tx.send(r);
             })
             .expect("spawn worker");
