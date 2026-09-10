@@ -97,6 +97,11 @@ pub(crate) fn evaluate_connect(
                 if ka_ms <= cfg_duration {
                     (c.keep_alive, ka_ms, None)
                 } else {
+                    // Announce clamp(cfg × 2/3, 1, u16::MAX) so 1.5 × announced fits the ceiling.
+                    // The floor of 1 is a recorded epic exception — see EPIC-SPEC.md §4, Bounded exception.
+                    // At cfg < 2 the enforced 1.5s exceeds the ceiling by at most 1.5s: announcing a
+                    // keep-alive the server then refuses to honor would close a conforming client.
+                    // Do not "fix" this to min(_, cfg_duration).
                     let a = (cfg * 2 / 3).clamp(1, u64::from(u16::MAX)) as u16;
                     (
                         a,
@@ -126,6 +131,12 @@ pub(crate) fn evaluate_connect(
 /// `evaluate_connect`) and the decoder-level refusal path in
 /// `handler::handle_client_io` — capability fields cannot diverge
 /// between the two when later features raise `max_qos`.
+///
+/// `max_qos` is `AtMostOnce` because no PUBACK or PUBREC exists yet — the interim
+/// advertisement recorded in EPIC-SPEC.md §4 and §11.2. F2.1 raises it to `AtLeastOnce`,
+/// F2.2 to `ExactlyOnce`; both carry that as a Done-when. `retain_available` stays
+/// `true` as a recorded exception in the same section: it promises the flag is
+/// accepted, not that a retained copy survives.
 pub(crate) fn honest_v5_connack(reason: V5ConnectAckReason) -> rmqtt_codec::v5::ConnectAck {
     rmqtt_codec::v5::ConnectAck {
         reason_code: reason,
