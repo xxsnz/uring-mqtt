@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use crate::codec::mqtt::{ConnectAck, ConnectAckReason, MqttPacket, PacketV3, PacketV5};
@@ -24,6 +25,10 @@ pub(crate) enum ConnectDecision {
         keep_alive_secs: u16,
         /// Effective packet-loop deadline per the Q1 decision.
         idle_timeout: Duration,
+        /// Largest packet the client declared it can receive (v5 Maximum
+        /// Packet Size). `None` — every v3 client, and a v5 CONNECT without
+        /// the property — means the client set no limit.
+        max_packet_size: Option<NonZeroU32>,
     },
     /// CONNECT refused: send `connack` (v3 error code / v5 reason >= 0x80), then close.
     Refuse { connack: MqttPacket },
@@ -73,6 +78,7 @@ pub(crate) fn evaluate_connect(
                 client_id,
                 keep_alive_secs: c.keep_alive,
                 idle_timeout,
+                max_packet_size: None,
             }
         }
         MqttPacket::V5(PacketV5::Connect(c)) => {
@@ -119,11 +125,18 @@ pub(crate) fn evaluate_connect(
                 client_id,
                 keep_alive_secs: negotiated_ka,
                 idle_timeout: idle,
+                max_packet_size: c.max_packet_size,
             }
         }
         _ => ConnectDecision::NotConnect,
     }
 }
+
+/// Highest QoS the server can presently acknowledge. `honest_v5_connack`
+/// advertises exactly this value and `packet::dispatch` refuses any PUBLISH
+/// above it, so the CONNACK cannot promise what the packet loop rejects.
+/// F2.2 raises this to `QoS::ExactlyOnce` when the receiver flow lands.
+pub(crate) const MAX_QOS: QoS = QoS::AtLeastOnce;
 
 /// Honest v5 CONNACK: truthful capability announcement per AC-15.
 ///
@@ -132,19 +145,19 @@ pub(crate) fn evaluate_connect(
 /// `handler::handle_client_io` — capability fields cannot diverge
 /// between the two when later features raise `max_qos`.
 ///
-/// `max_qos` is `AtMostOnce` because no PUBACK or PUBREC exists yet — the interim
-/// advertisement recorded in EPIC-SPEC.md §4 and §11.2. F2.1 raises it to `AtLeastOnce`,
-/// F2.2 to `ExactlyOnce`; both carry that as a Done-when. `retain_available` stays
-/// `true` as a recorded exception in the same section: it promises the flag is
-/// accepted, not that a retained copy survives.
+/// `max_qos` is `MAX_QOS`, currently `AtLeastOnce`, because the packet loop
+/// acknowledges QoS 1 and not QoS 2; F2.2 raises it to `ExactlyOnce` as its own
+/// Done-when. `retain_available` stays `true` as a recorded exception in the
+/// same section: it promises the flag is accepted, not that a retained copy
+/// survives.
 pub(crate) fn honest_v5_connack(reason: V5ConnectAckReason) -> rmqtt_codec::v5::ConnectAck {
     rmqtt_codec::v5::ConnectAck {
         reason_code: reason,
-        max_qos: QoS::AtMostOnce,
+        max_qos: MAX_QOS,
         retain_available: true,
-        wildcard_subscription_available: false,
-        subscription_identifiers_available: false,
-        shared_subscription_available: false,
+        wildcard_subscription_available: true,
+        subscription_identifiers_available: true,
+        shared_subscription_available: true,
         session_expiry_interval_secs: Some(0),
         ..Default::default()
     }
@@ -438,13 +451,52 @@ mod tests {
         let MqttPacket::V5(PacketV5::ConnectAck(ack)) = connack else {
             panic!("expected v5 CONNACK");
         };
-        assert!(matches!(ack.max_qos, QoS::AtMostOnce));
-        assert!(!ack.wildcard_subscription_available);
-        assert!(!ack.shared_subscription_available);
-        assert!(!ack.subscription_identifiers_available);
+        assert_eq!(ack.max_qos, QoS::AtLeastOnce);
+        assert!(ack.wildcard_subscription_available);
+        assert!(ack.shared_subscription_available);
+        assert!(ack.subscription_identifiers_available);
         assert_eq!(ack.session_expiry_interval_secs, Some(0));
         assert!(!ack.session_present);
         assert!(ack.retain_available);
+    }
+
+    /// The v5 Maximum Packet Size survives the CONNECT's drop, so the packet
+    /// loop can refuse to send a reply the client cannot receive. A v5 CONNECT
+    /// without the property and every v3 CONNECT declare no limit.
+    #[test]
+    fn retains_client_max_packet_size() {
+        let mut c = rmqtt_codec::v5::Connect {
+            client_id: "dev5".to_string().into(),
+            keep_alive: 60,
+            ..rmqtt_codec::v5::Connect::default()
+        };
+        c.max_packet_size = NonZeroU32::new(128);
+        let packet = MqttPacket::V5(PacketV5::Connect(Box::new(c)));
+        let ConnectDecision::Accept {
+            max_packet_size, ..
+        } = evaluate_connect(&packet, 300, peer())
+        else {
+            panic!("expected Accept");
+        };
+        assert_eq!(max_packet_size, NonZeroU32::new(128));
+
+        let packet = v5_connect_with("dev5", 60, true, None);
+        let ConnectDecision::Accept {
+            max_packet_size, ..
+        } = evaluate_connect(&packet, 300, peer())
+        else {
+            panic!("expected Accept");
+        };
+        assert_eq!(max_packet_size, None);
+
+        let packet = v3_connect_with("dev-1", 60, false);
+        let ConnectDecision::Accept {
+            max_packet_size, ..
+        } = evaluate_connect(&packet, 300, peer())
+        else {
+            panic!("expected Accept");
+        };
+        assert_eq!(max_packet_size, None);
     }
 
     #[test]

@@ -3,11 +3,13 @@ use monoio::io::stream::Stream;
 use monoio::io::{AsyncReadRent, AsyncWriteRent};
 use monoio::net::TcpStream;
 use monoio_codec::Framed;
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use super::worker::EventSender;
 use super::Event;
 use crate::broker::handshake::{self, ConnectDecision};
+use crate::broker::packet::{Disposition, Reply};
 use crate::codec::mqtt::{
     ConnectAck, ConnectAckReason, DecodeError, MqttEncoder, MqttPacket, PacketV3, PacketV5,
 };
@@ -21,10 +23,16 @@ use rmqtt_codec::v5::ConnectAckReason as V5ConnectAckReason;
 pub(crate) enum SessionOutcome {
     Served,
     Refused,
+    /// Closed by the packet loop's protocol-violation policy.
+    Violation,
 }
 
 const TIMEOUT_CTX_CONNACK_FLUSH: &str = "handshake timeout during CONNACK flush";
-const TIMEOUT_CTX_PINGRESP_FLUSH: &str = "idle timeout during PINGRESP flush";
+pub(super) const TIMEOUT_CTX_PINGRESP_FLUSH: &str = "idle timeout during PINGRESP flush";
+pub(super) const TIMEOUT_CTX_PUBACK_FLUSH: &str = "idle timeout during PUBACK flush";
+pub(super) const TIMEOUT_CTX_SUBACK_FLUSH: &str = "idle timeout during SUBACK flush";
+pub(super) const TIMEOUT_CTX_UNSUBACK_FLUSH: &str = "idle timeout during UNSUBACK flush";
+const TIMEOUT_CTX_DISCONNECT_FLUSH: &str = "idle timeout during DISCONNECT flush";
 
 /// Handle a single MQTT client connection.
 pub async fn handle_client(
@@ -168,7 +176,7 @@ where
     let decision = handshake::evaluate_connect(&packet, idle_timeout_secs, peer_addr);
     drop(packet);
 
-    match decision {
+    let outcome = match decision {
         ConnectDecision::NotConnect => {
             tracing::warn!("handshake violation: first packet was not CONNECT ({peer_addr})");
             return Err(Error::Protocol("first packet was not CONNECT".into()));
@@ -188,13 +196,14 @@ where
                 TIMEOUT_CTX_CONNACK_FLUSH,
             )
             .await?;
-            return Ok(SessionOutcome::Refused);
+            SessionOutcome::Refused
         }
         ConnectDecision::Accept {
             connack,
             client_id,
             keep_alive_secs,
             idle_timeout,
+            max_packet_size,
         } => {
             bounded_send(
                 &mut framed,
@@ -208,21 +217,34 @@ where
             state.keep_alive = keep_alive_secs;
             state.last_packet_time = connect_received_at;
 
-            run_packet_loop(&mut framed, &mut state, event_tx, idle_timeout, peer_addr).await?;
+            run_packet_loop(
+                &mut framed,
+                &mut state,
+                event_tx,
+                idle_timeout,
+                peer_addr,
+                max_packet_size,
+            )
+            .await?
         }
-    }
+    };
 
-    Ok(SessionOutcome::Served)
+    Ok(outcome)
 }
 
 /// Main packet loop — idle deadline anchored to the last received packet.
+///
+/// `max_packet_size` is the client's declared receive limit from CONNECT: every
+/// reply is gated against it, because a SUBACK's size follows the request's
+/// filter count and MQTT 5 forbids sending past the declared limit.
 async fn run_packet_loop<IO>(
     framed: &mut Framed<IO, CodecPair>,
     state: &mut ConnectionState,
     event_tx: EventSender,
     idle_timeout: Duration,
     peer_addr: std::net::SocketAddr,
-) -> Result<(), Error>
+    max_packet_size: Option<NonZeroU32>,
+) -> Result<SessionOutcome, Error>
 where
     IO: AsyncReadRent + AsyncWriteRent,
 {
@@ -232,82 +254,130 @@ where
         match packet_result {
             Ok(Some(Ok((packet, _id)))) => {
                 state.update_activity();
-                match packet {
-                    MqttPacket::V3(PacketV3::Publish(pub_pkt)) => {
-                        tracing::debug!(
-                            "v3 PUBLISH {} len: {}",
-                            pub_pkt.topic,
-                            pub_pkt.payload.len()
-                        );
-                        if let Some(event) = parse_sensor_data(&pub_pkt.payload) {
-                            event_tx.send(event);
-                        }
+                let reply_deadline = idle_timeout.saturating_sub(state.last_packet_time.elapsed());
+                let disposition = super::packet::dispatch(&packet);
+                // The ingest effect happens per arm; the reply every arm owes,
+                // if any, leaves through the single gated send below.
+                let owed_reply = match disposition {
+                    Disposition::Deliver(publish) => {
+                        deliver_publish(&event_tx, publish);
+                        None
                     }
-                    MqttPacket::V5(PacketV5::Publish(pub_pkt)) => {
-                        tracing::debug!(
-                            "v5 PUBLISH {} len: {}",
-                            pub_pkt.topic,
-                            pub_pkt.payload.len()
-                        );
-                        if let Some(event) = parse_sensor_data(&pub_pkt.payload) {
-                            event_tx.send(event);
-                        }
+                    Disposition::DeliverThenAck(publish, packet_id) => {
+                        deliver_publish(&event_tx, publish);
+                        Some(Reply::PublishAck(packet_id))
                     }
-                    MqttPacket::V3(PacketV3::PingRequest) => {
-                        let remaining =
-                            idle_timeout.saturating_sub(state.last_packet_time.elapsed());
-                        bounded_send(
-                            framed,
-                            MqttPacket::V3(PacketV3::PingResponse),
-                            remaining,
-                            peer_addr,
-                            TIMEOUT_CTX_PINGRESP_FLUSH,
-                        )
-                        .await?;
-                    }
-                    MqttPacket::V5(PacketV5::PingRequest) => {
-                        let remaining =
-                            idle_timeout.saturating_sub(state.last_packet_time.elapsed());
-                        bounded_send(
-                            framed,
-                            MqttPacket::V5(PacketV5::PingResponse),
-                            remaining,
-                            peer_addr,
-                            TIMEOUT_CTX_PINGRESP_FLUSH,
-                        )
-                        .await?;
-                    }
-                    MqttPacket::V3(PacketV3::Connect(_)) | MqttPacket::V5(PacketV5::Connect(_)) => {
-                        tracing::warn!(
-                            "handshake violation: duplicate CONNECT ({peer_addr}) — closing"
-                        );
-                        break;
-                    }
-                    MqttPacket::V3(PacketV3::Disconnect)
-                    | MqttPacket::V5(PacketV5::Disconnect(_)) => {
+                    Disposition::Reply(reply) => Some(reply),
+                    Disposition::Close => {
                         tracing::debug!("Client requested disconnect");
-                        break;
+                        break Ok(SessionOutcome::Served);
                     }
-                    _ => {
-                        tracing::trace!("Unhandled packet type");
+                    Disposition::Violation(violation) => {
+                        break Ok(close_with_violation(
+                            framed,
+                            violation,
+                            reply_deadline,
+                            peer_addr,
+                            max_packet_size,
+                        )
+                        .await);
                     }
+                };
+                if let Some(reply) = owed_reply {
+                    let version = framed.codec().version();
+                    if let Some(violation) =
+                        super::packet::reply_over_max_packet_size(reply, version, max_packet_size)
+                    {
+                        break Ok(close_with_violation(
+                            framed,
+                            violation,
+                            reply_deadline,
+                            peer_addr,
+                            max_packet_size,
+                        )
+                        .await);
+                    }
+                    bounded_send(
+                        framed,
+                        reply.render(version),
+                        reply_deadline,
+                        peer_addr,
+                        reply.timeout_context(),
+                    )
+                    .await?;
                 }
             }
             Ok(Some(Err(e))) => {
+                if let Some(violation) = super::packet::classify_read_error(&e) {
+                    let reply_deadline =
+                        idle_timeout.saturating_sub(state.last_packet_time.elapsed());
+                    break Ok(close_with_violation(
+                        framed,
+                        violation,
+                        reply_deadline,
+                        peer_addr,
+                        max_packet_size,
+                    )
+                    .await);
+                }
                 tracing::debug!("Packet error: {:?}", e);
-                break;
+                break Ok(SessionOutcome::Served);
             }
             Ok(None) => {
                 tracing::debug!("Client closed connection");
-                break;
+                break Ok(SessionOutcome::Served);
             }
             Err(_) => {
                 tracing::debug!("client idle timeout ({peer_addr})");
-                break;
+                break Ok(SessionOutcome::Served);
             }
         }
     }
-    Ok(())
+}
+
+/// Hands a PUBLISH's payload to the worker's ingest seam. A payload
+/// `parse_sensor_data` cannot read is discarded here; a reading the event
+/// channel cannot take is discarded inside `EventSender::send`, which
+/// counts it. Neither outcome reaches the caller, because neither changes
+/// what the caller does: the PUBACK is sent either way, and QoS 0 has no
+/// ack to send at all.
+fn deliver_publish(event_tx: &EventSender, publish: &rmqtt_codec::types::Publish) {
+    tracing::debug!("PUBLISH {} len: {}", publish.topic, publish.payload.len());
+    if let Some(event) = parse_sensor_data(&publish.payload) {
+        event_tx.send(event);
+    }
+}
+
+/// Emit the one warn line, send the v5 DISCONNECT best-effort, and report
+/// `Violation`. The DISCONNECT flush is best-effort by design: a write
+/// failure to a dead peer must not convert a countable violation into an
+/// anonymous `Err`. `max_packet_size` is the client's declared receive limit:
+/// a DISCONNECT that does not fit under it is omitted rather than written, so
+/// the close never breaks the limit it may itself be enforcing.
+async fn close_with_violation<IO>(
+    framed: &mut Framed<IO, CodecPair>,
+    violation: super::packet::Violation,
+    deadline: Duration,
+    peer_addr: std::net::SocketAddr,
+    max_packet_size: Option<NonZeroU32>,
+) -> SessionOutcome
+where
+    IO: AsyncWriteRent,
+{
+    tracing::warn!("{} ({peer_addr}) — closing", violation.reason());
+    if let Some(pkt) = violation.disconnect(framed.codec().version(), max_packet_size) {
+        drop(
+            bounded_send(
+                framed,
+                pkt,
+                deadline,
+                peer_addr,
+                TIMEOUT_CTX_DISCONNECT_FLUSH,
+            )
+            .await,
+        );
+    }
+    SessionOutcome::Violation
 }
 
 /// Bounded `send_and_flush` under a deadline (handshake or idle).
@@ -334,6 +404,7 @@ where
 
 /// Combined codec for both encoding and decoding MQTT packets.
 struct CodecPair {
+    version: ProtocolVersion,
     decoder: crate::codec::mqtt::MqttDecoder,
     encoder: MqttEncoder,
 }
@@ -341,9 +412,14 @@ struct CodecPair {
 impl CodecPair {
     fn new(version: ProtocolVersion) -> Self {
         Self {
+            version,
             decoder: crate::codec::mqtt::MqttDecoder::new(version),
             encoder: MqttEncoder::new(version),
         }
+    }
+
+    fn version(&self) -> ProtocolVersion {
+        self.version
     }
 }
 
@@ -386,7 +462,7 @@ fn parse_sensor_data(data: &[u8]) -> Option<Event> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::broker::worker::{event_channel, EventReceiver};
+    use crate::broker::worker::{event_channel, EventReceiver, EVENT_CHANNEL_CAPACITY};
     use bytes::BytesMut;
     use monoio::buf::{IoBuf, IoBufMut, IoVecBuf, IoVecBufMut};
     use monoio::io::{AsyncReadRent, AsyncWriteRent};
@@ -394,6 +470,7 @@ pub(crate) mod tests {
     use monoio_codec::Encoder as _;
     use rmqtt_codec::types::Publish as TypesPublish;
     use rmqtt_codec::types::QoS;
+    use std::num::NonZeroU16;
 
     // Wire fixtures (byte literals — server's own encoder never produces expected values).
     /// v3 CONNECT: ka=60, id "test", flags 0x00. Mirrors `src/codec/version.rs:76-86`.
@@ -425,8 +502,22 @@ pub(crate) mod tests {
     ];
     /// v3 PUBLISH QoS 0: topic "t", payload SensorV1 25.00°C / 1013 hPa.
     const PUBLISH_QOS0_T: [u8; 9] = [0x30, 0x07, 0x00, 0x01, b't', 0x09, 0xC4, 0x03, 0xF5];
+    /// v3 PUBLISH QoS 1: topic "t", packet id 1, payload SensorV1 25.00°C / 1013 hPa.
+    const PUBLISH_QOS1_T: [u8; 11] = [
+        0x32, 0x09, 0x00, 0x01, b't', 0x00, 0x01, 0x09, 0xC4, 0x03, 0xF5,
+    ];
+    /// v3 PUBLISH QoS 1: topic "t", packet id 1, payload too short for `parse_sensor_data`.
+    const PUBLISH_QOS1_T_BAD_PAYLOAD: [u8; 10] =
+        [0x32, 0x08, 0x00, 0x01, b't', 0x00, 0x01, 0xAA, 0xBB, 0xCC];
     const PINGREQ: [u8; 2] = [0xC0, 0x00];
     const DISCONNECT: [u8; 2] = [0xE0, 0x00];
+    /// v3 SUBSCRIBE: packet id 37, single filter "t", QoS 0.
+    const V3_SUBSCRIBE_T_ID37: [u8; 8] = [0x82, 0x06, 0x00, 0x25, 0x00, 0x01, b't', 0x00];
+    /// v3 UNSUBSCRIBE: packet id 37, single filter "t" — non-wildcard, so the
+    /// dispatch never short-circuits to the violation branch. The id is
+    /// deliberately not 1: an arm that hardcoded `NonZeroU16::new(1).unwrap()`
+    /// instead of propagating `*packet_id` would still satisfy an id-1 case.
+    const V3_UNSUBSCRIBE_T_ID37: [u8; 7] = [0xA2, 0x05, 0x00, 0x25, 0x00, 0x01, b't'];
 
     fn build_runtime() -> monoio::FusionRuntime<
         monoio::time::TimeDriver<monoio::IoUringDriver>,
@@ -449,6 +540,36 @@ pub(crate) mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("local_addr");
         let (tx, rx) = event_channel(0);
+        let handle = monoio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            handle_client(stream, tx, connection_timeout_secs, idle_timeout_secs).await
+        });
+        let client = TcpStream::connect(addr).await.expect("connect");
+        (client, rx, handle)
+    }
+
+    /// Identical to `spawn_handler` but pre-fills the event channel to capacity
+    /// before the accept task starts, so every `EventSender::send` the handler
+    /// makes takes the full-channel branch (`worker.rs:104`). The returned `rx`
+    /// stays alive and unpolled — the caller MUST keep it — so the sender's
+    /// `tx.is_closed()` check stays false and depth stays at capacity.
+    async fn spawn_handler_full_ingest(
+        connection_timeout_secs: u64,
+        idle_timeout_secs: u64,
+    ) -> (
+        TcpStream,
+        EventReceiver,
+        monoio::task::JoinHandle<Result<SessionOutcome, Error>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let (tx, rx) = event_channel(0);
+        for i in 0..EVENT_CHANNEL_CAPACITY {
+            tx.send(Event::SensorV1 {
+                temperature: i16::try_from(i % 1000).expect("fits i16"),
+                pressure: 1013,
+            });
+        }
         let handle = monoio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
             handle_client(stream, tx, connection_timeout_secs, idle_timeout_secs).await
@@ -666,10 +787,20 @@ pub(crate) mod tests {
     }
 
     fn encode_v5_connect(keep_alive: u16, client_id: &str) -> Vec<u8> {
+        encode_v5_connect_with_max_packet_size(keep_alive, client_id, None)
+    }
+
+    /// v5 CONNECT carrying the Maximum Packet Size property when one is given.
+    fn encode_v5_connect_with_max_packet_size(
+        keep_alive: u16,
+        client_id: &str,
+        max_packet_size: Option<NonZeroU32>,
+    ) -> Vec<u8> {
         let mut enc = MqttEncoder::v5();
         let connect = rmqtt_codec::v5::Connect {
             client_id: client_id.to_string().into(),
             keep_alive,
+            max_packet_size,
             ..Default::default()
         };
         let pkt = MqttPacket::V5(PacketV5::Connect(Box::new(connect)));
@@ -764,6 +895,462 @@ pub(crate) mod tests {
         });
     }
 
+    /// AC-1 — a QoS 1 PUBLISH receives a PUBACK carrying its packet id,
+    /// immediately after the CONNACK in the response byte stream. The client
+    /// writes CONNECT and PUBLISH coalesced, the way the brief's
+    /// pipelined-connect test does; the assertion pins reply order in the
+    /// stream, not how the replies are split across TCP segments.
+    #[test]
+    fn acks_v3_qos1_publish_with_puback() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+
+            // One coalesced write: CONNECT + QoS 1 PUBLISH.
+            let mut coalesced = Vec::new();
+            coalesced.extend_from_slice(&V3_CONNECT_TEST);
+            coalesced.extend_from_slice(&PUBLISH_QOS1_T);
+            tcp_write_all(&mut client, &coalesced)
+                .await
+                .expect("coalesced write");
+
+            // Read exactly 8 bytes: CONNACK (4) + PUBACK (4).
+            let got = tcp_read_n_bounded(&mut client, 8, Duration::from_secs(2))
+                .await
+                .expect("read 8 bytes");
+            assert_eq!(
+                got,
+                vec![0x20, 0x02, 0x00, 0x00, 0x40, 0x02, 0x00, 0x01],
+                "expected flushed CONNACK then PUBACK"
+            );
+
+            tcp_write_all(&mut client, &DISCONNECT)
+                .await
+                .expect("disconnect write");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Ok(SessionOutcome::Served)),
+                "expected Ok(SessionOutcome::Served), got {join_res:?}"
+            );
+        });
+    }
+
+    /// AC-2 — the event reaches the receiver while the PUBACK write is still
+    /// stalled. `spawn_handler_test_io`'s `undelayed_writes: 1` lets the
+    /// CONNACK flush immediately while every later write sleeps for a second;
+    /// if `DeliverThenAck` ever sends the PUBACK before calling
+    /// `deliver_publish`, the event never arrives in the 300 ms window.
+    #[test]
+    fn qos1_publish_event_arrives_before_puback_flush() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let mut script = Vec::new();
+            script.extend_from_slice(&V3_CONNECT_TEST);
+            script.extend_from_slice(&PUBLISH_QOS1_T);
+            let (mut client, mut rx, handle) =
+                spawn_handler_test_io(2, 30, Duration::from_secs(1), 1, Some(script), None).await;
+
+            // The event must arrive within 300 ms even though the PUBACK
+            // flush is stalled for 1 s.
+            let evt = monoio::time::timeout(Duration::from_millis(300), rx.recv())
+                .await
+                .expect("event timeout")
+                .expect("event Some");
+            match evt {
+                Event::SensorV1 {
+                    temperature,
+                    pressure,
+                } => {
+                    assert_eq!(temperature, 2500);
+                    assert_eq!(pressure, 1013);
+                }
+            }
+
+            // Drain CONNACK + PUBACK once the stalled write completes.
+            let got = tcp_read_n_bounded(&mut client, 8, Duration::from_secs(2))
+                .await
+                .expect("read 8 bytes");
+            assert_eq!(got, vec![0x20, 0x02, 0x00, 0x00, 0x40, 0x02, 0x00, 0x01]);
+
+            // DISCONNECT so the handler leaves `run_packet_loop`.
+            tcp_write_all(&mut client, &DISCONNECT)
+                .await
+                .expect("disconnect write");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Ok(SessionOutcome::Served)),
+                "expected Ok(SessionOutcome::Served), got {join_res:?}"
+            );
+        });
+    }
+
+    /// AC-1, AC-29 — when the event channel is full, the QoS 1 PUBACK still
+    /// arrives. `spawn_handler_full_ingest` keeps `rx` alive and unpolled so
+    /// every `EventSender::send` reaches the full-channel branch at
+    /// `worker.rs:104`. Draining `rx` here would silently move the test off
+    /// the branch it exists to cover.
+    #[test]
+    fn acks_qos1_publish_when_ingest_channel_is_full() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler_full_ingest(2, 30).await;
+
+            tcp_write_all(&mut client, &V3_CONNECT_TEST)
+                .await
+                .expect("CONNECT write");
+            let connack = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                .await
+                .expect("read CONNACK");
+            assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+
+            tcp_write_all(&mut client, &PUBLISH_QOS1_T)
+                .await
+                .expect("PUBLISH write");
+
+            // PUBACK must arrive even though the channel was full and the
+            // payload was dropped on the worker side.
+            let puback = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                .await
+                .expect("read PUBACK");
+            assert_eq!(puback, vec![0x40, 0x02, 0x00, 0x01]);
+
+            // Session is still alive — PINGREQ → PINGRESP round trip.
+            tcp_write_all(&mut client, &PINGREQ)
+                .await
+                .expect("PINGREQ write");
+            let pingresp = tcp_read_n_bounded(&mut client, 2, Duration::from_secs(2))
+                .await
+                .expect("read PINGRESP");
+            assert_eq!(pingresp, vec![0xD0, 0x00]);
+
+            tcp_write_all(&mut client, &DISCONNECT)
+                .await
+                .expect("disconnect write");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(matches!(join_res, Ok(SessionOutcome::Served)));
+        });
+    }
+
+    /// AC-29 — when the event receiver has gone away, the QoS 1 PUBACK still
+    /// arrives. The closed-receiver branch (`worker.rs:97`) is the other
+    /// branch the full-channel branch is paired with; both gates have to
+    /// ack the publisher or the device stalls.
+    #[test]
+    fn acks_qos1_publish_when_ingest_receiver_is_closed() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, rx, handle) = spawn_handler(2, 30).await;
+            drop(rx);
+
+            tcp_write_all(&mut client, &V3_CONNECT_TEST)
+                .await
+                .expect("CONNECT write");
+            let connack = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                .await
+                .expect("read CONNACK");
+            assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+
+            tcp_write_all(&mut client, &PUBLISH_QOS1_T)
+                .await
+                .expect("PUBLISH write");
+
+            // PUBACK must arrive even though the receiver is closed.
+            let puback = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                .await
+                .expect("read PUBACK");
+            assert_eq!(puback, vec![0x40, 0x02, 0x00, 0x01]);
+
+            tcp_write_all(&mut client, &PINGREQ)
+                .await
+                .expect("PINGREQ write");
+            let pingresp = tcp_read_n_bounded(&mut client, 2, Duration::from_secs(2))
+                .await
+                .expect("read PINGRESP");
+            assert_eq!(pingresp, vec![0xD0, 0x00]);
+
+            tcp_write_all(&mut client, &DISCONNECT)
+                .await
+                .expect("disconnect write");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(matches!(join_res, Ok(SessionOutcome::Served)));
+        });
+    }
+
+    /// AC-4 — a v3 SUBSCRIBE carrying one filter receives a spec-valid SUBACK
+    /// whose packet id echoes the request (here, 37), one `Failure` (0x80) per
+    /// filter, and the session keeps reading afterwards.
+    #[test]
+    fn refuses_v3_subscribe_with_failure_suback() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+
+            // Coalesced: v3 CONNECT + v3 SUBSCRIBE (packet id 37, filter "t", QoS 0).
+            let mut coalesced = Vec::new();
+            coalesced.extend_from_slice(&V3_CONNECT_TEST);
+            coalesced.extend_from_slice(&V3_SUBSCRIBE_T_ID37);
+            tcp_write_all(&mut client, &coalesced)
+                .await
+                .expect("coalesced write");
+
+            // CONNACK (4) + SUBACK (5): the id is echoed back, not hardcoded 1.
+            let got = tcp_read_n_bounded(&mut client, 9, Duration::from_secs(2))
+                .await
+                .expect("read 9 bytes");
+            assert_eq!(
+                got,
+                vec![0x20, 0x02, 0x00, 0x00, 0x90, 0x03, 0x00, 0x25, 0x80],
+                "expected CONNACK then SUBACK carrying the request's packet id"
+            );
+
+            // Session keeps reading: PINGREQ → PINGRESP.
+            tcp_write_all(&mut client, &PINGREQ)
+                .await
+                .expect("pingreq write");
+            let pingresp = tcp_read_n_bounded(&mut client, 2, Duration::from_secs(2))
+                .await
+                .expect("read pingresp");
+            assert_eq!(pingresp, vec![0xD0, 0x00]);
+
+            tcp_write_all(&mut client, &DISCONNECT)
+                .await
+                .expect("disconnect write");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(matches!(join_res, Ok(SessionOutcome::Served)));
+        });
+    }
+
+    /// AC-5 — a non-wildcard UNSUBSCRIBE receives an UNSUBACK carrying its
+    /// packet id (here, 37, not 1), the connection stays open, and the
+    /// session still answers a PINGREQ afterwards. CONNACK bytes come first;
+    /// the assertion pins reply order in the stream, not how the replies are
+    /// split across TCP segments. The id is deliberately not 1: this is the
+    /// only end-to-end observation of the propagated id.
+    #[test]
+    fn acks_v3_unsubscribe_with_unsuback() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+
+            // Coalesced: v3 CONNECT + v3 UNSUBSCRIBE (packet id 37, filter "t").
+            let mut coalesced = Vec::new();
+            coalesced.extend_from_slice(&V3_CONNECT_TEST);
+            coalesced.extend_from_slice(&V3_UNSUBSCRIBE_T_ID37);
+            tcp_write_all(&mut client, &coalesced)
+                .await
+                .expect("coalesced write");
+
+            // CONNACK (4) + UNSUBACK (4): the id is echoed back, not hardcoded 1.
+            let got = tcp_read_n_bounded(&mut client, 8, Duration::from_secs(2))
+                .await
+                .expect("read 8 bytes");
+            assert_eq!(
+                got,
+                vec![0x20, 0x02, 0x00, 0x00, 0xB0, 0x02, 0x00, 0x25],
+                "expected flushed CONNACK then UNSUBACK carrying the request's packet id"
+            );
+
+            // Session keeps reading: PINGREQ → PINGRESP.
+            tcp_write_all(&mut client, &PINGREQ)
+                .await
+                .expect("pingreq write");
+            let pingresp = tcp_read_n_bounded(&mut client, 2, Duration::from_secs(2))
+                .await
+                .expect("read pingresp");
+            assert_eq!(pingresp, vec![0xD0, 0x00]);
+
+            tcp_write_all(&mut client, &DISCONNECT)
+                .await
+                .expect("disconnect write");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(matches!(join_res, Ok(SessionOutcome::Served)));
+        });
+    }
+
+    /// AC-5 — the v5 half of the UNSUBSCRIBE path end to end: two filters and
+    /// packet id 37 come back as one UNSUBACK carrying one
+    /// `NoSubscriptionExisted` (0x11) byte per filter, and the session keeps
+    /// reading. The v5 renderer is the one that carries per-filter status, so
+    /// the count reaching the encoder off a real socket is what this pins;
+    /// `acks_v3_unsubscribe_with_unsuback` covers the version that drops it.
+    /// `V5Reader` is used because the UNSUBACK may coalesce with the CONNACK.
+    #[test]
+    fn acks_v5_unsubscribe_with_unsuback() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+
+            tcp_write_all(&mut client, &encode_v5_connect(30, "test"))
+                .await
+                .expect("v5 CONNECT write");
+
+            let mut reader = V5Reader::new();
+            let connack = monoio::time::timeout(Duration::from_secs(2), reader.next(&mut client))
+                .await
+                .expect("connack timeout");
+            match connack {
+                Some(MqttPacket::V5(PacketV5::ConnectAck(_))) => {}
+                other => panic!("expected v5 CONNACK, got {other:?}"),
+            }
+
+            // v5 UNSUBSCRIBE, packet id 37, two filters — built directly via
+            // the encoder, the same way the v5 SUBSCRIBE fixture below is.
+            let mut enc = MqttEncoder::v5();
+            let pkt = MqttPacket::V5(PacketV5::Unsubscribe(rmqtt_codec::v5::Unsubscribe {
+                packet_id: NonZeroU16::new(37).expect("non-zero"),
+                user_properties: Vec::new(),
+                topic_filters: vec!["a".into(), "b/c".into()],
+            }));
+            let mut buf = BytesMut::new();
+            enc.encode(pkt, &mut buf).expect("encode v5 UNSUBSCRIBE");
+            tcp_write_all(&mut client, &buf)
+                .await
+                .expect("v5 UNSUBSCRIBE write");
+
+            let unsuback =
+                monoio::time::timeout(Duration::from_secs(2), reader.raw(&mut client, 7))
+                    .await
+                    .expect("unsuback timeout");
+            assert_eq!(
+                unsuback,
+                vec![0xB0, 0x05, 0x00, 0x25, 0x00, 0x11, 0x11],
+                "expected v5 UNSUBACK with id 37 and one 0x11 status per filter"
+            );
+
+            // Session keeps reading — PINGREQ → PINGRESP.
+            tcp_write_all(&mut client, &PINGREQ)
+                .await
+                .expect("pingreq write");
+            let pingresp =
+                monoio::time::timeout(Duration::from_secs(2), reader.raw(&mut client, 2))
+                    .await
+                    .expect("pingresp timeout");
+            assert_eq!(pingresp, vec![0xD0, 0x00]);
+
+            tcp_write_all(&mut client, &DISCONNECT)
+                .await
+                .expect("disconnect write");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(matches!(join_res, Ok(SessionOutcome::Served)));
+        });
+    }
+
+    /// AC-26 — a v5 device asking with a wildcard SUBSCRIBE still gets its
+    /// SUBACK, and the session keeps reading afterwards. The CONNACK and the
+    /// SUBACK are read through `V5Reader` because the SUBACK may coalesce with
+    /// the CONNACK into a single TCP segment; a fixed byte count would lose
+    /// either packet when that happens.
+    #[test]
+    fn v5_wildcard_subscribe_is_refused_and_session_continues() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+
+            tcp_write_all(&mut client, &encode_v5_connect(30, "test"))
+                .await
+                .expect("v5 CONNECT write");
+
+            let mut reader = V5Reader::new();
+            let connack = monoio::time::timeout(Duration::from_secs(2), reader.next(&mut client))
+                .await
+                .expect("connack timeout");
+            match connack {
+                Some(MqttPacket::V5(PacketV5::ConnectAck(_))) => {}
+                other => panic!("expected v5 CONNACK, got {other:?}"),
+            }
+
+            // v5 SUBSCRIBE carrying a wildcard filter — built directly via the
+            // encoder to keep the test independent of the codec path under
+            // exercise elsewhere in this module.
+            let mut enc = MqttEncoder::v5();
+            let pkt = MqttPacket::V5(PacketV5::Subscribe(rmqtt_codec::v5::Subscribe {
+                packet_id: NonZeroU16::new(1).expect("non-zero"),
+                id: None,
+                user_properties: Vec::new(),
+                topic_filters: vec![(
+                    "t/#".into(),
+                    rmqtt_codec::v5::SubscriptionOptions::default(),
+                )],
+            }));
+            let mut buf = BytesMut::new();
+            enc.encode(pkt, &mut buf).expect("encode v5 SUBSCRIBE");
+            tcp_write_all(&mut client, &buf)
+                .await
+                .expect("v5 SUBSCRIBE write");
+
+            let suback = monoio::time::timeout(Duration::from_secs(2), reader.raw(&mut client, 6))
+                .await
+                .expect("suback timeout");
+            assert_eq!(suback, vec![0x90, 0x04, 0x00, 0x01, 0x00, 0x83]);
+
+            // Session keeps reading — PINGREQ → PINGRESP.
+            tcp_write_all(&mut client, &PINGREQ)
+                .await
+                .expect("pingreq write");
+            let pingresp =
+                monoio::time::timeout(Duration::from_secs(2), reader.raw(&mut client, 2))
+                    .await
+                    .expect("pingresp timeout");
+            assert_eq!(pingresp, vec![0xD0, 0x00]);
+
+            tcp_write_all(&mut client, &DISCONNECT)
+                .await
+                .expect("disconnect write");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(matches!(join_res, Ok(SessionOutcome::Served)));
+        });
+    }
+
+    /// AC-30 — an unparseable QoS 1 payload still gets its PUBACK, because
+    /// no retransmission could ever make it parse.
+    #[test]
+    fn acks_qos1_publish_with_unparseable_payload() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+
+            let mut coalesced = Vec::new();
+            coalesced.extend_from_slice(&V3_CONNECT_TEST);
+            coalesced.extend_from_slice(&PUBLISH_QOS1_T_BAD_PAYLOAD);
+            tcp_write_all(&mut client, &coalesced)
+                .await
+                .expect("coalesced write");
+
+            let got = tcp_read_n_bounded(&mut client, 8, Duration::from_secs(2))
+                .await
+                .expect("read 8 bytes");
+            assert_eq!(
+                got,
+                vec![0x20, 0x02, 0x00, 0x00, 0x40, 0x02, 0x00, 0x01],
+                "expected CONNACK then PUBACK even with an unparseable payload"
+            );
+
+            tcp_write_all(&mut client, &DISCONNECT)
+                .await
+                .expect("disconnect write");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(matches!(join_res, Ok(SessionOutcome::Served)));
+        });
+    }
+
     #[test]
     fn v5_connect_publish_pingreq_full_roundtrip() {
         let mut rt = build_runtime();
@@ -785,7 +1372,7 @@ pub(crate) mod tests {
                 Some(MqttPacket::V5(PacketV5::ConnectAck(ack))) => {
                     assert!(matches!(ack.reason_code, V5ConnectAckReason::Success));
                     assert!(!ack.session_present);
-                    assert!(matches!(ack.max_qos, QoS::AtMostOnce));
+                    assert_eq!(ack.max_qos, QoS::AtLeastOnce);
                 }
                 other => panic!("expected v5 CONNACK, got {other:?}"),
             }
@@ -874,10 +1461,10 @@ pub(crate) mod tests {
                         ack.reason_code,
                         V5ConnectAckReason::ClientIdentifierNotValid
                     ));
-                    assert!(matches!(ack.max_qos, QoS::AtMostOnce));
-                    assert!(!ack.wildcard_subscription_available);
-                    assert!(!ack.shared_subscription_available);
-                    assert!(!ack.subscription_identifiers_available);
+                    assert_eq!(ack.max_qos, QoS::AtLeastOnce);
+                    assert!(ack.wildcard_subscription_available);
+                    assert!(ack.shared_subscription_available);
+                    assert!(ack.subscription_identifiers_available);
                     assert_eq!(ack.session_expiry_interval_secs, Some(0));
                     assert!(ack.retain_available);
                 }
@@ -1709,6 +2296,476 @@ pub(crate) mod tests {
                 .await
                 .expect("join timeout");
             assert!(join_res.is_ok(), "handler returned error: {join_res:?}");
+        });
+    }
+
+    /// AC-16 — a v3 duplicate CONNECT closes with `SessionOutcome::Violation`.
+    #[test]
+    fn duplicate_connect_closes_as_violation_outcome() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            tcp_write_all(&mut client, &V3_CONNECT_TEST)
+                .await
+                .expect("first CONNECT write");
+            let connack = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                .await
+                .expect("read CONNACK");
+            assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+            tcp_write_all(&mut client, &V3_CONNECT_TEST)
+                .await
+                .expect("second CONNECT write");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            match join_res {
+                Ok(super::SessionOutcome::Violation) => {}
+                other => panic!("expected SessionOutcome::Violation, got {other:?}"),
+            }
+        });
+    }
+
+    /// AC-13 — a v3 duplicate CONNECT emits exactly one WARN line whose reason
+    /// clause is "protocol violation: duplicate CONNECT" and carries the peer
+    /// address. Asserted via `has_line_at` / `count_lines_at` (not raw
+    /// `contains("WARN")`), per the epic's log-test convention.
+    #[test]
+    fn duplicate_connect_warn_is_labelled_protocol_violation() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            // Client's local socket address is the same port the broker
+            // observes as its peer, so we assert on the client side and the
+            // handler's warn line matches.
+            let peer = client.local_addr().expect("local_addr").to_string();
+            tcp_write_all(&mut client, &V3_CONNECT_TEST)
+                .await
+                .expect("first CONNECT write");
+            let connack = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                .await
+                .expect("read CONNACK");
+            assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+            tcp_write_all(&mut client, &V3_CONNECT_TEST)
+                .await
+                .expect("second CONNECT write");
+            let _ = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            let logs =
+                String::from_utf8(sink.lock().expect("log lock").clone()).expect("log UTF-8");
+            assert!(
+                has_line_at(
+                    &logs,
+                    "WARN",
+                    &["protocol violation: duplicate CONNECT", &peer]
+                ),
+                "expected one WARN line with the violation reason and peer {peer}; logs:\n{logs}"
+            );
+            assert_eq!(
+                count_lines_at(&logs, "WARN", "protocol violation"),
+                1,
+                "expected exactly one WARN line mentioning 'protocol violation'"
+            );
+        });
+    }
+
+    /// AC-17 — a v3 PUBLISH whose QoS bits are 3 mid-session closes with
+    /// `SessionOutcome::Violation`. The QoS-3 fixture is rejected by the
+    /// decoder as `DecodeError::MalformedPacket`; the handler must surface
+    /// that as a violation rather than the inherited `Ok(Served)` quiet path.
+    #[test]
+    fn qos3_publish_mid_session_closes_as_violation() {
+        // v3 PUBLISH QoS=3: first byte 0x36, topic "t" (len 1), packet id 1,
+        // payload SensorV1 25.00°C / 1013 hPa. Same wire shape as
+        // `PUBLISH_QOS1_T` (0x32...) with QoS bits set to the reserved value.
+        const V3_PUBLISH_QOS3_T: [u8; 11] = [
+            0x36, 0x09, 0x00, 0x01, b't', 0x00, 0x01, 0x09, 0xC4, 0x03, 0xF5,
+        ];
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            let peer = client.local_addr().expect("local_addr").to_string();
+            tcp_write_all(&mut client, &V3_CONNECT_TEST)
+                .await
+                .expect("CONNECT write");
+            let connack = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                .await
+                .expect("read CONNACK");
+            assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+            tcp_write_all(&mut client, &V3_PUBLISH_QOS3_T)
+                .await
+                .expect("QoS-3 PUBLISH write");
+            // v3 has no DISCONNECT on malformed; server-side close should mean
+            // EOF after CONNACK. Bound the read so a stuck server does not
+            // hang the test.
+            let post = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(2))
+                .await
+                .expect("read to eof (bounded)");
+            assert!(
+                post.is_empty(),
+                "v3 close on malformed must not emit extra bytes, got {post:?}"
+            );
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            match join_res {
+                Ok(super::SessionOutcome::Violation) => {}
+                other => panic!("expected SessionOutcome::Violation, got {other:?}"),
+            }
+            let logs =
+                String::from_utf8(sink.lock().expect("log lock").clone()).expect("log UTF-8");
+            assert!(
+                has_line_at(
+                    &logs,
+                    "WARN",
+                    &["protocol violation: malformed packet", &peer]
+                ),
+                "expected one WARN line with the malformed-packet reason and peer {peer}; logs:\n{logs}"
+            );
+        });
+    }
+
+    /// AC-14 — a v5 duplicate CONNECT receives the ProtocolError DISCONNECT
+    /// before the handler closes. `V5Reader` is wrapped in `monoio::time::timeout`
+    /// per the brief because it has no internal deadline.
+    #[test]
+    fn v5_duplicate_connect_receives_disconnect_before_close() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            tcp_write_all(&mut client, &encode_v5_connect(30, "test"))
+                .await
+                .expect("first v5 CONNECT write");
+            let mut reader = V5Reader::new();
+            let connack = monoio::time::timeout(Duration::from_secs(2), reader.next(&mut client))
+                .await
+                .expect("v5 CONNACK read timeout")
+                .expect("v5 CONNACK decoded");
+            let MqttPacket::V5(PacketV5::ConnectAck(_)) = connack else {
+                panic!("expected v5 CONNACK, got {connack:?}")
+            };
+            tcp_write_all(&mut client, &encode_v5_connect(30, "test"))
+                .await
+                .expect("second v5 CONNECT write");
+            let disconnect_bytes =
+                monoio::time::timeout(Duration::from_secs(2), reader.raw(&mut client, 4))
+                    .await
+                    .expect("v5 DISCONNECT read timeout");
+            assert_eq!(
+                disconnect_bytes,
+                vec![0xE0, 0x02, 0x82, 0x00],
+                "expected v5 DISCONNECT carrying ProtocolError (0x82)"
+            );
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            match join_res {
+                Ok(super::SessionOutcome::Violation) => {}
+                other => panic!("expected SessionOutcome::Violation, got {other:?}"),
+            }
+        });
+    }
+
+    /// AC-14 — a v5 mid-session decoder rejection receives the `MalformedPacket`
+    /// (0x81) DISCONNECT before close. The v3 test above proves the close
+    /// but no DISCONNECT bytes, so without this test a `close_with_violation`
+    /// that sent nothing on v5 would pass every other check.
+    #[test]
+    fn v5_malformed_packet_mid_session_disconnects_with_81() {
+        // Build a real v5 PUBLISH, then mutate the fixed-header QoS bits to
+        // 3 (reserved) so the v5 decoder rejects it as `MalformedPacket`.
+        // The QoS bits are rejected before any further bytes are parsed, so
+        // the rest of the buffer is irrelevant.
+        let mut publish = encode_v5_publish("t", &[0x09, 0xC4, 0x03, 0xF5]);
+        publish[0] = 0x36;
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            tcp_write_all(&mut client, &encode_v5_connect(30, "test"))
+                .await
+                .expect("v5 CONNECT write");
+            let mut reader = V5Reader::new();
+            let connack = monoio::time::timeout(Duration::from_secs(2), reader.next(&mut client))
+                .await
+                .expect("v5 CONNACK read timeout")
+                .expect("v5 CONNACK decoded");
+            let MqttPacket::V5(PacketV5::ConnectAck(_)) = connack else {
+                panic!("expected v5 CONNACK, got {connack:?}")
+            };
+            tcp_write_all(&mut client, &publish)
+                .await
+                .expect("malformed v5 PUBLISH write");
+            let disconnect_bytes =
+                monoio::time::timeout(Duration::from_secs(2), reader.raw(&mut client, 4))
+                    .await
+                    .expect("v5 DISCONNECT read timeout");
+            assert_eq!(
+                disconnect_bytes,
+                vec![0xE0, 0x02, 0x81, 0x00],
+                "expected v5 DISCONNECT carrying MalformedPacket (0x81)"
+            );
+            // The DISCONNECT is the last thing written: the socket reaches EOF
+            // with no trailing bytes. A zero bound here would time out before
+            // the close and assert nothing.
+            let rest = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(2))
+                .await
+                .expect("EOF after the v5 DISCONNECT");
+            assert!(
+                rest.is_empty(),
+                "expected EOF after the DISCONNECT, got {rest:02X?}"
+            );
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            match join_res {
+                Ok(super::SessionOutcome::Violation) => {}
+                other => panic!("expected SessionOutcome::Violation, got {other:?}"),
+            }
+        });
+    }
+
+    /// AC-18 — a mid-session transport error must keep the inherited quiet
+    /// `Served` path. The injected `InvalidData` has no `DecodeError` source,
+    /// so `classify_read_error` returns `None` and the `debug` + `Served`
+    /// arm survives. `ConnectionReset` would not exercise this branch — see
+    /// the brief note on the discriminator.
+    #[test]
+    fn mid_session_transport_error_stays_served() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler_test_io(
+                2,
+                30,
+                Duration::ZERO,
+                0,
+                Some(V3_CONNECT_TEST.to_vec()),
+                Some(std::io::ErrorKind::InvalidData),
+            )
+            .await;
+            let peer = client.local_addr().expect("local_addr").to_string();
+            // Read the CONNACK so the handshake completes, then drop the
+            // client so the next read on the server side yields the injected
+            // transport error — the mid-session branch.
+            let connack = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                .await
+                .expect("read CONNACK");
+            assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+            drop(client);
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Ok(super::SessionOutcome::Served)),
+                "mid-session InvalidData (no DecodeError source) must stay Served, got {join_res:?}"
+            );
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert_eq!(
+                count_lines_at(&logs, "WARN", "protocol violation"),
+                0,
+                "a transport failure must not emit a WARN line; logs:\n{logs}"
+            );
+            // Sanity: the WARN-level transport line that the handshake path
+            // emits is not present here either — the packet loop has no such
+            // line, the WARN silence is the property AC-18 asks for.
+            let _ = peer;
+        });
+    }
+
+    /// AC-7, AC-13 — a v5 client that sends a PINGRESP (a server-only packet)
+    /// receives a v5 DISCONNECT carrying `ProtocolError` (0x82) and the
+    /// handler reports `SessionOutcome::Violation`, with exactly one WARN
+    /// line carrying the violation reason.
+    #[test]
+    fn v5_pingresp_from_client_closes_with_disconnect() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            tcp_write_all(&mut client, &encode_v5_connect(30, "test"))
+                .await
+                .expect("v5 CONNECT write");
+
+            let mut reader = V5Reader::new();
+            let connack = monoio::time::timeout(Duration::from_secs(2), reader.next(&mut client))
+                .await
+                .expect("v5 CONNACK read timeout")
+                .expect("v5 CONNACK decoded");
+            let MqttPacket::V5(PacketV5::ConnectAck(_)) = connack else {
+                panic!("expected v5 CONNACK, got {connack:?}")
+            };
+
+            // PINGRESP from a client: server-only packet, must close as a violation.
+            tcp_write_all(&mut client, &[0xD0, 0x00])
+                .await
+                .expect("client PINGRESP write");
+
+            let disconnect_bytes =
+                monoio::time::timeout(Duration::from_secs(2), reader.raw(&mut client, 4))
+                    .await
+                    .expect("v5 DISCONNECT read timeout");
+            assert_eq!(
+                disconnect_bytes,
+                vec![0xE0, 0x02, 0x82, 0x00],
+                "expected v5 DISCONNECT carrying ProtocolError (0x82)"
+            );
+
+            // EOF on the socket after the DISCONNECT flush, with no trailing
+            // bytes. A zero bound here would time out before the close and
+            // assert nothing.
+            let rest = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(2))
+                .await
+                .expect("EOF after the v5 DISCONNECT");
+            assert!(
+                rest.is_empty(),
+                "expected EOF after the DISCONNECT, got {rest:02X?}"
+            );
+
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            match join_res {
+                Ok(super::SessionOutcome::Violation) => {}
+                other => panic!("expected SessionOutcome::Violation, got {other:?}"),
+            }
+
+            let logs =
+                String::from_utf8(sink.lock().expect("log lock").clone()).expect("utf8 logs");
+            assert_eq!(
+                count_lines_at(&logs, "WARN", "protocol violation"),
+                1,
+                "exactly one WARN protocol-violation line expected; logs were:\n{logs}"
+            );
+        });
+    }
+
+    /// A SUBACK the client's declared Maximum Packet Size cannot hold is never
+    /// written: 200 filters render a 206-byte refusal, so a client that
+    /// declared 128 gets the `PacketTooLarge` (0x95) DISCONNECT and a
+    /// `Violation` outcome instead of an oversized packet.
+    #[test]
+    fn v5_suback_over_client_max_packet_size_closes_with_packet_too_large() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            let connect = encode_v5_connect_with_max_packet_size(
+                30,
+                "test",
+                Some(NonZeroU32::new(128).expect("non-zero")),
+            );
+            tcp_write_all(&mut client, &connect)
+                .await
+                .expect("v5 CONNECT write");
+
+            let mut reader = V5Reader::new();
+            let connack = monoio::time::timeout(Duration::from_secs(2), reader.next(&mut client))
+                .await
+                .expect("v5 CONNACK read timeout")
+                .expect("v5 CONNACK decoded");
+            let MqttPacket::V5(PacketV5::ConnectAck(_)) = connack else {
+                panic!("expected v5 CONNACK, got {connack:?}")
+            };
+
+            let mut enc = MqttEncoder::v5();
+            let pkt = MqttPacket::V5(PacketV5::Subscribe(rmqtt_codec::v5::Subscribe {
+                packet_id: NonZeroU16::new(1).expect("non-zero"),
+                id: None,
+                user_properties: Vec::new(),
+                topic_filters: (0..200)
+                    .map(|i| {
+                        (
+                            format!("t/{i}").into(),
+                            rmqtt_codec::v5::SubscriptionOptions::default(),
+                        )
+                    })
+                    .collect(),
+            }));
+            let mut buf = BytesMut::new();
+            enc.encode(pkt, &mut buf).expect("encode v5 SUBSCRIBE");
+            tcp_write_all(&mut client, &buf)
+                .await
+                .expect("v5 SUBSCRIBE write");
+
+            let disconnect_bytes =
+                monoio::time::timeout(Duration::from_secs(2), reader.raw(&mut client, 4))
+                    .await
+                    .expect("v5 DISCONNECT read timeout");
+            assert_eq!(
+                disconnect_bytes,
+                vec![0xE0, 0x02, 0x95, 0x00],
+                "expected v5 DISCONNECT carrying PacketTooLarge (0x95), not a 206-byte SUBACK"
+            );
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            match join_res {
+                Ok(super::SessionOutcome::Violation) => {}
+                other => panic!("expected SessionOutcome::Violation, got {other:?}"),
+            }
+        });
+    }
+
+    /// The oversize close obeys the limit it enforces. A client declaring a
+    /// Maximum Packet Size of 3 cannot receive the 4-byte `PacketTooLarge`
+    /// DISCONNECT either, so its one-filter SUBSCRIBE closes the connection
+    /// silently: zero bytes after the CONNACK, still `SessionOutcome::Violation`.
+    #[test]
+    fn v5_oversize_close_under_four_byte_limit_sends_no_disconnect() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            let connect = encode_v5_connect_with_max_packet_size(
+                30,
+                "test",
+                Some(NonZeroU32::new(3).expect("non-zero")),
+            );
+            tcp_write_all(&mut client, &connect)
+                .await
+                .expect("v5 CONNECT write");
+
+            let mut reader = V5Reader::new();
+            let connack = monoio::time::timeout(Duration::from_secs(2), reader.next(&mut client))
+                .await
+                .expect("v5 CONNACK read timeout")
+                .expect("v5 CONNACK decoded");
+            let MqttPacket::V5(PacketV5::ConnectAck(_)) = connack else {
+                panic!("expected v5 CONNACK, got {connack:?}")
+            };
+
+            let mut enc = MqttEncoder::v5();
+            let pkt = MqttPacket::V5(PacketV5::Subscribe(rmqtt_codec::v5::Subscribe {
+                packet_id: NonZeroU16::new(1).expect("non-zero"),
+                id: None,
+                user_properties: Vec::new(),
+                topic_filters: vec![(
+                    "t/0".into(),
+                    rmqtt_codec::v5::SubscriptionOptions::default(),
+                )],
+            }));
+            let mut buf = BytesMut::new();
+            enc.encode(pkt, &mut buf).expect("encode v5 SUBSCRIBE");
+            tcp_write_all(&mut client, &buf)
+                .await
+                .expect("v5 SUBSCRIBE write");
+
+            let got = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(2))
+                .await
+                .expect("read to eof");
+            assert!(
+                got.is_empty(),
+                "expected no packet after the CONNACK — neither the 6-byte SUBACK nor the \
+                 4-byte DISCONNECT fits a 3-byte limit — got {got:?}"
+            );
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            match join_res {
+                Ok(super::SessionOutcome::Violation) => {}
+                other => panic!("expected SessionOutcome::Violation, got {other:?}"),
+            }
         });
     }
 

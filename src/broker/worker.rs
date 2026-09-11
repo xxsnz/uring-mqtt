@@ -14,6 +14,7 @@ struct WorkerState {
     active_connections: Cell<usize>,
     max_connections: usize,
     refused_connects: Cell<u64>,
+    violations: Cell<u64>,
     #[allow(dead_code)] // Reserved for future buffer reuse optimization
     buffer_pool: BufferPool,
 }
@@ -25,6 +26,7 @@ impl WorkerState {
             active_connections: Cell::new(0),
             max_connections,
             refused_connects: Cell::new(0),
+            violations: Cell::new(0),
             buffer_pool: BufferPool::new(2048, max_connections / 4),
         }
     }
@@ -62,6 +64,18 @@ impl WorkerState {
             );
         }
     }
+
+    fn note_violation(&self) {
+        let total = self.violations.get() + 1;
+        self.violations.set(total);
+        if should_log_count(total) {
+            tracing::warn!(
+                "Worker {}: {} protocol violations total",
+                self.worker_id,
+                total
+            );
+        }
+    }
 }
 
 /// Maximum number of undelivered events buffered between worker and callback.
@@ -89,6 +103,12 @@ pub(crate) struct EventSender {
 }
 
 impl EventSender {
+    /// Offers `event` to the worker's callback. A full channel increments the
+    /// drop counter and warns on the `should_log_count` cadence; a receiver
+    /// that has gone away is debug-logged only, and is not counted. Either way
+    /// the event is discarded and the caller is not told: a QoS 1 PUBACK is
+    /// sent for every well-formed PUBLISH regardless, so a publisher is never
+    /// left holding an inflight slot for a reading this broker has dropped.
     pub(crate) fn send(&self, event: Event) {
         if self.tx.is_closed() {
             tracing::debug!(
@@ -109,17 +129,20 @@ impl EventSender {
             }
             return;
         }
-        match self.tx.send(event) {
-            Ok(()) => {
-                self.state.depth.set(self.state.depth.get() + 1);
-            }
-            Err(_) => {
-                tracing::debug!(
-                    "worker {}: event receiver closed, event discarded",
-                    self.worker_id
-                );
-            }
+        if let Ok(()) = self.tx.send(event) {
+            self.state.depth.set(self.state.depth.get() + 1);
+        } else {
+            tracing::debug!(
+                "worker {}: event receiver closed, event discarded",
+                self.worker_id
+            );
         }
+    }
+
+    /// Events currently queued behind this sender.
+    #[cfg(test)]
+    fn queued_depth(&self) -> usize {
+        self.state.depth.get()
     }
 }
 
@@ -333,9 +356,15 @@ pub async fn run_worker(
                     monoio::select! {
                         biased;
                         res = handle_client(stream, event_tx_clone, connection_timeout, idle_timeout) => {
+                            // Task 1 introduces `Violation` with an empty body so the
+                            // match stays exhaustive; task 8 fills it with the counter
+                            // increment. The two empty bodies are intentionally
+                            // identical until then.
+                            #[allow(clippy::match_same_arms)]
                             match res {
                                 Ok(super::handler::SessionOutcome::Refused) => state_clone.note_refused(),
                                 Ok(super::handler::SessionOutcome::Served) => {}
+                                Ok(super::handler::SessionOutcome::Violation) => state_clone.note_violation(),
                                 Err(e) => {
                                     if !e.is_routine_disconnect() {
                                         tracing::debug!("Client {} error: {:?}", addr, e);
@@ -419,6 +448,10 @@ mod tests {
     impl WorkerState {
         pub(crate) fn refused_total(&self) -> u64 {
             self.refused_connects.get()
+        }
+
+        pub(crate) fn violations_total(&self) -> u64 {
+            self.violations.get()
         }
     }
 
@@ -528,6 +561,34 @@ mod tests {
                 "received index {idx} out of order"
             );
         }
+    }
+
+    /// AC-28 — a `send` that overflows the channel is dropped without
+    /// occupying a slot. Fill the channel to capacity, observe the depth,
+    /// send one more, then assert the drop counter incremented once and the
+    /// depth did not move. Pins the full-channel branch specifically; the
+    /// closed-receiver branch is reachable only from a wire test
+    /// (`acks_qos1_publish_when_ingest_receiver_is_closed`).
+    #[test]
+    fn full_channel_send_is_dropped_without_occupying_a_slot() {
+        let (tx, _rx) = event_channel(0);
+        for i in 0..EVENT_CHANNEL_CAPACITY {
+            tx.send(Event::SensorV1 {
+                temperature: i16::try_from(i).expect("fixture index fits i16"),
+                pressure: 1013,
+            });
+        }
+        assert_eq!(tx.queued_depth(), EVENT_CHANNEL_CAPACITY);
+        tx.send(Event::SensorV1 {
+            temperature: 0,
+            pressure: 1013,
+        });
+        assert_eq!(tx.dropped_total(), 1);
+        assert_eq!(
+            tx.queued_depth(),
+            EVENT_CHANNEL_CAPACITY,
+            "a rejected send must not occupy a queue slot"
+        );
     }
 
     #[test]
@@ -662,6 +723,35 @@ mod tests {
         state.note_refused();
         state.note_refused();
         assert_eq!(state.refused_total(), 3);
+    }
+
+    /// AC-24 — `note_violation` increments the lifetime counter exactly once
+    /// per call. Asserting after each call (not only at the end) catches an
+    /// accessor that returns a constant or an increment of the wrong size.
+    /// `refused_total` is asserted as a control throughout to prove the two
+    /// counters are independent; the final `note_refused` proves that control
+    /// is live rather than merely unexercised.
+    #[test]
+    fn note_violation_increments_lifetime_total() {
+        let state = WorkerState::new(0, 2);
+        assert_eq!(state.violations_total(), 0);
+        assert_eq!(state.refused_total(), 0);
+
+        state.note_violation();
+        assert_eq!(state.violations_total(), 1);
+        assert_eq!(state.refused_total(), 0);
+
+        state.note_violation();
+        assert_eq!(state.violations_total(), 2);
+        assert_eq!(state.refused_total(), 0);
+
+        state.note_violation();
+        assert_eq!(state.violations_total(), 3);
+        assert_eq!(state.refused_total(), 0);
+
+        state.note_refused();
+        assert_eq!(state.refused_total(), 1);
+        assert_eq!(state.violations_total(), 3);
     }
 
     /// AC-2 + AC-16 + AC-22 — bind happens on the worker thread (the std
