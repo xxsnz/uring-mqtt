@@ -181,21 +181,33 @@ where
             tracing::warn!("handshake violation: first packet was not CONNECT ({peer_addr})");
             return Err(Error::Protocol("first packet was not CONNECT".into()));
         }
-        ConnectDecision::Refuse { connack } => {
+        ConnectDecision::Refuse { connack, sendable } => {
             let reason = match &connack {
                 MqttPacket::V3(PacketV3::ConnectAck(a)) => format!("{:?}", a.return_code),
-                MqttPacket::V5(PacketV5::ConnectAck(a)) => format!("{:?}", a.reason_code),
+                MqttPacket::V5(PacketV5::ConnectAck(a)) => match a.reason_code {
+                    V5ConnectAckReason::ImplementationSpecificError => {
+                        "ImplementationSpecificError (maximum packet size too small for the CONNACK)"
+                            .to_string()
+                    }
+                    other => format!("{other:?}"),
+                },
                 _ => "unknown".to_string(),
             };
             tracing::warn!("CONNECT refused: {reason} from {peer_addr}");
-            bounded_send(
-                &mut framed,
-                connack,
-                remaining(),
-                peer_addr,
-                TIMEOUT_CTX_CONNACK_FLUSH,
-            )
-            .await?;
+            if sendable {
+                bounded_send(
+                    &mut framed,
+                    connack,
+                    remaining(),
+                    peer_addr,
+                    TIMEOUT_CTX_CONNACK_FLUSH,
+                )
+                .await?;
+            } else {
+                tracing::debug!(
+                    "refusal CONNACK withheld: over the client's maximum packet size ({peer_addr})"
+                );
+            }
             SessionOutcome::Refused
         }
         ConnectDecision::Accept {
@@ -2708,12 +2720,20 @@ pub(crate) mod tests {
         });
     }
 
-    /// The oversize close obeys the limit it enforces. A client declaring a
-    /// Maximum Packet Size of 3 cannot receive the 4-byte `PacketTooLarge`
-    /// DISCONNECT either, so its one-filter SUBSCRIBE closes the connection
-    /// silently: zero bytes after the CONNACK, still `SessionOutcome::Violation`.
+    /// AC-8 — a v5 CONNECT whose declared Maximum Packet Size (3) cannot hold
+    /// even the bare refusal CONNACK (12 bytes) is refused at handshake time
+    /// and zero bytes are written: the client declared the limit, the limit
+    /// is honoured, the connection closes with `SessionOutcome::Refused`.
+    /// **Replaces** the prior `v5_oversize_close_under_four_byte_limit_sends_no_disconnect`,
+    /// whose premise — a 3-byte client reaching the packet loop — this task
+    /// removes: a CONNECT declaring less than 12 is no longer accepted, so no
+    /// 3-byte client can reach the violation DISCONNECT. The behaviour the
+    /// deleted test proved (a violation close obeying its own limit) remains
+    /// covered at the pure seam by
+    /// `violation_disconnect_under_the_clients_max_packet_size_is_omitted`
+    /// (`packet.rs:939`), untouched.
     #[test]
-    fn v5_oversize_close_under_four_byte_limit_sends_no_disconnect() {
+    fn v5_connect_declaring_three_bytes_is_refused_with_no_packet_written() {
         let mut rt = build_runtime();
         rt.block_on(async {
             let (mut client, _rx, handle) = spawn_handler(2, 30).await;
@@ -2726,45 +2746,332 @@ pub(crate) mod tests {
                 .await
                 .expect("v5 CONNECT write");
 
-            let mut reader = V5Reader::new();
-            let connack = monoio::time::timeout(Duration::from_secs(2), reader.next(&mut client))
+            let got = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(2))
                 .await
-                .expect("v5 CONNACK read timeout")
-                .expect("v5 CONNACK decoded");
-            let MqttPacket::V5(PacketV5::ConnectAck(_)) = connack else {
+                .expect("read to eof");
+            assert!(
+                got.is_empty(),
+                "expected zero bytes — the 12-byte refusal CONNACK over a declared 3 must be withheld — got {got:?}"
+            );
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            match join_res {
+                Ok(super::SessionOutcome::Refused) => {}
+                other => panic!("expected SessionOutcome::Refused, got {other:?}"),
+            }
+        });
+    }
+
+    /// AC-9 — keep-alive 30 against a 30s config is capped, so the accept
+    /// CONNACK carries `server_keepalive_sec` and is 15 bytes — over a
+    /// declared 12. The bare refusal CONNACK is 12 bytes and fits, so the
+    /// client receives exactly one CONNACK with `ImplementationSpecificError`.
+    /// The byte count is this feature's contract (asserted directly rather
+    /// than via `V5Reader::next`, which returns `None` at EOF even after a
+    /// truncated packet — `handler.rs:755-769`).
+    #[test]
+    fn v5_connect_below_the_accept_connack_but_above_the_refusal_receives_the_refusal() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            let connect = encode_v5_connect_with_max_packet_size(
+                30,
+                "test",
+                Some(NonZeroU32::new(12).expect("non-zero")),
+            );
+            tcp_write_all(&mut client, &connect)
+                .await
+                .expect("v5 CONNECT write");
+
+            let got = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(2))
+                .await
+                .expect("read to eof");
+            assert_eq!(
+                got.len(),
+                12,
+                "expected exactly the 12-byte refusal CONNACK — got {got:?}"
+            );
+
+            let mut reader = V5Reader::new();
+            reader.buf.extend_from_slice(&got);
+            let connack = match monoio_codec::Decoder::decode(&mut reader.decoder, &mut reader.buf)
+            {
+                Ok(monoio_codec::Decoded::Some((packet, _))) => packet,
+                other => panic!("expected one v5 CONNACK, got {other:?}"),
+            };
+            let MqttPacket::V5(PacketV5::ConnectAck(ack)) = connack else {
                 panic!("expected v5 CONNACK, got {connack:?}")
             };
+            assert!(
+                matches!(
+                    ack.reason_code,
+                    V5ConnectAckReason::ImplementationSpecificError
+                ),
+                "size-policy refusal is ImplementationSpecificError, got {:?}",
+                ack.reason_code,
+            );
+            assert_eq!(
+                ack.server_keepalive_sec, None,
+                "refusal CONNACK has no server_keepalive_sec"
+            );
 
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            match join_res {
+                Ok(super::SessionOutcome::Refused) => {}
+                other => panic!("expected SessionOutcome::Refused, got {other:?}"),
+            }
+        });
+    }
+
+    /// AC-12 — same scenario as the byte-level AC-9 test, driven under
+    /// `capture_logs()`. A separate test from the byte-level one because it
+    /// proves a different capability: an operator reading default-level logs
+    /// can tell why the device was turned away. The reason clause names the
+    /// size so the refusal is not opaque.
+    #[test]
+    fn v5_size_refusal_warn_line_names_the_maximum_packet_size() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            let connect = encode_v5_connect_with_max_packet_size(
+                30,
+                "test",
+                Some(NonZeroU32::new(12).expect("non-zero")),
+            );
+            tcp_write_all(&mut client, &connect)
+                .await
+                .expect("v5 CONNECT write");
+
+            let _ = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(2))
+                .await
+                .expect("read to eof");
+            let peer = client.local_addr().expect("local_addr").to_string();
+
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            match join_res {
+                Ok(super::SessionOutcome::Refused) => {}
+                other => panic!("expected SessionOutcome::Refused, got {other:?}"),
+            }
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert!(
+                has_line_at(
+                    &logs,
+                    "WARN",
+                    &[
+                        "CONNECT refused: ImplementationSpecificError (maximum packet size too small for the CONNACK)",
+                        &peer,
+                    ],
+                ),
+                "missing WARN-level size-refusal log with complete peer address, got: {logs}"
+            );
+        });
+    }
+
+    /// AC-10 — pins the named residual. A v5 CONNECT the decoder rejects with
+    /// `InvalidClientId` (empty client id + `clean_start` false) has already
+    /// had its Maximum Packet Size parsed by `rmqtt-codec`, but the codec's
+    /// error variant is fieldless and the body has already been split out of
+    /// the input buffer, so the limit is lost before the refusal is chosen.
+    /// The 12-byte `ClientIdentifierNotValid` CONNACK is therefore written
+    /// ungated — a reachable case where 12 bytes go to a connection that
+    /// declared 3. **This test documents a departure rather than a
+    /// guarantee**; see EPIC-SPEC.md §4, "Recorded exception — Maximum
+    /// Packet Size" for the rationale.
+    #[test]
+    fn v5_decoder_refusal_is_written_whatever_limit_the_connect_declared() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            // Empty client id + clean_start false → codec rejects with
+            // InvalidClientId; max_packet_size = 3 is below the CONNACK length.
             let mut enc = MqttEncoder::v5();
-            let pkt = MqttPacket::V5(PacketV5::Subscribe(rmqtt_codec::v5::Subscribe {
-                packet_id: NonZeroU16::new(1).expect("non-zero"),
-                id: None,
-                user_properties: Vec::new(),
-                topic_filters: vec![(
-                    "t/0".into(),
-                    rmqtt_codec::v5::SubscriptionOptions::default(),
-                )],
-            }));
+            let connect = rmqtt_codec::v5::Connect {
+                max_packet_size: NonZeroU32::new(3),
+                ..rmqtt_codec::v5::Connect::default()
+            };
+            let pkt = MqttPacket::V5(PacketV5::Connect(Box::new(connect)));
             let mut buf = BytesMut::new();
-            enc.encode(pkt, &mut buf).expect("encode v5 SUBSCRIBE");
+            enc.encode(pkt, &mut buf).expect("encode v5 CONNECT");
             tcp_write_all(&mut client, &buf)
                 .await
-                .expect("v5 SUBSCRIBE write");
+                .expect("v5 CONNECT write");
+
+            let got = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(2))
+                .await
+                .expect("read to eof");
+            assert_eq!(
+                got.len(),
+                12,
+                "expected the 12-byte ClientIdentifierNotValid CONNACK despite declared 3 — got {got:?}"
+            );
+
+            let mut reader = V5Reader::new();
+            reader.buf.extend_from_slice(&got);
+            let connack =
+                match monoio_codec::Decoder::decode(&mut reader.decoder, &mut reader.buf) {
+                    Ok(monoio_codec::Decoded::Some((packet, _))) => packet,
+                    other => panic!("expected one v5 CONNACK, got {other:?}"),
+                };
+            let MqttPacket::V5(PacketV5::ConnectAck(ack)) = connack else {
+                panic!("expected v5 CONNACK, got {connack:?}")
+            };
+            assert!(
+                matches!(ack.reason_code, V5ConnectAckReason::ClientIdentifierNotValid),
+                "decoder-level refusal is ClientIdentifierNotValid, got {:?}",
+                ack.reason_code,
+            );
+
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            match join_res {
+                Ok(super::SessionOutcome::Refused) => {}
+                other => panic!("expected SessionOutcome::Refused, got {other:?}"),
+            }
+        });
+    }
+
+    /// AC-12 on the path where nothing reaches the socket. `EPIC-PLAN.md:83`
+    /// binds every CONNECT refusal to a warn line carrying peer and reason,
+    /// and withholding the refusal CONNACK must not withhold the diagnosis:
+    /// a client declaring 3 is turned away in silence on the wire while the
+    /// operator still learns why. Regression guard against moving the warn
+    /// inside the `sendable` branch — every other test in this file asserts
+    /// the warn line only on the path where the CONNACK is also written, so
+    /// that mistake would pass all of them. The DEBUG line naming the
+    /// withholding is asserted alongside it because it is the only record
+    /// that a packet was suppressed rather than never built.
+    #[test]
+    fn v5_withheld_refusal_still_warns_with_peer_and_reason() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            let connect = encode_v5_connect_with_max_packet_size(
+                30,
+                "test",
+                Some(NonZeroU32::new(3).expect("non-zero")),
+            );
+            tcp_write_all(&mut client, &connect)
+                .await
+                .expect("v5 CONNECT write");
 
             let got = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(2))
                 .await
                 .expect("read to eof");
             assert!(
                 got.is_empty(),
-                "expected no packet after the CONNACK — neither the 6-byte SUBACK nor the \
-                 4-byte DISCONNECT fits a 3-byte limit — got {got:?}"
+                "premise: the 12-byte refusal CONNACK over a declared 3 is withheld — got {got:?}"
             );
+            let peer = client.local_addr().expect("local_addr").to_string();
+
             let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
                 .await
                 .expect("join timeout");
             match join_res {
-                Ok(super::SessionOutcome::Violation) => {}
-                other => panic!("expected SessionOutcome::Violation, got {other:?}"),
+                Ok(super::SessionOutcome::Refused) => {}
+                other => panic!("expected SessionOutcome::Refused, got {other:?}"),
+            }
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert!(
+                has_line_at(
+                    &logs,
+                    "WARN",
+                    &[
+                        "CONNECT refused: ImplementationSpecificError (maximum packet size too small for the CONNACK)",
+                        &peer,
+                    ],
+                ),
+                "a refusal whose CONNACK is withheld must still warn with peer and reason, got: {logs}"
+            );
+            assert!(
+                has_line_at(
+                    &logs,
+                    "DEBUG",
+                    &["refusal CONNACK withheld", &peer],
+                ),
+                "withholding the refusal CONNACK must leave a DEBUG record, got: {logs}"
+            );
+        });
+    }
+
+    /// The admission threshold is the CONNACK *this* connection would receive,
+    /// not a constant. A v5 CONNECT carrying no client id is owed a CONNACK
+    /// with `assigned_client_id` built from its own peer address, so its
+    /// threshold is over 30 bytes where a named client's is 12 or 15. A client
+    /// declaring 20 therefore clears the bare CONNACK's length and is still
+    /// refused — which no fixed 12- or 15-byte threshold would do, and which
+    /// only a real socket can prove, because the assigned id's length is the
+    /// ephemeral peer address the unit seam cannot produce. The refusal
+    /// CONNACK is 12 bytes, fits the declared 20, and is written.
+    #[test]
+    fn v5_connect_needing_an_assigned_id_is_refused_when_its_connack_does_not_fit() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            // Empty client id + clean_start true → the server assigns
+            // "auto-<peer>", which alone puts the accept CONNACK over 30 bytes.
+            let mut enc = MqttEncoder::v5();
+            let connect = rmqtt_codec::v5::Connect {
+                client_id: String::new().into(),
+                clean_start: true,
+                keep_alive: 30,
+                max_packet_size: NonZeroU32::new(20),
+                ..rmqtt_codec::v5::Connect::default()
+            };
+            let pkt = MqttPacket::V5(PacketV5::Connect(Box::new(connect)));
+            let mut buf = BytesMut::new();
+            enc.encode(pkt, &mut buf).expect("encode v5 CONNECT");
+            tcp_write_all(&mut client, &buf)
+                .await
+                .expect("v5 CONNECT write");
+
+            let got = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(2))
+                .await
+                .expect("read to eof");
+            assert_eq!(
+                got.len(),
+                12,
+                "expected exactly the 12-byte refusal CONNACK — got {got:?}"
+            );
+
+            let mut reader = V5Reader::new();
+            reader.buf.extend_from_slice(&got);
+            let connack = match monoio_codec::Decoder::decode(&mut reader.decoder, &mut reader.buf)
+            {
+                Ok(monoio_codec::Decoded::Some((packet, _))) => packet,
+                other => panic!("expected one v5 CONNACK, got {other:?}"),
+            };
+            let MqttPacket::V5(PacketV5::ConnectAck(ack)) = connack else {
+                panic!("expected v5 CONNACK, got {connack:?}")
+            };
+            assert!(
+                matches!(
+                    ack.reason_code,
+                    V5ConnectAckReason::ImplementationSpecificError
+                ),
+                "a declared 20 cannot hold the assigned-id CONNACK, got {:?}",
+                ack.reason_code,
+            );
+            assert_eq!(
+                ack.assigned_client_id, None,
+                "the refusal CONNACK assigns no client id"
+            );
+
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            match join_res {
+                Ok(super::SessionOutcome::Refused) => {}
+                other => panic!("expected SessionOutcome::Refused, got {other:?}"),
             }
         });
     }

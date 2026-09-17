@@ -257,6 +257,19 @@ fn fits_within(len: Option<usize>, max_packet_size: Option<NonZeroU32>) -> bool 
     matches!(len, Some(len) if u64::try_from(len).is_ok_and(|len| len <= limit))
 }
 
+/// Whether `packet` may be written to a client that declared
+/// `max_packet_size`. The `pub(crate)` face of the private
+/// `fits_within(encoded_len(..))` pair, for the CONNACK decision that
+/// happens before the packet loop exists. `None` for `max_packet_size`
+/// means "no client-side limit" and is never gated.
+pub(crate) fn fits_max_packet_size(
+    packet: MqttPacket,
+    version: ProtocolVersion,
+    max_packet_size: Option<NonZeroU32>,
+) -> bool {
+    fits_within(encoded_len(packet, version), max_packet_size)
+}
+
 /// The gate between `dispatch` and the send: MQTT 5 forbids sending a packet
 /// larger than the Maximum Packet Size the client declared on CONNECT, and the
 /// SUBACK's size follows the request's filter count, so a refusal the client
@@ -389,14 +402,15 @@ pub(crate) fn dispatch(packet: &MqttPacket) -> Disposition<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::broker::handshake;
     use crate::codec::mqtt::{MqttEncoder, PacketV3, PacketV5};
     use crate::codec::version::ProtocolVersion;
     use bytes::BytesMut;
     use rmqtt_codec::types::{Publish as TypesPublish, QoS};
     use rmqtt_codec::v5::{
-        Disconnect as V5Disconnect, DisconnectReasonCode, PublishAckReason,
-        Subscribe as V5Subscribe, SubscriptionOptions, Unsubscribe as V5Unsubscribe,
-        UnsubscribeAckReason,
+        ConnectAckReason as V5ConnectAckReason, Disconnect as V5Disconnect, DisconnectReasonCode,
+        PublishAckReason, Subscribe as V5Subscribe, SubscriptionOptions,
+        Unsubscribe as V5Unsubscribe, UnsubscribeAckReason,
     };
     use std::num::{NonZeroU16, NonZeroU32, NonZeroUsize};
 
@@ -1390,5 +1404,134 @@ mod tests {
         assert!(Violation::MalformedPacket
             .disconnect(ProtocolVersion::MQTT3, None)
             .is_none());
+    }
+
+    /// AC-4, AC-5 — `fits_max_packet_size` is the pub(crate) face of the
+    /// private `fits_within(encoded_len(..))` pair, and the gate that makes
+    /// the rest of the policy reachable: `None` for `max_packet_size` means
+    /// "no client-side limit" and is never gated; a limit exactly equal to
+    /// the encoded length accepts; one byte below it refuses. The triple
+    /// pins both directions of the boundary so an off-by-one in either arm
+    /// fails one of the three.
+    #[test]
+    fn fits_max_packet_size_gates_only_a_declared_limit() {
+        let render = || Reply::PingResponse.render(ProtocolVersion::MQTT5);
+        let len = encoded_len(render(), ProtocolVersion::MQTT5)
+            .expect("PingResponse must encode on MQTT5");
+        assert!(
+            fits_max_packet_size(render(), ProtocolVersion::MQTT5, None),
+            "None means no client-side limit and is never gated"
+        );
+        let at_limit =
+            NonZeroU32::new(u32::try_from(len).expect("len fits in u32")).expect("non-zero");
+        assert!(
+            fits_max_packet_size(render(), ProtocolVersion::MQTT5, Some(at_limit)),
+            "limit exactly equal to encoded length accepts"
+        );
+        let under = NonZeroU32::new(u32::try_from(len - 1).expect("len - 1 fits in u32"))
+            .expect("non-zero");
+        assert!(
+            !fits_max_packet_size(render(), ProtocolVersion::MQTT5, Some(under)),
+            "limit one byte below the encoded length refuses"
+        );
+    }
+
+    /// AC-6 — a CONNACK `honest_v5_connack` produces must hold every fixed-size
+    /// reply and the v5 violation DISCONNECT. The plan's whole policy rests on
+    /// a fitting CONNACK also guaranteeing every fixed reply fits, so this
+    /// passes today (12 against a 6-byte maximum) and fails the moment
+    /// `honest_v5_connack` shrinks below any fixed reply — the moment the
+    /// CONNACK-only threshold this plan reasons about becomes a lie.
+    #[test]
+    fn smallest_honest_connack_holds_every_fixed_size_reply() {
+        let id = NonZeroU16::new(1).expect("non-zero");
+        let one = NonZeroUsize::new(1).expect("non-zero");
+        let connack = handshake::honest_v5_connack(V5ConnectAckReason::Success);
+        let connack_len = {
+            let mut buf = BytesMut::new();
+            MqttEncoder::v5()
+                .encode(
+                    MqttPacket::V5(PacketV5::ConnectAck(Box::new(connack))),
+                    &mut buf,
+                )
+                .expect("encode bare v5 CONNACK");
+            buf.len()
+        };
+        let fixed = [
+            Reply::PingResponse,
+            Reply::PublishAck(id),
+            Reply::SubscribeRefusal(id, one),
+            Reply::UnsubscribeAck(id, one),
+        ];
+        for version in [ProtocolVersion::MQTT3, ProtocolVersion::MQTT5] {
+            for reply in fixed {
+                let pkt = reply.render(version);
+                let len = encoded_len(pkt, version)
+                    .unwrap_or_else(|| panic!("{reply:?} must encode on {version:?}"));
+                assert!(
+                    len <= connack_len,
+                    "{reply:?} on {version:?} ({len} bytes) must fit the bare v5 CONNACK ({connack_len} bytes)"
+                );
+            }
+        }
+        let disconnect_pkt = Violation::ReplyOverMaxPacketSize
+            .disconnect(ProtocolVersion::MQTT5, None)
+            .expect("v5 violation disconnect");
+        let disconnect_len = encoded_len(disconnect_pkt, ProtocolVersion::MQTT5)
+            .expect("violation disconnect must encode");
+        assert!(
+            disconnect_len <= connack_len,
+            "v5 violation DISCONNECT ({disconnect_len} bytes) must fit the bare v5 CONNACK ({connack_len} bytes)"
+        );
+    }
+
+    /// AC-7 — the CONNACK with `server_keepalive_sec` set and no `assigned_client_id`
+    /// is the largest a v5 CONNECT that does not need an id assignment produces;
+    /// its encoded length **is an admission threshold**, so a capability
+    /// property added to `honest_v5_connack` raises the bar a client must clear
+    /// to connect at all, in a release that touched neither CONNECT nor packet
+    /// size. `assigned_client_id` is excluded because its length is the
+    /// client's own peer address, not a capability choice the server made.
+    #[test]
+    fn largest_capability_connack_stays_within_the_admission_floor() {
+        let mut ack = handshake::honest_v5_connack(V5ConnectAckReason::Success);
+        ack.server_keepalive_sec = Some(u16::MAX);
+        let ack = MqttPacket::V5(PacketV5::ConnectAck(Box::new(ack)));
+        let len = encoded_len(ack, ProtocolVersion::MQTT5).expect("encode capability CONNACK");
+        assert!(
+            len <= 15,
+            "capability CONNACK with server_keepalive_sec must encode to <= 15 bytes; got {len}"
+        );
+    }
+
+    /// AC-4, AC-5 — a packet that cannot be encoded has no measurable length,
+    /// and `fits_within` documents that such a packet never fits under a
+    /// declared limit. `fits_max_packet_size` must carry that through, because
+    /// the CONNACK gate is a refuse-on-doubt decision: a packet it cannot
+    /// measure must not be admitted. Under `None` the answer stays `true` —
+    /// `None` means "no client-side limit" and is never gated, and AC-4 says
+    /// every packet, including one that does not encode.
+    #[test]
+    fn fits_max_packet_size_refuses_an_unmeasurable_packet_only_under_a_limit() {
+        // A v5 CONNACK handed to the v3 codec: rmqtt-codec rejects the
+        // cross-version pair, so `encoded_len` is `None`.
+        let unmeasurable = || {
+            MqttPacket::V5(PacketV5::ConnectAck(Box::new(
+                handshake::honest_v5_connack(V5ConnectAckReason::Success),
+            )))
+        };
+        assert!(
+            encoded_len(unmeasurable(), ProtocolVersion::MQTT3).is_none(),
+            "premise: a v5 CONNACK does not encode under the v3 codec"
+        );
+        let limit = NonZeroU32::new(u32::MAX).expect("non-zero");
+        assert!(
+            !fits_max_packet_size(unmeasurable(), ProtocolVersion::MQTT3, Some(limit)),
+            "an unmeasurable packet never fits under a declared limit, however large"
+        );
+        assert!(
+            fits_max_packet_size(unmeasurable(), ProtocolVersion::MQTT3, None),
+            "None means no client-side limit and is never gated, even for a packet that cannot encode"
+        );
     }
 }

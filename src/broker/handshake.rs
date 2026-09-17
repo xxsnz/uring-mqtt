@@ -3,6 +3,7 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 
 use crate::codec::mqtt::{ConnectAck, ConnectAckReason, MqttPacket, PacketV3, PacketV5};
+use crate::codec::version::ProtocolVersion;
 use rmqtt_codec::types::QoS;
 use rmqtt_codec::v5::ConnectAckReason as V5ConnectAckReason;
 
@@ -30,10 +31,31 @@ pub(crate) enum ConnectDecision {
         /// the property — means the client set no limit.
         max_packet_size: Option<NonZeroU32>,
     },
-    /// CONNECT refused: send `connack` (v3 error code / v5 reason >= 0x80), then close.
-    Refuse { connack: MqttPacket },
+    /// CONNECT refused: `connack` names the refusal reason and is written only when
+    /// `sendable`. `sendable` is false when the CONNACK is larger than the Maximum
+    /// Packet Size the CONNECT declared: it is then withheld and the connection
+    /// closes with no reply, the same silent shape the v3 violation close uses.
+    /// Always true on v3 and whenever the CONNECT declared no limit.
+    Refuse { connack: MqttPacket, sendable: bool },
     /// First packet was not CONNECT: close without CONNACK.
     NotConnect,
+}
+
+/// A v5 refusal decision. The CONNACK carries `reason`; it is sendable only
+/// when it fits the Maximum Packet Size the CONNECT declared. Built from a
+/// clone because `MqttPacket` is not `Clone` and measuring a packet
+/// consumes it.
+fn refuse_v5(reason: V5ConnectAckReason, max_packet_size: Option<NonZeroU32>) -> ConnectDecision {
+    let ack = honest_v5_connack(reason);
+    let sendable = super::packet::fits_max_packet_size(
+        MqttPacket::V5(PacketV5::ConnectAck(Box::new(ack.clone()))),
+        ProtocolVersion::MQTT5,
+        max_packet_size,
+    );
+    ConnectDecision::Refuse {
+        connack: MqttPacket::V5(PacketV5::ConnectAck(Box::new(ack))),
+        sendable,
+    }
 }
 
 /// Evaluate the first decoded packet of a connection against the broker's policy.
@@ -57,6 +79,7 @@ pub(crate) fn evaluate_connect(
                         return_code: ConnectAckReason::IdentifierRejected,
                         session_present: false,
                     })),
+                    sendable: true,
                 };
             }
             let client_id = if c.client_id.is_empty() {
@@ -83,11 +106,10 @@ pub(crate) fn evaluate_connect(
         }
         MqttPacket::V5(PacketV5::Connect(c)) => {
             if c.auth_method.is_some() {
-                return ConnectDecision::Refuse {
-                    connack: MqttPacket::V5(PacketV5::ConnectAck(Box::new(honest_v5_connack(
-                        V5ConnectAckReason::BadAuthenticationMethod,
-                    )))),
-                };
+                return refuse_v5(
+                    V5ConnectAckReason::BadAuthenticationMethod,
+                    c.max_packet_size,
+                );
             }
             let assigned = if c.client_id.is_empty() {
                 Some(format!("auto-{peer_addr}"))
@@ -120,6 +142,21 @@ pub(crate) fn evaluate_connect(
             let mut connack = honest_v5_connack(V5ConnectAckReason::Success);
             connack.assigned_client_id = assigned.map(Into::into);
             connack.server_keepalive_sec = announce;
+            // A client whose declared Maximum Packet Size cannot hold the CONNACK it
+            // is owed cannot be served: the session's first packet would already
+            // break the limit. Refuse before the session begins rather than accept
+            // and close on the first reply. See EPIC-SPEC.md §4, "Recorded exception
+            // — Maximum Packet Size".
+            if !super::packet::fits_max_packet_size(
+                MqttPacket::V5(PacketV5::ConnectAck(Box::new(connack.clone()))),
+                ProtocolVersion::MQTT5,
+                c.max_packet_size,
+            ) {
+                return refuse_v5(
+                    V5ConnectAckReason::ImplementationSpecificError,
+                    c.max_packet_size,
+                );
+            }
             ConnectDecision::Accept {
                 connack: MqttPacket::V5(PacketV5::ConnectAck(Box::new(connack))),
                 client_id,
@@ -166,7 +203,9 @@ pub(crate) fn honest_v5_connack(reason: V5ConnectAckReason) -> rmqtt_codec::v5::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::mqtt::MqttEncoder;
     use bytes::Bytes;
+    use monoio_codec::Encoder as _;
     use rmqtt_codec::v3::{Connect, LastWill};
 
     fn peer() -> SocketAddr {
@@ -385,7 +424,7 @@ mod tests {
     fn rejects_v5_connect_with_auth_method() {
         let packet = v5_connect_with("dev5", 60, true, Some("PLAIN"));
         let d = evaluate_connect(&packet, 300, peer());
-        let ConnectDecision::Refuse { connack } = d else {
+        let ConnectDecision::Refuse { connack, .. } = d else {
             panic!("expected Refuse");
         };
         let MqttPacket::V5(PacketV5::ConnectAck(ack)) = connack else {
@@ -401,7 +440,7 @@ mod tests {
     fn refuses_v3_empty_client_id_without_clean_session() {
         let packet = MqttPacket::V3(PacketV3::Connect(Box::<Connect>::default()));
         let d = evaluate_connect(&packet, 300, peer());
-        let ConnectDecision::Refuse { connack } = d else {
+        let ConnectDecision::Refuse { connack, .. } = d else {
             panic!("expected Refuse");
         };
         let MqttPacket::V3(PacketV3::ConnectAck(ack)) = connack else {
@@ -621,7 +660,7 @@ mod tests {
         // The auth_method refusal outranks client-id assignment.
         let packet = v5_connect_with("", 60, true, Some("PLAIN"));
         let d = evaluate_connect(&packet, 300, peer());
-        let ConnectDecision::Refuse { connack } = d else {
+        let ConnectDecision::Refuse { connack, .. } = d else {
             panic!("expected Refuse");
         };
         let MqttPacket::V5(PacketV5::ConnectAck(ack)) = connack else {
@@ -663,5 +702,338 @@ mod tests {
         let packet = MqttPacket::V3(PacketV3::PingRequest);
         let d = evaluate_connect(&packet, 300, peer());
         assert!(matches!(d, ConnectDecision::NotConnect));
+    }
+
+    /// AC-1 — a v5 client that declared a Maximum Packet Size smaller than
+    /// the CONNACK it is owed is refused before any session begins, with a
+    /// reason code the brief pins so a default-level warning carries it.
+    /// Written against the `{ connack, .. }` pattern so the test compiles
+    /// before the implementation step adds `sendable`. Today this returns
+    /// `Accept` for any v5 CONNECT whose declared limit is non-zero, which is
+    /// the exact RED behaviour: the size gate has not been wired.
+    #[test]
+    fn refuses_v5_connect_whose_declared_limit_cannot_hold_the_connack() {
+        let c = rmqtt_codec::v5::Connect {
+            client_id: "dev5".to_string().into(),
+            keep_alive: 60,
+            max_packet_size: NonZeroU32::new(11),
+            ..rmqtt_codec::v5::Connect::default()
+        };
+        let packet = MqttPacket::V5(PacketV5::Connect(Box::new(c)));
+        let d = evaluate_connect(&packet, 300, peer());
+        let ConnectDecision::Refuse { connack, sendable } = d else {
+            panic!("expected Refuse; today evaluate_connect returns Accept for v5 CONNECTs that fit the CONNACK");
+        };
+        let MqttPacket::V5(PacketV5::ConnectAck(ack)) = connack else {
+            panic!("expected v5 CONNACK");
+        };
+        assert!(
+            matches!(
+                ack.reason_code,
+                V5ConnectAckReason::ImplementationSpecificError
+            ),
+            "size-policy refusal is ImplementationSpecificError, got {:?}",
+            ack.reason_code,
+        );
+        assert!(
+            !sendable,
+            "refusal CONNACK is 12 bytes over a declared 11 — must be withheld"
+        );
+    }
+
+    /// AC-1, AC-2 — the boundary between accept and refuse lives at the
+    /// measured CONNACK length, not at any hardcoded threshold. Three shapes
+    /// (bare CONNACK, server-announced keep-alive, and `assigned_client_id`)
+    /// all pin their own Accept-length boundary; `max_packet_size == len` is
+    /// the inclusive accept side, `len - 1` is the refuse side. A
+    /// hardcoded threshold constant cannot satisfy all three because the
+    /// three lengths are pairwise distinct, and the bare-CONNACK length is
+    /// pinned to 12 so a constant that only happens to line up with one
+    /// shape fails the other two.
+    #[test]
+    #[allow(clippy::too_many_lines)] // three CONNACK shapes each measured end-to-end, splitting buys nothing
+    fn accepts_at_exactly_the_connack_length_for_every_connack_shape() {
+        // (a) bare CONNACK — id "dev5", keep_alive 60 under config 300.
+        let pkt_a = v5_connect_with("dev5", 60, false, None);
+        let ConnectDecision::Accept {
+            connack: a_connack, ..
+        } = evaluate_connect(&pkt_a, 300, peer())
+        else {
+            panic!("shape (a) expected Accept at max_packet_size = None");
+        };
+        let a_len = {
+            let mut buf = bytes::BytesMut::new();
+            MqttEncoder::v5()
+                .encode(a_connack, &mut buf)
+                .expect("encode a");
+            buf.len()
+        };
+        assert_eq!(a_len, 12, "bare CONNACK length pins the lower threshold");
+
+        // (b) capped keep-alive — id "dev5", keep_alive 30 under config 30.
+        let pkt_b = v5_connect_with("dev5", 30, false, None);
+        let ConnectDecision::Accept {
+            connack: b_connack, ..
+        } = evaluate_connect(&pkt_b, 30, peer())
+        else {
+            panic!("shape (b) expected Accept at max_packet_size = None");
+        };
+        let b_len = {
+            let mut buf = bytes::BytesMut::new();
+            MqttEncoder::v5()
+                .encode(b_connack, &mut buf)
+                .expect("encode b");
+            buf.len()
+        };
+
+        // (c) assigned client id — id "" + clean_start, keep_alive 60 under config 300.
+        let pkt_c = v5_connect_with("", 60, true, None);
+        let ConnectDecision::Accept {
+            connack: c_connack, ..
+        } = evaluate_connect(&pkt_c, 300, peer())
+        else {
+            panic!("shape (c) expected Accept at max_packet_size = None");
+        };
+        let c_len = {
+            let mut buf = bytes::BytesMut::new();
+            MqttEncoder::v5()
+                .encode(c_connack, &mut buf)
+                .expect("encode c");
+            buf.len()
+        };
+
+        // Distinct — a hardcoded single threshold cannot satisfy all three.
+        assert_ne!(
+            a_len, b_len,
+            "shapes (a) and (b) must encode to distinct lengths"
+        );
+        assert_ne!(
+            a_len, c_len,
+            "shapes (a) and (c) must encode to distinct lengths"
+        );
+        assert_ne!(
+            b_len, c_len,
+            "shapes (b) and (c) must encode to distinct lengths"
+        );
+
+        // At max_packet_size == len the implementation must keep Accept.
+        let c_a = rmqtt_codec::v5::Connect {
+            client_id: "dev5".to_string().into(),
+            keep_alive: 60,
+            max_packet_size: NonZeroU32::new(a_len.try_into().unwrap()),
+            ..rmqtt_codec::v5::Connect::default()
+        };
+        let packet = MqttPacket::V5(PacketV5::Connect(Box::new(c_a)));
+        assert!(
+            matches!(
+                evaluate_connect(&packet, 300, peer()),
+                ConnectDecision::Accept { .. }
+            ),
+            "shape (a) at max_packet_size = a_len ({a_len}) must accept",
+        );
+
+        let c_b = rmqtt_codec::v5::Connect {
+            client_id: "dev5".to_string().into(),
+            keep_alive: 30,
+            max_packet_size: NonZeroU32::new(b_len.try_into().unwrap()),
+            ..rmqtt_codec::v5::Connect::default()
+        };
+        let packet = MqttPacket::V5(PacketV5::Connect(Box::new(c_b)));
+        assert!(
+            matches!(
+                evaluate_connect(&packet, 30, peer()),
+                ConnectDecision::Accept { .. }
+            ),
+            "shape (b) at max_packet_size = b_len ({b_len}) must accept",
+        );
+
+        let c_c = rmqtt_codec::v5::Connect {
+            client_id: String::new().into(),
+            keep_alive: 60,
+            clean_start: true,
+            max_packet_size: NonZeroU32::new(c_len.try_into().unwrap()),
+            ..rmqtt_codec::v5::Connect::default()
+        };
+        let packet = MqttPacket::V5(PacketV5::Connect(Box::new(c_c)));
+        assert!(
+            matches!(
+                evaluate_connect(&packet, 300, peer()),
+                ConnectDecision::Accept { .. }
+            ),
+            "shape (c) at max_packet_size = c_len ({c_len}) must accept",
+        );
+
+        // At max_packet_size = len - 1 the implementation must Refuse.
+        let a_under = u32::try_from(a_len - 1).unwrap();
+        let c_a = rmqtt_codec::v5::Connect {
+            client_id: "dev5".to_string().into(),
+            keep_alive: 60,
+            max_packet_size: NonZeroU32::new(a_under),
+            ..rmqtt_codec::v5::Connect::default()
+        };
+        let packet = MqttPacket::V5(PacketV5::Connect(Box::new(c_a)));
+        assert!(
+            matches!(
+                evaluate_connect(&packet, 300, peer()),
+                ConnectDecision::Refuse { .. }
+            ),
+            "shape (a) at max_packet_size = {a_under} must refuse",
+        );
+    }
+
+    /// AC-3 — v3 carries no Maximum Packet Size property, so the new size
+    /// rule cannot reach a v3 CONNECT. Pure regression guard against an
+    /// implementation that mis-targets the gate at `MqttPacket` rather than
+    /// at the v5 CONNECT only.
+    #[test]
+    fn v3_connect_is_never_refused_for_packet_size() {
+        let packet = v3_connect_with("dev-1", 60, false);
+        let d = evaluate_connect(&packet, 300, peer());
+        assert!(
+            matches!(d, ConnectDecision::Accept { .. }),
+            "v3 CONNECT cannot be refused for packet size"
+        );
+    }
+
+    /// AC-11 — authentication-method refusal outranks the size refusal so a
+    /// misconfigured client that violates both rules sees the more useful
+    /// `BadAuthenticationMethod` diagnosis. Regression guard against an
+    /// implementation that places the size check before the auth check (or
+    /// that overwrites the auth reason with `ImplementationSpecificError`).
+    /// The v5 CONNECT carries both `auth_method = Some("PLAIN")` AND a
+    /// `max_packet_size` set to each of 11, 12, and `None`; all three must
+    /// refuse with `BadAuthenticationMethod`, not `ImplementationSpecificError`.
+    #[test]
+    fn authentication_refusal_outranks_the_packet_size_refusal() {
+        for (label, max_packet_size, expected_sendable) in [
+            ("max=11", NonZeroU32::new(11), false),
+            ("max=12", NonZeroU32::new(12), true),
+            ("max=None", None, true),
+        ] {
+            let mut c = rmqtt_codec::v5::Connect {
+                client_id: "dev5".to_string().into(),
+                keep_alive: 60,
+                clean_start: true,
+                auth_method: Some("PLAIN".to_string().into()),
+                max_packet_size,
+                ..rmqtt_codec::v5::Connect::default()
+            };
+            let packet = MqttPacket::V5(PacketV5::Connect(Box::new(c.clone())));
+            let d = evaluate_connect(&packet, 300, peer());
+            let ConnectDecision::Refuse { connack, sendable } = d else {
+                panic!("{label}: expected Refuse (auth_method outranks size)");
+            };
+            let MqttPacket::V5(PacketV5::ConnectAck(ack)) = connack else {
+                panic!("{label}: expected v5 CONNACK");
+            };
+            assert!(
+                matches!(ack.reason_code, V5ConnectAckReason::BadAuthenticationMethod),
+                "{label}: size policy must not overwrite the auth refusal, got {:?}",
+                ack.reason_code,
+            );
+            assert_eq!(
+                sendable, expected_sendable,
+                "{label}: auth-refusal sendable must follow the size rule (false at 11, true at 12/None)",
+            );
+            // Shape under test: see brief.
+            let _ = &mut c;
+        }
+    }
+
+    /// AC-1, AC-2 — the below-limit half of the boundary for the two CONNACK
+    /// shapes that `accepts_at_exactly_the_connack_length_for_every_connack_shape`
+    /// only proves the accept side of. That test refuses at `len - 1` for the
+    /// bare 12-byte CONNACK alone, so a gate hardcoded to 12 still passes it:
+    /// the server-announced keep-alive (15) and assigned-client-id (~34)
+    /// shapes both clear a constant 12 at their own `len - 1`. Refusing there
+    /// is what a constant cannot do. Both cases also assert the refusal is
+    /// sendable, because both thresholds sit above the 12-byte refusal CONNACK.
+    #[test]
+    fn refuses_one_byte_below_the_keepalive_and_assigned_id_connack_lengths() {
+        let measure = |packet: &MqttPacket, cfg: u64| -> usize {
+            let ConnectDecision::Accept { connack, .. } = evaluate_connect(packet, cfg, peer())
+            else {
+                panic!("expected Accept at max_packet_size = None");
+            };
+            let mut buf = bytes::BytesMut::new();
+            MqttEncoder::v5()
+                .encode(connack, &mut buf)
+                .expect("encode CONNACK");
+            buf.len()
+        };
+        let b_len = measure(&v5_connect_with("dev5", 30, false, None), 30);
+        let c_len = measure(&v5_connect_with("", 60, true, None), 300);
+
+        for (label, client_id, keep_alive, clean_start, cfg, len) in [
+            (
+                "server-announced keep-alive",
+                "dev5",
+                30_u16,
+                false,
+                30_u64,
+                b_len,
+            ),
+            ("assigned client id", "", 60, true, 300, c_len),
+        ] {
+            assert!(
+                len > 12,
+                "{label}: this shape must be larger than the bare CONNACK or it proves nothing; got {len}",
+            );
+            let under = u32::try_from(len - 1).expect("len - 1 fits in u32");
+            let c = rmqtt_codec::v5::Connect {
+                client_id: client_id.to_string().into(),
+                keep_alive,
+                clean_start,
+                max_packet_size: NonZeroU32::new(under),
+                ..rmqtt_codec::v5::Connect::default()
+            };
+            let packet = MqttPacket::V5(PacketV5::Connect(Box::new(c)));
+            let ConnectDecision::Refuse { connack, sendable } =
+                evaluate_connect(&packet, cfg, peer())
+            else {
+                panic!("{label}: max_packet_size {under}, one below its {len}-byte CONNACK, must refuse");
+            };
+            let MqttPacket::V5(PacketV5::ConnectAck(ack)) = connack else {
+                panic!("{label}: expected v5 CONNACK");
+            };
+            assert!(
+                matches!(
+                    ack.reason_code,
+                    V5ConnectAckReason::ImplementationSpecificError
+                ),
+                "{label}: size-policy refusal is ImplementationSpecificError, got {:?}",
+                ack.reason_code,
+            );
+            assert!(
+                sendable,
+                "{label}: the 12-byte refusal CONNACK fits {under} and must be sent",
+            );
+        }
+    }
+
+    /// `sendable` is unconditionally true on v3: MQTT 3.1.1 carries no Maximum
+    /// Packet Size property, so a v3 refusal can never be gated by one.
+    /// Regression guard against an implementation that lets the new field
+    /// default to false on this arm, which would silently turn every v3
+    /// `IdentifierRejected` refusal into a bare close — a behaviour change
+    /// this feature does not make, and one no other test would catch.
+    #[test]
+    fn v3_refusal_connack_is_always_sendable() {
+        let packet = MqttPacket::V3(PacketV3::Connect(Box::<Connect>::default()));
+        let ConnectDecision::Refuse { connack, sendable } = evaluate_connect(&packet, 300, peer())
+        else {
+            panic!("expected Refuse");
+        };
+        let MqttPacket::V3(PacketV3::ConnectAck(ack)) = connack else {
+            panic!("expected v3 CONNACK");
+        };
+        assert!(matches!(
+            ack.return_code,
+            ConnectAckReason::IdentifierRejected
+        ));
+        assert!(
+            sendable,
+            "a v3 refusal CONNACK is never gated by a Maximum Packet Size"
+        );
     }
 }
