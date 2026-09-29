@@ -356,11 +356,6 @@ pub async fn run_worker(
                     monoio::select! {
                         biased;
                         res = handle_client(stream, event_tx_clone, connection_timeout, idle_timeout) => {
-                            // Task 1 introduces `Violation` with an empty body so the
-                            // match stays exhaustive; task 8 fills it with the counter
-                            // increment. The two empty bodies are intentionally
-                            // identical until then.
-                            #[allow(clippy::match_same_arms)]
                             match res {
                                 Ok(super::handler::SessionOutcome::Refused) => state_clone.note_refused(),
                                 Ok(super::handler::SessionOutcome::Served) => {}

@@ -22,9 +22,12 @@ type EventReceiver = Receiver<EventMsg>;
 
 /// Client identifier the rumqttc connection presents on CONNECT.
 const CLIENT_ID: &str = "uring-mqtt-itest";
-/// `set_keep_alive` argument — short enough that the broker's idle timeout
-/// (`idle_timeout_secs`, default 300 s) never fires in this test, long
-/// enough to let the broker's PINGRESP loop run if it wants to.
+/// `set_keep_alive` argument. The broker negotiates a v3 idle deadline of
+/// 1.5x this value (7.5 s, capped by `idle_timeout_secs`). The broker sends
+/// no pings of its own: rumqttc 0.24 schedules a PINGREQ every interval
+/// regardless of traffic, which normally keeps the connection inside that
+/// deadline, and the broker answers each with a PINGRESP that `next_event`
+/// skips.
 const KEEP_ALIVE: Duration = Duration::from_secs(5);
 /// `Client::new` capacity argument — the bound on rumqttc's own request
 /// queue, which the test fills with two publishes, one subscribe and one
@@ -60,6 +63,10 @@ const DRIVER_THREAD_NAME: &str = "itest-qos1-driver";
 /// SensorV1 payload bytes the same fixtures the in-crate tests use:
 /// temperature 25.00 °C (0x09C4 = 2500) and pressure 1013 hPa (0x03F5).
 const SENSOR_PAYLOAD: [u8; 4] = [0x09, 0xC4, 0x03, 0xF5];
+/// Wait bound for the `next_event` guard tests, which feed the channel
+/// themselves: every message is already queued, so the bound is only the
+/// margin that keeps a scheduling hiccup from timing the wait out.
+const GUARD_BOUND: Duration = Duration::from_secs(1);
 
 fn find_free_port() -> u16 {
     let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind free port");
@@ -89,7 +96,7 @@ fn next_event(
     rx: &EventReceiver,
     bound: Duration,
     teardown: &AtomicBool,
-    session_open: &AtomicBool,
+    session_open: &mut bool,
 ) -> Result<rumqttc::Event, RumqttcOutcome> {
     let started = Instant::now();
     loop {
@@ -102,14 +109,14 @@ fn next_event(
                 rumqttc::Event::Outgoing(_)
                 | rumqttc::Event::Incoming(rumqttc::Packet::PingResp) => {}
                 rumqttc::Event::Incoming(packet @ rumqttc::Packet::ConnAck(_)) => {
-                    if session_open.load(Ordering::SeqCst) {
+                    if *session_open {
                         return Err(RumqttcOutcome::UnexpectedConnAck);
                     }
-                    session_open.store(true, Ordering::SeqCst);
+                    *session_open = true;
                     return Ok(rumqttc::Event::Incoming(packet));
                 }
                 rumqttc::Event::Incoming(rumqttc::Packet::Disconnect) => {
-                    if session_open.load(Ordering::SeqCst) && !teardown.load(Ordering::SeqCst) {
+                    if *session_open && !teardown.load(Ordering::SeqCst) {
                         return Err(RumqttcOutcome::UnexpectedDisconnect);
                     }
                     return Ok(rumqttc::Event::Incoming(rumqttc::Packet::Disconnect));
@@ -260,16 +267,17 @@ fn qos1_publish_acked_and_session_survives_refused_subscribe() {
         }
     };
 
-    // Build the rumqttc blocking client. `set_keep_alive` is short enough
-    // that the broker's idle timer is never at risk; long enough that the
-    // broker's idle loop (if it pings) does not interfere with our timing.
+    // Build the rumqttc blocking client. rumqttc 0.24, not the broker, sends
+    // PINGREQ every `KEEP_ALIVE`, which normally keeps the session inside its
+    // negotiated 7.5 s idle deadline; `next_event` skips the broker's PINGRESP
+    // replies, so they do not interfere with our timing.
     let mut opts = rumqttc::MqttOptions::new(CLIENT_ID, "127.0.0.1", port);
     opts.set_keep_alive(KEEP_ALIVE);
     let (client, mut connection) = rumqttc::Client::new(opts, REQUEST_CHANNEL_CAP);
 
     let (event_tx, event_rx): (Sender<EventMsg>, EventReceiver) = std::sync::mpsc::channel();
     let teardown = Arc::new(AtomicBool::new(false));
-    let session_open = Arc::new(AtomicBool::new(false));
+    let mut session_open = false;
 
     // Driver thread: forward every event the connection yields to the main
     // test thread, never swallowing an Err. `recv()` blocks until the
@@ -317,7 +325,7 @@ fn qos1_publish_acked_and_session_survives_refused_subscribe() {
 
     // Step 3 — wait for the first ConnAck.
     let connack = assert_outcome(
-        next_event(&event_rx, CONNACK_BOUND, &teardown, &session_open),
+        next_event(&event_rx, CONNACK_BOUND, &teardown, &mut session_open),
         "first ConnAck",
     );
     assert!(
@@ -333,7 +341,7 @@ fn qos1_publish_acked_and_session_survives_refused_subscribe() {
         .publish("t", rumqttc::QoS::AtLeastOnce, false, SENSOR_PAYLOAD)
         .expect("first publish call");
     let puback_1 = assert_outcome(
-        next_event(&event_rx, ACK_BOUND, &teardown, &session_open),
+        next_event(&event_rx, ACK_BOUND, &teardown, &mut session_open),
         "first PubAck",
     );
     let first_pkid = match puback_1 {
@@ -348,7 +356,7 @@ fn qos1_publish_acked_and_session_survives_refused_subscribe() {
         .subscribe("t/#", rumqttc::QoS::AtMostOnce)
         .expect("subscribe call");
     let suback = assert_outcome(
-        next_event(&event_rx, SUBACK_BOUND, &teardown, &session_open),
+        next_event(&event_rx, SUBACK_BOUND, &teardown, &mut session_open),
         "SubAck",
     );
     let return_codes = match suback {
@@ -374,7 +382,7 @@ fn qos1_publish_acked_and_session_survives_refused_subscribe() {
         .publish("t", rumqttc::QoS::AtLeastOnce, false, SENSOR_PAYLOAD)
         .expect("second publish call");
     let puback_2 = assert_outcome(
-        next_event(&event_rx, ACK_BOUND, &teardown, &session_open),
+        next_event(&event_rx, ACK_BOUND, &teardown, &mut session_open),
         "second PubAck",
     );
     let second_pkid = match puback_2 {
@@ -427,8 +435,8 @@ fn qos1_publish_acked_and_session_survives_refused_subscribe() {
         panic!("outgoing Disconnect: {}", err.describe());
     }
 
-    // Drop the receiving end so the driver sees a clean channel close when
-    // its last send fails.
+    // Nothing reads the channel after this point, and the driver was
+    // joined above, so dropping the receiver only releases the channel.
     drop(event_rx);
 
     // Tell the harness thread it may now drop the BrokerHandle, which
@@ -450,4 +458,102 @@ fn qos1_publish_acked_and_session_survives_refused_subscribe() {
             panic!("harness channel closed before reporting teardown")
         }
     }
+}
+
+/// AC-12 — the session window is a local `bool` now, so the guard that reads
+/// it must answer exactly as the shared atomic did: the first `ConnAck`
+/// opens the window and is returned to step 3, and any later `ConnAck` is
+/// the silent client reconnect the helper exists to catch. The live test
+/// never reaches the second branch, so only this case pins it.
+#[test]
+fn next_event_opens_the_window_on_the_first_connack_and_refuses_a_second() {
+    let (tx, rx) = std::sync::mpsc::channel::<EventMsg>();
+    let teardown = AtomicBool::new(false);
+    let mut session_open = false;
+
+    tx.send(Ok(rumqttc::Event::Incoming(rumqttc::Packet::ConnAck(
+        rumqttc::ConnAck::new(rumqttc::ConnectReturnCode::Success, false),
+    ))))
+    .expect("queue the first ConnAck");
+    assert!(
+        matches!(
+            next_event(&rx, GUARD_BOUND, &teardown, &mut session_open),
+            Ok(rumqttc::Event::Incoming(rumqttc::Packet::ConnAck(_)))
+        ),
+        "the first ConnAck is returned to the caller"
+    );
+    assert!(session_open, "the first ConnAck opens the session window");
+
+    tx.send(Ok(rumqttc::Event::Incoming(rumqttc::Packet::ConnAck(
+        rumqttc::ConnAck::new(rumqttc::ConnectReturnCode::Success, false),
+    ))))
+    .expect("queue a second ConnAck");
+    assert!(
+        matches!(
+            next_event(&rx, GUARD_BOUND, &teardown, &mut session_open),
+            Err(RumqttcOutcome::UnexpectedConnAck)
+        ),
+        "a second ConnAck inside an open window is a failure"
+    );
+}
+
+/// AC-12 — the same `bool` decides the incoming-`Disconnect` guard: inside an
+/// open window with the teardown flag still clear it is a failure, and after
+/// the flag flips it is the expected end of the session and is returned.
+#[test]
+fn next_event_refuses_an_in_session_disconnect_and_accepts_it_after_teardown() {
+    let (tx, rx) = std::sync::mpsc::channel::<EventMsg>();
+    let teardown = AtomicBool::new(false);
+    let mut session_open = true;
+
+    tx.send(Ok(rumqttc::Event::Incoming(rumqttc::Packet::Disconnect)))
+        .expect("queue the in-session Disconnect");
+    assert!(
+        matches!(
+            next_event(&rx, GUARD_BOUND, &teardown, &mut session_open),
+            Err(RumqttcOutcome::UnexpectedDisconnect)
+        ),
+        "a Disconnect before teardown ends the session early"
+    );
+
+    teardown.store(true, Ordering::SeqCst);
+    tx.send(Ok(rumqttc::Event::Incoming(rumqttc::Packet::Disconnect)))
+        .expect("queue the teardown Disconnect");
+    assert!(
+        matches!(
+            next_event(&rx, GUARD_BOUND, &teardown, &mut session_open),
+            Ok(rumqttc::Event::Incoming(rumqttc::Packet::Disconnect))
+        ),
+        "after the teardown flag is set the Disconnect is the expected end"
+    );
+    assert!(session_open, "neither Disconnect branch closes the window");
+}
+
+/// AC-13 — `Outgoing` events and the broker's PINGRESP reply are skipped
+/// under the same deadline, so the acknowledgment queued behind them is
+/// still the event the wait returns, and the skip leaves the window as it
+/// found it.
+#[test]
+fn next_event_skips_outgoing_and_pingresp_before_the_awaited_incoming() {
+    let (tx, rx) = std::sync::mpsc::channel::<EventMsg>();
+    let teardown = AtomicBool::new(false);
+    let mut session_open = true;
+
+    tx.send(Ok(rumqttc::Event::Outgoing(rumqttc::Outgoing::PingReq)))
+        .expect("queue the client's own PINGREQ observation");
+    tx.send(Ok(rumqttc::Event::Incoming(rumqttc::Packet::PingResp)))
+        .expect("queue the broker's PINGRESP");
+    tx.send(Ok(rumqttc::Event::Incoming(rumqttc::Packet::PubAck(
+        rumqttc::PubAck::new(1),
+    ))))
+    .expect("queue the awaited PUBACK");
+
+    assert!(
+        matches!(
+            next_event(&rx, GUARD_BOUND, &teardown, &mut session_open),
+            Ok(rumqttc::Event::Incoming(rumqttc::Packet::PubAck(_)))
+        ),
+        "the PUBACK behind the skipped events is what the wait returns"
+    );
+    assert!(session_open, "skipped events leave the session window open");
 }

@@ -350,9 +350,10 @@ where
 /// Hands a PUBLISH's payload to the worker's ingest seam. A payload
 /// `parse_sensor_data` cannot read is discarded here; a reading the event
 /// channel cannot take is discarded inside `EventSender::send`, which
-/// counts it. Neither outcome reaches the caller, because neither changes
-/// what the caller does: the PUBACK is sent either way, and QoS 0 has no
-/// ack to send at all.
+/// counts it only when the channel is full — a closed receiver is
+/// debug-logged, not counted. Neither outcome reaches the caller, because
+/// neither changes what the caller does: the PUBACK is sent either way,
+/// and QoS 0 has no ack to send at all.
 fn deliver_publish(event_tx: &EventSender, publish: &rmqtt_codec::types::Publish) {
     tracing::debug!("PUBLISH {} len: {}", publish.topic, publish.payload.len());
     if let Some(event) = parse_sensor_data(&publish.payload) {
@@ -525,8 +526,7 @@ pub(crate) mod tests {
     const DISCONNECT: [u8; 2] = [0xE0, 0x00];
     /// v3 SUBSCRIBE: packet id 37, single filter "t", QoS 0.
     const V3_SUBSCRIBE_T_ID37: [u8; 8] = [0x82, 0x06, 0x00, 0x25, 0x00, 0x01, b't', 0x00];
-    /// v3 UNSUBSCRIBE: packet id 37, single filter "t" — non-wildcard, so the
-    /// dispatch never short-circuits to the violation branch. The id is
+    /// v3 UNSUBSCRIBE: packet id 37, single filter "t". The id is
     /// deliberately not 1: an arm that hardcoded `NonZeroU16::new(1).unwrap()`
     /// instead of propagating `*packet_id` would still satisfy an id-1 case.
     const V3_UNSUBSCRIBE_T_ID37: [u8; 7] = [0xA2, 0x05, 0x00, 0x25, 0x00, 0x01, b't'];
