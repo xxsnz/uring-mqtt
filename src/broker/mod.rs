@@ -706,6 +706,191 @@ mod tests {
         drop(broker_handle);
     }
 
+    /// AC-22 — the epic Done-when at the application boundary: a QoS 2 PUBLISH
+    /// repeated before its PUBREL fires the callback once, not once per PUBLISH.
+    #[test]
+    fn run_fires_callback_once_for_qos2_publish_repeated_before_pubrel() {
+        let port = find_free_port();
+        let addr_str = format!("127.0.0.1:{port}");
+        let addr: std::net::SocketAddr = addr_str.parse().expect("parse addr");
+        let (cb_tx, cb_rx) = std::sync::mpsc::channel::<Event>();
+
+        let config = BrokerConfig::new(addr_str).num_workers(1);
+        let cb: EventCallback = std::sync::Arc::new(move |event: Event| {
+            let _ = cb_tx.send(event);
+        });
+        let broker_handle = std::thread::Builder::new()
+            .name("broker-qos2-callback".into())
+            .spawn(move || {
+                let _ = MqttBroker::run_with_callback(config, Some(cb));
+            })
+            .expect("spawn broker");
+
+        let v3_connect: [u8; 18] = [
+            0x10, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x00, 0x00, 0x3C, 0x00, 0x04,
+            b't', b'e', b's', b't',
+        ];
+        let publish_qos2: [u8; 11] = [
+            0x34, 0x09, 0x00, 0x01, b't', 0x00, 0x01, 0x09, 0xC4, 0x03, 0xF5,
+        ];
+        let publish_qos2_dup: [u8; 11] = [
+            0x3C, 0x09, 0x00, 0x01, b't', 0x00, 0x01, 0x09, 0xC4, 0x03, 0xF5,
+        ];
+        let pubrel: [u8; 4] = [0x62, 0x02, 0x00, 0x01];
+
+        let mut stream = None;
+        for _ in 0..20 {
+            match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(50)) {
+                Ok(s) => {
+                    stream = Some(s);
+                    break;
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+        let mut stream = stream.expect("connect within retry window");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set_read_timeout");
+        stream.write_all(&v3_connect).expect("write CONNECT");
+        let mut connack = [0u8; 4];
+        stream.read_exact(&mut connack).expect("read CONNACK");
+        assert_eq!(connack, [0x20, 0x02, 0x00, 0x00]);
+
+        stream.write_all(&publish_qos2).expect("write PUBLISH");
+        stream
+            .write_all(&publish_qos2_dup)
+            .expect("write PUBLISH DUP");
+        let mut pubrecs = [0u8; 8];
+        stream.read_exact(&mut pubrecs).expect("read PUBRECs");
+        assert_eq!(pubrecs, [0x50, 0x02, 0x00, 0x01, 0x50, 0x02, 0x00, 0x01]);
+
+        match cb_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Event::SensorV1 {
+                temperature,
+                pressure,
+            }) => {
+                assert_eq!(temperature, 2500);
+                assert_eq!(pressure, 1013);
+            }
+            other => panic!("expected Event::SensorV1 {{ 2500, 1013 }}, got {other:?}"),
+        }
+
+        stream.write_all(&pubrel).expect("write PUBREL");
+        let mut pubcomp = [0u8; 4];
+        stream.read_exact(&mut pubcomp).expect("read PUBCOMP");
+        assert_eq!(pubcomp, [0x70, 0x02, 0x00, 0x01]);
+
+        assert!(
+            matches!(
+                cb_rx.recv_timeout(Duration::from_millis(300)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "a QoS 2 PUBLISH repeated before PUBREL fired the callback twice"
+        );
+
+        // Detached broker thread keeps running until process exit — F1.4 owns
+        // graceful shutdown. We drop the JoinHandle so it isn't joined here.
+        drop(broker_handle);
+    }
+
+    /// Spec §4 per-connection scope — the awaiting-release set lives and dies
+    /// with the connection. A client leaves packet id 1 awaiting release, drops
+    /// the socket, reconnects to the same single-worker broker and publishes the
+    /// same id: the reading is delivered again, because a redelivery on a new
+    /// connection is a new message under clean-session-only. A set hoisted to
+    /// the worker or to a shared map would answer the second PUBLISH with a
+    /// PUBREC and fire no callback.
+    ///
+    /// Both CONNECTs set the Clean Session flag, so neither session asks the
+    /// broker to retain state the crate has no store for: the second delivery
+    /// asserted below is what MQTT 3.1.1 prescribes for this input, not a
+    /// departure from it. The same two sessions at `CleanSession=0` reach this
+    /// same second delivery, because the broker accepts that flag and keys no
+    /// state on client id — but only for a client that re-publishes of its own
+    /// accord, which is a new message either way. A conforming client does not
+    /// re-send the *incomplete* exchange there: the accepted CONNACK reports
+    /// `session_present: false`, and MQTT 3.1.1 §3.2.2.2 makes it discard its
+    /// own session state on that signal. See EPIC-SPEC.md §4, "Accepted
+    /// `CleanSession=0`"; the admission side is pinned by
+    /// `handshake::tests::accepts_v3_connect_requesting_a_persistent_session`.
+    /// This fixture keeps the flag set so that what it pins is the
+    /// per-connection scope alone.
+    #[test]
+    fn run_starts_each_connection_with_a_fresh_awaiting_release_set() {
+        let port = find_free_port();
+        let addr_str = format!("127.0.0.1:{port}");
+        let addr: std::net::SocketAddr = addr_str.parse().expect("parse addr");
+        let (cb_tx, cb_rx) = std::sync::mpsc::channel::<Event>();
+
+        let config = BrokerConfig::new(addr_str).num_workers(1);
+        let cb: EventCallback = std::sync::Arc::new(move |event: Event| {
+            let _ = cb_tx.send(event);
+        });
+        let broker_handle = std::thread::Builder::new()
+            .name("broker-qos2-scope".into())
+            .spawn(move || {
+                let _ = MqttBroker::run_with_callback(config, Some(cb));
+            })
+            .expect("spawn broker");
+
+        // Connect flags 0x02 — Clean Session set, so the request the broker
+        // accepts is the one it can honour.
+        let v3_connect: [u8; 18] = [
+            0x10, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x02, 0x00, 0x3C, 0x00, 0x04,
+            b't', b'e', b's', b't',
+        ];
+        let publish_qos2: [u8; 11] = [
+            0x34, 0x09, 0x00, 0x01, b't', 0x00, 0x01, 0x09, 0xC4, 0x03, 0xF5,
+        ];
+
+        // Two sessions in turn, both on the one worker, both publishing packet
+        // id 1 and neither sending a PUBREL.
+        for session in 1..=2 {
+            let mut stream = None;
+            for _ in 0..20 {
+                match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(50)) {
+                    Ok(s) => {
+                        stream = Some(s);
+                        break;
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(50)),
+                }
+            }
+            let mut stream = stream.expect("connect within retry window");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set_read_timeout");
+            stream.write_all(&v3_connect).expect("write CONNECT");
+            let mut connack = [0u8; 4];
+            stream.read_exact(&mut connack).expect("read CONNACK");
+            assert_eq!(connack, [0x20, 0x02, 0x00, 0x00]);
+
+            stream.write_all(&publish_qos2).expect("write PUBLISH");
+            let mut pubrec = [0u8; 4];
+            stream.read_exact(&mut pubrec).expect("read PUBREC");
+            assert_eq!(pubrec, [0x50, 0x02, 0x00, 0x01]);
+
+            match cb_rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(Event::SensorV1 {
+                    temperature,
+                    pressure,
+                }) => {
+                    assert_eq!(temperature, 2500);
+                    assert_eq!(pressure, 1013);
+                }
+                other => panic!("session {session}: expected Event::SensorV1, got {other:?}"),
+            }
+
+            // Drop the socket with packet id 1 still awaiting release.
+            drop(stream);
+        }
+
+        // Detached broker thread keeps running until process exit — F1.4 owns
+        // graceful shutdown. We drop the JoinHandle so it isn't joined here.
+        drop(broker_handle);
+    }
+
     /// AC-19 + AC-24 wiring — the accept loop's `SessionOutcome::Refused` arm
     /// must still release the connection slot. With `max_connections_per_worker(1)`
     /// a refused CONNECT would permanently exhaust the worker if `release()`

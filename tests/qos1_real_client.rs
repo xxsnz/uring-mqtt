@@ -2,7 +2,8 @@
 //! third-party MQTT client library (`rumqttc`) drives the broker over a TCP
 //! socket, publishes at QoS 1 and gets a PUBACK back, then sends a wildcard
 //! SUBSCRIBE that the broker refuses with a SUBACK carrying one failure
-//! code, then publishes at QoS 1 again to prove the session survived. The
+//! code, then publishes at QoS 1 again to prove the session survived, and
+//! finally publishes at QoS 2 and completes PUBREC → PUBREL → PUBCOMP. The
 //! fixtures used in the in-crate tests are hand-written byte literals; this
 //! test confirms a real decoder, not `rmqtt-codec`, agrees with them.
 
@@ -30,7 +31,7 @@ const CLIENT_ID: &str = "uring-mqtt-itest";
 /// skips.
 const KEEP_ALIVE: Duration = Duration::from_secs(5);
 /// `Client::new` capacity argument — the bound on rumqttc's own request
-/// queue, which the test fills with two publishes, one subscribe and one
+/// queue, which the test fills with three publishes, one subscribe and one
 /// disconnect. The channel that ferries events back to the test thread is a
 /// separate, unbounded `std::sync::mpsc`.
 const REQUEST_CHANNEL_CAP: usize = 16;
@@ -43,7 +44,8 @@ const HARNESS_TIMEOUT: Duration = Duration::from_secs(45);
 /// Window for the very first `ConnAck` to land after the harness reports
 /// startup complete.
 const CONNACK_BOUND: Duration = Duration::from_secs(5);
-/// Window for a QoS 1 `PubAck` to land after a `publish` call returns `Ok`.
+/// Window for a QoS 1 `PubAck`, or a QoS 2 `PubRec` / `PubComp`, to land
+/// after the triggering event.
 const ACK_BOUND: Duration = Duration::from_secs(5);
 /// Window for a `SubAck` to land after a `subscribe` call returns `Ok`.
 const SUBACK_BOUND: Duration = Duration::from_secs(5);
@@ -57,9 +59,9 @@ const DRIVER_JOIN_BOUND: Duration = Duration::from_secs(10);
 /// whole interval, long enough not to spin.
 const DRIVER_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Harness thread name — visible in `top -H` and panic backtraces.
-const HARNESS_THREAD_NAME: &str = "itest-qos1-harness";
+const HARNESS_THREAD_NAME: &str = "itest-mqtt-harness";
 /// Driver thread name — same purpose.
-const DRIVER_THREAD_NAME: &str = "itest-qos1-driver";
+const DRIVER_THREAD_NAME: &str = "itest-mqtt-driver";
 /// SensorV1 payload bytes the same fixtures the in-crate tests use:
 /// temperature 25.00 °C (0x09C4 = 2500) and pressure 1013 hPa (0x03F5).
 const SENSOR_PAYLOAD: [u8; 4] = [0x09, 0xC4, 0x03, 0xF5];
@@ -211,7 +213,7 @@ fn assert_outcome(outcome: Result<rumqttc::Event, RumqttcOutcome>, label: &str) 
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn qos1_publish_acked_and_session_survives_refused_subscribe() {
+fn qos1_and_qos2_publishes_complete_and_session_survives_refused_subscribe() {
     let (harness_tx, harness_rx) = std::sync::mpsc::channel::<Result<u16, String>>();
     let (teardown_tx, teardown_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
@@ -394,7 +396,34 @@ fn qos1_publish_acked_and_session_survives_refused_subscribe() {
         "first and second PubAck carried the same packet id {first_pkid}",
     );
 
-    // Step 6 — teardown. Order matters: flip the flag FIRST so any Err the
+    // Step 7 — QoS 2 publish: rumqttc writes PUBREL on the PUBREC by itself
+    // (rumqttc 0.24 `state.rs:259-279`), so the next incoming packets are
+    // PubRec then PubComp, both carrying the publish's packet id.
+    client
+        .publish("t", rumqttc::QoS::ExactlyOnce, false, SENSOR_PAYLOAD)
+        .expect("QoS 2 publish call");
+    let pubrec = assert_outcome(
+        next_event(&event_rx, ACK_BOUND, &teardown, &mut session_open),
+        "PubRec",
+    );
+    let rec_pkid = match pubrec {
+        rumqttc::Event::Incoming(rumqttc::Packet::PubRec(rec)) => rec.pkid,
+        other => panic!("expected PubRec, got {other:?}"),
+    };
+    let pubcomp = assert_outcome(
+        next_event(&event_rx, ACK_BOUND, &teardown, &mut session_open),
+        "PubComp",
+    );
+    let comp_pkid = match pubcomp {
+        rumqttc::Event::Incoming(rumqttc::Packet::PubComp(comp)) => comp.pkid,
+        other => panic!("expected PubComp, got {other:?}"),
+    };
+    assert_eq!(
+        rec_pkid, comp_pkid,
+        "PubComp must carry the PubRec's packet id"
+    );
+
+    // Step 8 — teardown. Order matters: flip the flag FIRST so any Err the
     // driver observes from here on is the expected terminal one, not a
     // session-window violation. `disconnect()` only enqueues a request, so
     // its `Ok` says nothing about the wire; the outgoing-Disconnect wait

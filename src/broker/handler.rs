@@ -9,7 +9,7 @@ use std::time::Duration;
 use super::worker::EventSender;
 use super::Event;
 use crate::broker::handshake::{self, ConnectDecision};
-use crate::broker::packet::{Disposition, Reply};
+use crate::broker::packet::Disposition;
 use crate::codec::mqtt::{
     ConnectAck, ConnectAckReason, DecodeError, MqttEncoder, MqttPacket, PacketV3, PacketV5,
 };
@@ -32,6 +32,8 @@ pub(super) const TIMEOUT_CTX_PINGRESP_FLUSH: &str = "idle timeout during PINGRES
 pub(super) const TIMEOUT_CTX_PUBACK_FLUSH: &str = "idle timeout during PUBACK flush";
 pub(super) const TIMEOUT_CTX_SUBACK_FLUSH: &str = "idle timeout during SUBACK flush";
 pub(super) const TIMEOUT_CTX_UNSUBACK_FLUSH: &str = "idle timeout during UNSUBACK flush";
+pub(super) const TIMEOUT_CTX_PUBREC_FLUSH: &str = "idle timeout during PUBREC flush";
+pub(super) const TIMEOUT_CTX_PUBCOMP_FLUSH: &str = "idle timeout during PUBCOMP flush";
 const TIMEOUT_CTX_DISCONNECT_FLUSH: &str = "idle timeout during DISCONNECT flush";
 
 /// Handle a single MQTT client connection.
@@ -260,6 +262,7 @@ async fn run_packet_loop<IO>(
 where
     IO: AsyncReadRent + AsyncWriteRent,
 {
+    let mut awaiting = super::packet::AwaitingRelease::default();
     loop {
         let remaining_idle = idle_timeout.saturating_sub(state.last_packet_time.elapsed());
         let packet_result = monoio::time::timeout(remaining_idle, framed.next()).await;
@@ -267,7 +270,7 @@ where
             Ok(Some(Ok((packet, _id)))) => {
                 state.update_activity();
                 let reply_deadline = idle_timeout.saturating_sub(state.last_packet_time.elapsed());
-                let disposition = super::packet::dispatch(&packet);
+                let disposition = super::packet::dispatch(&packet, &mut awaiting);
                 // The ingest effect happens per arm; the reply every arm owes,
                 // if any, leaves through the single gated send below.
                 let owed_reply = match disposition {
@@ -275,9 +278,9 @@ where
                         deliver_publish(&event_tx, publish);
                         None
                     }
-                    Disposition::DeliverThenAck(publish, packet_id) => {
+                    Disposition::DeliverThenReply(publish, reply) => {
                         deliver_publish(&event_tx, publish);
-                        Some(Reply::PublishAck(packet_id))
+                        Some(reply)
                     }
                     Disposition::Reply(reply) => Some(reply),
                     Disposition::Close => {
@@ -348,16 +351,18 @@ where
 }
 
 /// Hands a PUBLISH's payload to the worker's ingest seam. A payload
-/// `parse_sensor_data` cannot read is discarded here; a reading the event
-/// channel cannot take is discarded inside `EventSender::send`, which
-/// counts it only when the channel is full — a closed receiver is
-/// debug-logged, not counted. Neither outcome reaches the caller, because
-/// neither changes what the caller does: the PUBACK is sent either way,
-/// and QoS 0 has no ack to send at all.
+/// `parse_sensor_data` cannot read is counted here through
+/// `note_unparseable_payload`; a reading the event channel cannot take is
+/// counted inside `EventSender::send`, under a separate counter per reason
+/// (channel full, receiver closed). Every discard therefore carries a
+/// lifetime total and a rate-limited warn. None of them reaches the caller,
+/// because none changes what the caller does: the PUBACK or PUBREC is sent
+/// either way, and QoS 0 has no ack to send at all.
 fn deliver_publish(event_tx: &EventSender, publish: &rmqtt_codec::types::Publish) {
     tracing::debug!("PUBLISH {} len: {}", publish.topic, publish.payload.len());
-    if let Some(event) = parse_sensor_data(&publish.payload) {
-        event_tx.send(event);
+    match parse_sensor_data(&publish.payload) {
+        Some(event) => event_tx.send(event),
+        None => event_tx.note_unparseable_payload(),
     }
 }
 
@@ -456,14 +461,23 @@ impl monoio_codec::Encoder<MqttPacket> for CodecPair {
     }
 }
 
+/// Exact SensorV1 payload width. The length is the whole format: there is no
+/// version byte and no length prefix, so a payload of any other width is a
+/// different format this parser cannot identify.
+const SENSOR_V1_LEN: usize = 4;
+
 /// Parse binary sensor data (SensorV1 format).
 ///
-/// Format: 4 bytes big-endian
+/// Format: exactly `SENSOR_V1_LEN` bytes big-endian
 /// - bytes 0-1: temperature (i16, scale 0.01°C)
 /// - bytes 2-3: pressure (u16, scale 1.0 hPa)
+///
+/// A longer payload is rejected rather than truncated: accepting its first
+/// four bytes would report a reading the publisher never sent and silently
+/// drop the rest.
 #[inline(always)]
 fn parse_sensor_data(data: &[u8]) -> Option<Event> {
-    if data.len() < 4 {
+    if data.len() != SENSOR_V1_LEN {
         return None;
     }
     Some(Event::SensorV1 {
@@ -530,6 +544,18 @@ pub(crate) mod tests {
     /// deliberately not 1: an arm that hardcoded `NonZeroU16::new(1).unwrap()`
     /// instead of propagating `*packet_id` would still satisfy an id-1 case.
     const V3_UNSUBSCRIBE_T_ID37: [u8; 7] = [0xA2, 0x05, 0x00, 0x25, 0x00, 0x01, b't'];
+    /// v3 PUBREL: packet id 37.
+    const V3_PUBREL_ID37: [u8; 4] = [0x62, 0x02, 0x00, 0x25];
+    /// v3 PUBLISH QoS 2: topic "t", packet id 1, payload SensorV1 25.00°C / 1013 hPa.
+    const PUBLISH_QOS2_T: [u8; 11] = [
+        0x34, 0x09, 0x00, 0x01, b't', 0x00, 0x01, 0x09, 0xC4, 0x03, 0xF5,
+    ];
+    /// Same PUBLISH with the DUP flag set — a client's retransmission.
+    const PUBLISH_QOS2_T_DUP: [u8; 11] = [
+        0x3C, 0x09, 0x00, 0x01, b't', 0x00, 0x01, 0x09, 0xC4, 0x03, 0xF5,
+    ];
+    /// v3 PUBREL: packet id 1.
+    const V3_PUBREL_ID1: [u8; 4] = [0x62, 0x02, 0x00, 0x01];
 
     fn build_runtime() -> monoio::FusionRuntime<
         monoio::time::TimeDriver<monoio::IoUringDriver>,
@@ -562,7 +588,7 @@ pub(crate) mod tests {
 
     /// Identical to `spawn_handler` but pre-fills the event channel to capacity
     /// before the accept task starts, so every `EventSender::send` the handler
-    /// makes takes the full-channel branch (`worker.rs:104`). The returned `rx`
+    /// makes takes `EventSender::send`'s full-channel branch. The returned `rx`
     /// stays alive and unpolled — the caller MUST keep it — so the sender's
     /// `tx.is_closed()` check stays false and depth stays at capacity.
     async fn spawn_handler_full_ingest(
@@ -837,6 +863,60 @@ pub(crate) mod tests {
         buf.to_vec()
     }
 
+    fn encode_v5_qos2_publish(topic: &str, packet_id: NonZeroU16, payload: &[u8]) -> Vec<u8> {
+        let mut enc = MqttEncoder::v5();
+        let pkt = MqttPacket::V5(PacketV5::Publish(Box::new(TypesPublish {
+            dup: false,
+            retain: false,
+            qos: QoS::ExactlyOnce,
+            topic: topic.to_string().into(),
+            packet_id: Some(packet_id),
+            payload: bytes::Bytes::copy_from_slice(payload),
+            properties: None,
+        })));
+        let mut buf = BytesMut::new();
+        enc.encode(pkt, &mut buf).expect("encode v5 QoS 2 PUBLISH");
+        buf.to_vec()
+    }
+
+    /// v5 PUBREL with reason `Success` — the shape rumqttc sends on a PUBREC.
+    fn encode_v5_pubrel(packet_id: NonZeroU16) -> Vec<u8> {
+        let mut enc = MqttEncoder::v5();
+        let pkt = MqttPacket::V5(PacketV5::PublishRelease(rmqtt_codec::v5::PublishAck2 {
+            packet_id,
+            reason_code: rmqtt_codec::v5::PublishAck2Reason::Success,
+            properties: Vec::new(),
+            reason_string: None,
+        }));
+        let mut buf = BytesMut::new();
+        enc.encode(pkt, &mut buf).expect("encode v5 PUBREL");
+        buf.to_vec()
+    }
+
+    /// `SENSOR_V1_LEN` is the whole format: a shorter payload has no reading
+    /// to read and a longer one is a format this parser cannot identify.
+    /// Truncating the longer one would report a reading nobody sent.
+    #[test]
+    fn parse_sensor_data_accepts_only_the_exact_sensor_v1_width() {
+        assert!(matches!(
+            parse_sensor_data(&[0x09, 0xC4, 0x03, 0xF5]),
+            Some(Event::SensorV1 {
+                temperature: 2500,
+                pressure: 1013,
+            })
+        ));
+        for short in 0..SENSOR_V1_LEN {
+            assert!(
+                parse_sensor_data(&vec![0xFF; short]).is_none(),
+                "{short} bytes is short of SensorV1 and must not parse"
+            );
+        }
+        assert!(
+            parse_sensor_data(&[0x09, 0xC4, 0x03, 0xF5, 0x00]).is_none(),
+            "a trailing byte makes this a different format, not a SensorV1 reading"
+        );
+    }
+
     #[test]
     fn pipelined_connect_publish_pingreq_gets_connack_then_pingresp() {
         let sink = capture_logs();
@@ -952,7 +1032,7 @@ pub(crate) mod tests {
     /// AC-2 — the event reaches the receiver while the PUBACK write is still
     /// stalled. `spawn_handler_test_io`'s `undelayed_writes: 1` lets the
     /// CONNACK flush immediately while every later write sleeps for a second;
-    /// if `DeliverThenAck` ever sends the PUBACK before calling
+    /// if `DeliverThenReply` ever sends the PUBACK before calling
     /// `deliver_publish`, the event never arrives in the 300 ms window.
     #[test]
     fn qos1_publish_event_arrives_before_puback_flush() {
@@ -1000,11 +1080,58 @@ pub(crate) mod tests {
         });
     }
 
+    /// AC-21 — the event reaches the receiver while the PUBREC write is
+    /// still stalled (same ordering as QoS 1).
+    #[test]
+    fn qos2_publish_event_arrives_before_pubrec_flush() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let mut script = Vec::new();
+            script.extend_from_slice(&V3_CONNECT_TEST);
+            script.extend_from_slice(&PUBLISH_QOS2_T);
+            let (mut client, mut rx, handle) =
+                spawn_handler_test_io(2, 30, Duration::from_secs(1), 1, Some(script), None).await;
+
+            // The event must arrive within 300 ms even though the PUBREC
+            // flush is stalled for 1 s.
+            let evt = monoio::time::timeout(Duration::from_millis(300), rx.recv())
+                .await
+                .expect("event timeout")
+                .expect("event Some");
+            match evt {
+                Event::SensorV1 {
+                    temperature,
+                    pressure,
+                } => {
+                    assert_eq!(temperature, 2500);
+                    assert_eq!(pressure, 1013);
+                }
+            }
+
+            // Drain CONNACK + PUBREC once the stalled write completes.
+            let got = tcp_read_n_bounded(&mut client, 8, Duration::from_secs(2))
+                .await
+                .expect("read 8 bytes");
+            assert_eq!(got, vec![0x20, 0x02, 0x00, 0x00, 0x50, 0x02, 0x00, 0x01]);
+
+            // DISCONNECT so the handler leaves `run_packet_loop`.
+            tcp_write_all(&mut client, &DISCONNECT)
+                .await
+                .expect("disconnect write");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Ok(SessionOutcome::Served)),
+                "expected Ok(SessionOutcome::Served), got {join_res:?}"
+            );
+        });
+    }
+
     /// AC-1, AC-29 — when the event channel is full, the QoS 1 PUBACK still
     /// arrives. `spawn_handler_full_ingest` keeps `rx` alive and unpolled so
-    /// every `EventSender::send` reaches the full-channel branch at
-    /// `worker.rs:104`. Draining `rx` here would silently move the test off
-    /// the branch it exists to cover.
+    /// every `EventSender::send` reaches its full-channel branch. Draining `rx`
+    /// here would silently move the test off the branch it exists to cover.
     #[test]
     fn acks_qos1_publish_when_ingest_channel_is_full() {
         let mut rt = build_runtime();
@@ -1180,6 +1307,323 @@ pub(crate) mod tests {
                 .await
                 .expect("read pingresp");
             assert_eq!(pingresp, vec![0xD0, 0x00]);
+
+            tcp_write_all(&mut client, &DISCONNECT)
+                .await
+                .expect("disconnect write");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(matches!(join_res, Ok(SessionOutcome::Served)));
+        });
+    }
+
+    /// AC-6 — a PUBREL for a packet id that is not awaiting release receives a
+    /// PUBCOMP carrying that id, and the session keeps reading.
+    #[test]
+    fn v3_pubrel_for_unknown_packet_id_gets_pubcomp_and_session_continues() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+
+            tcp_write_all(&mut client, &V3_CONNECT_TEST)
+                .await
+                .expect("CONNECT write");
+            let connack = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                .await
+                .expect("read CONNACK");
+            assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+
+            tcp_write_all(&mut client, &V3_PUBREL_ID37)
+                .await
+                .expect("PUBREL write");
+            let pubcomp = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                .await
+                .expect("read PUBCOMP");
+            assert_eq!(pubcomp, vec![0x70, 0x02, 0x00, 0x25]);
+
+            // Session keeps reading: PINGREQ → PINGRESP.
+            tcp_write_all(&mut client, &PINGREQ)
+                .await
+                .expect("pingreq write");
+            let pingresp = tcp_read_n_bounded(&mut client, 2, Duration::from_secs(2))
+                .await
+                .expect("read pingresp");
+            assert_eq!(pingresp, vec![0xD0, 0x00]);
+
+            tcp_write_all(&mut client, &DISCONNECT)
+                .await
+                .expect("disconnect write");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(matches!(join_res, Ok(SessionOutcome::Served)));
+        });
+    }
+
+    /// AC-3, AC-5 — a QoS 2 PUBLISH repeated before its PUBREL is
+    /// acknowledged twice and delivered once; after the PUBREL the same
+    /// packet id carries a new message.
+    #[test]
+    fn qos2_repeat_before_pubrel_delivers_once_and_pubrel_frees_the_packet_id() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, mut rx, handle) = spawn_handler(2, 30).await;
+
+            // One coalesced write: CONNECT + PUBLISH + repeat PUBLISH (DUP) + PUBREL.
+            let mut coalesced = Vec::new();
+            coalesced.extend_from_slice(&V3_CONNECT_TEST);
+            coalesced.extend_from_slice(&PUBLISH_QOS2_T);
+            coalesced.extend_from_slice(&PUBLISH_QOS2_T_DUP);
+            coalesced.extend_from_slice(&V3_PUBREL_ID1);
+            tcp_write_all(&mut client, &coalesced)
+                .await
+                .expect("coalesced write");
+
+            // Read exactly 16 bytes: CONNACK (4) + PUBREC (4) + PUBREC (4) + PUBCOMP (4).
+            let got = tcp_read_n_bounded(&mut client, 16, Duration::from_secs(2))
+                .await
+                .expect("read 16 bytes");
+            assert_eq!(
+                got,
+                vec![
+                    0x20, 0x02, 0x00, 0x00, 0x50, 0x02, 0x00, 0x01, 0x50, 0x02, 0x00, 0x01, 0x70,
+                    0x02, 0x00, 0x01
+                ],
+                "expected CONNACK, PUBREC, PUBREC, PUBCOMP"
+            );
+
+            // Exactly one event for the first PUBLISH; the repeat before
+            // PUBREL must not deliver a second one.
+            let evt = monoio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("event timeout")
+                .expect("event Some");
+            match evt {
+                Event::SensorV1 {
+                    temperature,
+                    pressure,
+                } => {
+                    assert_eq!(temperature, 2500);
+                    assert_eq!(pressure, 1013);
+                }
+            }
+
+            // The PUBREL freed packet id 1, so this PUBLISH is a fresh
+            // delivery, not a repeat.
+            tcp_write_all(&mut client, &PUBLISH_QOS2_T)
+                .await
+                .expect("PUBLISH write");
+            let pubrec = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                .await
+                .expect("read PUBREC");
+            assert_eq!(pubrec, vec![0x50, 0x02, 0x00, 0x01]);
+
+            let evt = monoio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("event timeout")
+                .expect("event Some");
+            match evt {
+                Event::SensorV1 {
+                    temperature,
+                    pressure,
+                } => {
+                    assert_eq!(temperature, 2500);
+                    assert_eq!(pressure, 1013);
+                }
+            }
+
+            tcp_write_all(&mut client, &V3_PUBREL_ID1)
+                .await
+                .expect("PUBREL write");
+            let pubcomp = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                .await
+                .expect("read PUBCOMP");
+            assert_eq!(pubcomp, vec![0x70, 0x02, 0x00, 0x01]);
+
+            tcp_write_all(&mut client, &DISCONNECT)
+                .await
+                .expect("disconnect write");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Ok(SessionOutcome::Served)),
+                "expected Ok(SessionOutcome::Served), got {join_res:?}"
+            );
+
+            // Exactly two events for three PUBLISHes.
+            let third = monoio::time::timeout(Duration::from_millis(300), rx.recv()).await;
+            assert!(
+                matches!(third, Ok(None)),
+                "expected no third event, got {third:?}"
+            );
+        });
+    }
+
+    /// AC-11 — Q4: a full event channel does not withhold the PUBREC, and
+    /// the dropped reading's packet id is still recorded, so a repeat
+    /// before PUBREL is not delivered.
+    #[test]
+    fn acks_qos2_publish_with_pubrec_when_ingest_channel_is_full() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, mut rx, handle) = spawn_handler_full_ingest(2, 30).await;
+
+            tcp_write_all(&mut client, &V3_CONNECT_TEST)
+                .await
+                .expect("CONNECT write");
+            let connack = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                .await
+                .expect("read CONNACK");
+            assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+
+            tcp_write_all(&mut client, &PUBLISH_QOS2_T)
+                .await
+                .expect("PUBLISH write");
+            let pubrec = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                .await
+                .expect("read PUBREC");
+            assert_eq!(pubrec, vec![0x50, 0x02, 0x00, 0x01]);
+
+            for _ in 0..EVENT_CHANNEL_CAPACITY {
+                monoio::time::timeout(Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("drain timeout")
+                    .expect("pre-filled event");
+            }
+
+            tcp_write_all(&mut client, &PUBLISH_QOS2_T_DUP)
+                .await
+                .expect("PUBLISH DUP write");
+            let pubrec = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                .await
+                .expect("read PUBREC");
+            assert_eq!(pubrec, vec![0x50, 0x02, 0x00, 0x01]);
+
+            // The id was recorded although the first reading was dropped,
+            // so the repeat is not delivered.
+            assert!(
+                monoio::time::timeout(Duration::from_millis(300), rx.recv())
+                    .await
+                    .is_err(),
+                "the repeat before PUBREL must not deliver"
+            );
+
+            tcp_write_all(&mut client, &V3_PUBREL_ID1)
+                .await
+                .expect("PUBREL write");
+            let pubcomp = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                .await
+                .expect("read PUBCOMP");
+            assert_eq!(pubcomp, vec![0x70, 0x02, 0x00, 0x01]);
+
+            // The channel now has room, and the released id carries a new message.
+            tcp_write_all(&mut client, &PUBLISH_QOS2_T)
+                .await
+                .expect("PUBLISH write");
+            let pubrec = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                .await
+                .expect("read PUBREC");
+            assert_eq!(pubrec, vec![0x50, 0x02, 0x00, 0x01]);
+
+            let evt = monoio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("event timeout")
+                .expect("event Some");
+            match evt {
+                Event::SensorV1 {
+                    temperature,
+                    pressure,
+                } => {
+                    assert_eq!(temperature, 2500);
+                    assert_eq!(pressure, 1013);
+                }
+            }
+
+            tcp_write_all(&mut client, &DISCONNECT)
+                .await
+                .expect("disconnect write");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(matches!(join_res, Ok(SessionOutcome::Served)));
+        });
+    }
+
+    /// AC-4, AC-6, AC-7 — the v5 half of the QoS 2 flow end to end: a QoS 2
+    /// PUBLISH comes back as the 6-byte v5 PUBREC, its PUBREL as a Success
+    /// PUBCOMP, and a PUBREL for an id that is not awaiting release as a
+    /// `PacketIdNotFound` (0x92) PUBCOMP. The v3 wire tests cover the packet
+    /// loop on the version whose PUBCOMP carries no reason code, and the
+    /// `dispatch` tests construct the flow packets directly, so only this test
+    /// proves v5 PUBREL bytes decode into `PacketV5::PublishRelease` and the
+    /// rendered reason code reaches the socket. `V5Reader` is used because the
+    /// PUBREC may coalesce with the CONNACK.
+    #[test]
+    fn v5_qos2_publish_and_pubrel_complete_over_the_wire() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, mut rx, handle) = spawn_handler(2, 30).await;
+            let id1 = NonZeroU16::new(1).expect("non-zero");
+            let id37 = NonZeroU16::new(37).expect("non-zero");
+
+            let mut coalesced = Vec::new();
+            coalesced.extend_from_slice(&encode_v5_connect(60, "dev5"));
+            coalesced.extend_from_slice(&encode_v5_qos2_publish(
+                "t",
+                id1,
+                &[0x09, 0xC4, 0x03, 0xF5],
+            ));
+            tcp_write_all(&mut client, &coalesced)
+                .await
+                .expect("coalesced write");
+
+            let mut reader = V5Reader::new();
+            match reader.next(&mut client).await {
+                Some(MqttPacket::V5(PacketV5::ConnectAck(ack))) => {
+                    assert!(matches!(ack.reason_code, V5ConnectAckReason::Success));
+                    assert_eq!(ack.max_qos, QoS::ExactlyOnce);
+                }
+                other => panic!("expected v5 CONNACK, got {other:?}"),
+            }
+
+            let pubrec = reader.raw(&mut client, 6).await;
+            assert_eq!(pubrec, vec![0x50, 0x04, 0x00, 0x01, 0x00, 0x00]);
+
+            let evt = monoio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("event timeout")
+                .expect("event Some");
+            match evt {
+                Event::SensorV1 {
+                    temperature,
+                    pressure,
+                } => {
+                    assert_eq!(temperature, 2500);
+                    assert_eq!(pressure, 1013);
+                }
+            }
+
+            tcp_write_all(&mut client, &encode_v5_pubrel(id1))
+                .await
+                .expect("PUBREL write");
+            let pubcomp = reader.raw(&mut client, 6).await;
+            assert_eq!(
+                pubcomp,
+                vec![0x70, 0x04, 0x00, 0x01, 0x00, 0x00],
+                "a released packet id must complete with reason Success"
+            );
+
+            tcp_write_all(&mut client, &encode_v5_pubrel(id37))
+                .await
+                .expect("unknown PUBREL write");
+            let pubcomp = reader.raw(&mut client, 6).await;
+            assert_eq!(
+                pubcomp,
+                vec![0x70, 0x04, 0x00, 0x25, 0x92, 0x00],
+                "an id that is not awaiting release must complete with PacketIdNotFound"
+            );
 
             tcp_write_all(&mut client, &DISCONNECT)
                 .await
@@ -1384,7 +1828,7 @@ pub(crate) mod tests {
                 Some(MqttPacket::V5(PacketV5::ConnectAck(ack))) => {
                     assert!(matches!(ack.reason_code, V5ConnectAckReason::Success));
                     assert!(!ack.session_present);
-                    assert_eq!(ack.max_qos, QoS::AtLeastOnce);
+                    assert_eq!(ack.max_qos, QoS::ExactlyOnce);
                 }
                 other => panic!("expected v5 CONNACK, got {other:?}"),
             }
@@ -1473,7 +1917,7 @@ pub(crate) mod tests {
                         ack.reason_code,
                         V5ConnectAckReason::ClientIdentifierNotValid
                     ));
-                    assert_eq!(ack.max_qos, QoS::AtLeastOnce);
+                    assert_eq!(ack.max_qos, QoS::ExactlyOnce);
                     assert!(ack.wildcard_subscription_available);
                     assert!(ack.shared_subscription_available);
                     assert!(ack.subscription_identifiers_available);
@@ -1700,8 +2144,11 @@ pub(crate) mod tests {
         );
     }
 
+    /// A closed receiver keeps its own lifetime counter and its own warn, so an
+    /// acknowledged reading that can never reach the callback is visible at
+    /// normal log levels — without the overflow total absorbing it.
     #[test]
-    fn closed_receiver_discard_is_not_counted_or_warned() {
+    fn closed_receiver_discard_is_counted_apart_from_overflow_drops() {
         // Case (a): fresh channel, drop receiver, send.
         let sink_a = capture_logs();
         {
@@ -1714,7 +2161,12 @@ pub(crate) mod tests {
             assert_eq!(
                 tx.dropped_total(),
                 0,
-                "closed-receiver discard must not increment the counter"
+                "closed-receiver discard must not increment the overflow counter"
+            );
+            assert_eq!(
+                tx.closed_discards_total(),
+                1,
+                "closed-receiver discard must increment its own counter"
             );
         }
         let logs_a =
@@ -1722,6 +2174,14 @@ pub(crate) mod tests {
         assert!(
             !logs_a.contains("dropped total"),
             "closed-receiver discard must not emit a drop-warn, got: {logs_a}"
+        );
+        assert!(
+            has_line_at(
+                &logs_a,
+                "WARN",
+                &["worker 11", "event receiver closed", "1 discarded total"]
+            ),
+            "first closed-receiver discard must warn, got: {logs_a}"
         );
 
         // Case (b): overflow into a still-open channel, then drop the receiver
@@ -1756,6 +2216,11 @@ pub(crate) mod tests {
                 2,
                 "closed-receiver discards must not add to dropped total"
             );
+            assert_eq!(
+                tx.closed_discards_total(),
+                1,
+                "the closure-branch discard belongs to the closed-discard counter"
+            );
         }
         let logs_b =
             String::from_utf8(sink_b.lock().expect("log buffer").clone()).expect("utf8 logs");
@@ -1765,6 +2230,90 @@ pub(crate) mod tests {
         assert_eq!(
             drop_warn_lines_b, 1,
             "expected exactly one drop-warn line for case (b), got {drop_warn_lines_b}: {logs_b}"
+        );
+        let closed_warn_lines_b = count_lines_at(&logs_b, "WARN", "discarded total");
+        assert_eq!(
+            closed_warn_lines_b, 1,
+            "expected exactly one closed-discard warn for case (b), got {closed_warn_lines_b}: {logs_b}"
+        );
+    }
+
+    /// The two discard counters keep separate cadences: the closed-receiver
+    /// warn fires at #1 and #100 only, and never lands in the overflow total.
+    #[test]
+    fn closed_receiver_discard_warns_on_first_and_every_hundredth() {
+        let sink = capture_logs();
+        let (tx, rx) = event_channel(13);
+        drop(rx);
+        for _ in 0..100 {
+            tx.send(Event::SensorV1 {
+                temperature: 0,
+                pressure: 0,
+            });
+        }
+        assert_eq!(tx.closed_discards_total(), 100);
+        assert_eq!(tx.dropped_total(), 0);
+
+        let logs = String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+        assert!(
+            has_line_at(&logs, "WARN", &["worker 13", "100 discarded total"]),
+            "every-100th closed-discard warn missing, got: {logs}"
+        );
+        let closed_warn_lines = count_lines_at(&logs, "WARN", "discarded total");
+        assert_eq!(
+            closed_warn_lines, 2,
+            "expected exactly two closed-discard warns, got {closed_warn_lines}: {logs}"
+        );
+    }
+
+    /// An unparseable payload is acknowledged but never ingested. It carries
+    /// its own lifetime counter and the same first-and-every-hundredth warn
+    /// cadence, so a stream of malformed readings is distinguishable from
+    /// successful ingest at normal log levels.
+    #[test]
+    fn unparseable_payload_warns_on_first_and_every_hundredth() {
+        let sink = capture_logs();
+        let (tx, _rx) = event_channel(17);
+        let publish = TypesPublish {
+            dup: false,
+            retain: false,
+            qos: QoS::AtMostOnce,
+            topic: "sensors/1".into(),
+            packet_id: None,
+            payload: bytes::Bytes::from_static(&[1, 2, 3, 4, 5]),
+            properties: None,
+        };
+        for _ in 0..100 {
+            deliver_publish(&tx, &publish);
+        }
+        assert_eq!(tx.unparseable_total(), 100);
+        assert_eq!(
+            tx.dropped_total(),
+            0,
+            "a parse failure never reaches the channel, so it is not an overflow drop"
+        );
+
+        let logs = String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+        assert!(
+            has_line_at(
+                &logs,
+                "WARN",
+                &[
+                    "worker 17",
+                    "unparseable PUBLISH payload",
+                    "1 unparseable total"
+                ]
+            ),
+            "first unparseable warn missing, got: {logs}"
+        );
+        assert!(
+            has_line_at(&logs, "WARN", &["100 unparseable total"]),
+            "every-100th unparseable warn missing, got: {logs}"
+        );
+        let unparseable_warn_lines = count_lines_at(&logs, "WARN", "unparseable total");
+        assert_eq!(
+            unparseable_warn_lines, 2,
+            "expected exactly two unparseable warns, got {unparseable_warn_lines}: {logs}"
         );
     }
 
@@ -2721,12 +3270,12 @@ pub(crate) mod tests {
     }
 
     /// AC-8 — a v5 CONNECT whose declared Maximum Packet Size (3) cannot hold
-    /// even the bare refusal CONNACK (12 bytes) is refused at handshake time
+    /// even the bare refusal CONNACK (10 bytes) is refused at handshake time
     /// and zero bytes are written: the client declared the limit, the limit
     /// is honoured, the connection closes with `SessionOutcome::Refused`.
     /// **Replaces** the prior `v5_oversize_close_under_four_byte_limit_sends_no_disconnect`,
     /// whose premise — a 3-byte client reaching the packet loop — this task
-    /// removes: a CONNECT declaring less than 12 is no longer accepted, so no
+    /// removes: a CONNECT declaring less than 10 is no longer accepted, so no
     /// 3-byte client can reach the violation DISCONNECT. The behaviour the
     /// deleted test proved (a violation close obeying its own limit) remains
     /// covered at the pure seam by
@@ -2751,7 +3300,7 @@ pub(crate) mod tests {
                 .expect("read to eof");
             assert!(
                 got.is_empty(),
-                "expected zero bytes — the 12-byte refusal CONNACK over a declared 3 must be withheld — got {got:?}"
+                "expected zero bytes — the 10-byte refusal CONNACK over a declared 3 must be withheld — got {got:?}"
             );
             let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
                 .await
@@ -2764,8 +3313,8 @@ pub(crate) mod tests {
     }
 
     /// AC-9 — keep-alive 30 against a 30s config is capped, so the accept
-    /// CONNACK carries `server_keepalive_sec` and is 15 bytes — over a
-    /// declared 12. The bare refusal CONNACK is 12 bytes and fits, so the
+    /// CONNACK carries `server_keepalive_sec` and is 13 bytes — over a
+    /// declared 10. The bare refusal CONNACK is 10 bytes and fits, so the
     /// client receives exactly one CONNACK with `ImplementationSpecificError`.
     /// The byte count is this feature's contract (asserted directly rather
     /// than via `V5Reader::next`, which returns `None` at EOF even after a
@@ -2778,7 +3327,7 @@ pub(crate) mod tests {
             let connect = encode_v5_connect_with_max_packet_size(
                 30,
                 "test",
-                Some(NonZeroU32::new(12).expect("non-zero")),
+                Some(NonZeroU32::new(10).expect("non-zero")),
             );
             tcp_write_all(&mut client, &connect)
                 .await
@@ -2789,8 +3338,8 @@ pub(crate) mod tests {
                 .expect("read to eof");
             assert_eq!(
                 got.len(),
-                12,
-                "expected exactly the 12-byte refusal CONNACK — got {got:?}"
+                10,
+                "expected exactly the 10-byte refusal CONNACK — got {got:?}"
             );
 
             let mut reader = V5Reader::new();
@@ -2840,7 +3389,7 @@ pub(crate) mod tests {
             let connect = encode_v5_connect_with_max_packet_size(
                 30,
                 "test",
-                Some(NonZeroU32::new(12).expect("non-zero")),
+                Some(NonZeroU32::new(10).expect("non-zero")),
             );
             tcp_write_all(&mut client, &connect)
                 .await
@@ -2879,8 +3428,8 @@ pub(crate) mod tests {
     /// had its Maximum Packet Size parsed by `rmqtt-codec`, but the codec's
     /// error variant is fieldless and the body has already been split out of
     /// the input buffer, so the limit is lost before the refusal is chosen.
-    /// The 12-byte `ClientIdentifierNotValid` CONNACK is therefore written
-    /// ungated — a reachable case where 12 bytes go to a connection that
+    /// The 10-byte `ClientIdentifierNotValid` CONNACK is therefore written
+    /// ungated — a reachable case where 10 bytes go to a connection that
     /// declared 3. **This test documents a departure rather than a
     /// guarantee**; see EPIC-SPEC.md §4, "Recorded exception — Maximum
     /// Packet Size" for the rationale.
@@ -2908,8 +3457,8 @@ pub(crate) mod tests {
                 .expect("read to eof");
             assert_eq!(
                 got.len(),
-                12,
-                "expected the 12-byte ClientIdentifierNotValid CONNACK despite declared 3 — got {got:?}"
+                10,
+                "expected the 10-byte ClientIdentifierNotValid CONNACK despite declared 3 — got {got:?}"
             );
 
             let mut reader = V5Reader::new();
@@ -2968,7 +3517,7 @@ pub(crate) mod tests {
                 .expect("read to eof");
             assert!(
                 got.is_empty(),
-                "premise: the 12-byte refusal CONNACK over a declared 3 is withheld — got {got:?}"
+                "premise: the 10-byte refusal CONNACK over a declared 3 is withheld — got {got:?}"
             );
             let peer = client.local_addr().expect("local_addr").to_string();
 
@@ -3006,12 +3555,12 @@ pub(crate) mod tests {
     /// The admission threshold is the CONNACK *this* connection would receive,
     /// not a constant. A v5 CONNECT carrying no client id is owed a CONNACK
     /// with `assigned_client_id` built from its own peer address, so its
-    /// threshold is over 30 bytes where a named client's is 12 or 15. A client
+    /// threshold is over 30 bytes where a named client's is 10 or 13. A client
     /// declaring 20 therefore clears the bare CONNACK's length and is still
-    /// refused — which no fixed 12- or 15-byte threshold would do, and which
+    /// refused — which no fixed 10- or 13-byte threshold would do, and which
     /// only a real socket can prove, because the assigned id's length is the
     /// ephemeral peer address the unit seam cannot produce. The refusal
-    /// CONNACK is 12 bytes, fits the declared 20, and is written.
+    /// CONNACK is 10 bytes, fits the declared 20, and is written.
     #[test]
     fn v5_connect_needing_an_assigned_id_is_refused_when_its_connack_does_not_fit() {
         let mut rt = build_runtime();
@@ -3039,8 +3588,8 @@ pub(crate) mod tests {
                 .expect("read to eof");
             assert_eq!(
                 got.len(),
-                12,
-                "expected exactly the 12-byte refusal CONNACK — got {got:?}"
+                10,
+                "expected exactly the 10-byte refusal CONNACK — got {got:?}"
             );
 
             let mut reader = V5Reader::new();

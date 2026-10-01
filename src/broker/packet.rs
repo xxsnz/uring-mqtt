@@ -1,4 +1,4 @@
-//! Pure packet-decision seam. No IO, no `tracing`, no time.
+//! Packet-decision seam. No IO, no `tracing`, no time; QoS 2 state is caller-owned.
 //!
 //! `dispatch` maps every variant of `MqttPacket` to a `Disposition` without a
 //! catch-all arm, so a new packet type is a compile error here — exactly the
@@ -26,6 +26,11 @@ pub(crate) enum Reply {
     /// Packet id + requested-filter count. v3 UNSUBACK carries no per-filter
     /// status, so the v3 renderer discards the count.
     UnsubscribeAck(NonZeroU16, NonZeroUsize),
+    /// PUBREC for a QoS 2 PUBLISH — first receipt and every repeat alike.
+    PublishReceived(NonZeroU16),
+    /// PUBCOMP answering a PUBREL. v5 renders `UnknownPacketId` as reason
+    /// `PacketIdNotFound` (0x92); v3 PUBCOMP carries no reason code.
+    PublishComplete(NonZeroU16, ReleaseOutcome),
 }
 
 impl Reply {
@@ -38,6 +43,8 @@ impl Reply {
             Reply::PublishAck(_) => super::handler::TIMEOUT_CTX_PUBACK_FLUSH,
             Reply::SubscribeRefusal(_, _) => super::handler::TIMEOUT_CTX_SUBACK_FLUSH,
             Reply::UnsubscribeAck(_, _) => super::handler::TIMEOUT_CTX_UNSUBACK_FLUSH,
+            Reply::PublishReceived(_) => super::handler::TIMEOUT_CTX_PUBREC_FLUSH,
+            Reply::PublishComplete(_, _) => super::handler::TIMEOUT_CTX_PUBCOMP_FLUSH,
         }
     }
 
@@ -101,6 +108,33 @@ impl Reply {
                     ],
                 }))
             }
+            (Reply::PublishReceived(packet_id), ProtocolVersion::MQTT3) => {
+                MqttPacket::V3(PacketV3::PublishReceived { packet_id })
+            }
+            (Reply::PublishReceived(packet_id), ProtocolVersion::MQTT5) => {
+                MqttPacket::V5(PacketV5::PublishReceived(rmqtt_codec::v5::PublishAck {
+                    packet_id,
+                    reason_code: rmqtt_codec::v5::PublishAckReason::Success,
+                    properties: Vec::new(),
+                    reason_string: None,
+                }))
+            }
+            (Reply::PublishComplete(packet_id, _outcome), ProtocolVersion::MQTT3) => {
+                MqttPacket::V3(PacketV3::PublishComplete { packet_id })
+            }
+            (Reply::PublishComplete(packet_id, outcome), ProtocolVersion::MQTT5) => {
+                MqttPacket::V5(PacketV5::PublishComplete(rmqtt_codec::v5::PublishAck2 {
+                    packet_id,
+                    reason_code: match outcome {
+                        ReleaseOutcome::Released => rmqtt_codec::v5::PublishAck2Reason::Success,
+                        ReleaseOutcome::UnknownPacketId => {
+                            rmqtt_codec::v5::PublishAck2Reason::PacketIdNotFound
+                        }
+                    },
+                    properties: Vec::new(),
+                    reason_string: None,
+                }))
+            }
         }
     }
 }
@@ -122,9 +156,7 @@ pub(crate) enum Violation {
     ReplyOverMaxPacketSize,
     /// CONNACK / SUBACK / UNSUBACK / PINGRESP arriving from a client.
     ServerOnlyPacket,
-    /// PUBREC / PUBREL / PUBCOMP. F2.2 turns these into the receiver flow.
-    Qos2FlowNotImplemented,
-    /// PUBACK from a client — this server never publishes.
+    /// PUBACK, PUBREC or PUBCOMP from a client — this server never publishes.
     PublishAckFromClient,
     /// v5 AUTH with no authentication method negotiated at CONNECT.
     AuthNotNegotiated,
@@ -153,11 +185,8 @@ impl Violation {
             Violation::ServerOnlyPacket => {
                 "protocol violation: server-to-client packet from a client"
             }
-            Violation::Qos2FlowNotImplemented => {
-                "protocol violation: QoS 2 flow packet, receiver flow not implemented"
-            }
             Violation::PublishAckFromClient => {
-                "protocol violation: PUBACK from a client this server never publishes to"
+                "protocol violation: PUBACK, PUBREC or PUBCOMP from a client this server never publishes to"
             }
             Violation::AuthNotNegotiated => {
                 "protocol violation: AUTH without a negotiated authentication method"
@@ -185,7 +214,6 @@ impl Violation {
                 | Violation::EmptyTopicFilterList
                 | Violation::ReplyOverMaxPacketSize
                 | Violation::ServerOnlyPacket
-                | Violation::Qos2FlowNotImplemented
                 | Violation::PublishAckFromClient
                 | Violation::AuthNotNegotiated
                 | Violation::PublishQosAboveMaximum
@@ -209,10 +237,9 @@ impl Violation {
             (Violation::ReplyOverMaxPacketSize, ProtocolVersion::MQTT5) => {
                 Some(rmqtt_codec::v5::DisconnectReasonCode::PacketTooLarge)
             }
-            (
-                Violation::Qos2FlowNotImplemented | Violation::PublishQosAboveMaximum,
-                ProtocolVersion::MQTT5,
-            ) => Some(rmqtt_codec::v5::DisconnectReasonCode::QosNotSupported),
+            (Violation::PublishQosAboveMaximum, ProtocolVersion::MQTT5) => {
+                Some(rmqtt_codec::v5::DisconnectReasonCode::QosNotSupported)
+            }
         }
     }
 
@@ -315,15 +342,71 @@ pub(crate) fn classify_read_error(err: &std::io::Error) -> Option<Violation> {
         .map(|_| Violation::MalformedPacket)
 }
 
+/// Packet ids tracked per bitset word.
+const ID_BITS_PER_WORD: usize = 64;
+/// Words covering every `u16` packet id (65 536 ids, id 0 never used).
+const PACKET_ID_WORDS: usize = (1 << u16::BITS) / ID_BITS_PER_WORD;
+
+/// The connection's QoS 2 packet ids that were received and whose PUBREL
+/// has not arrived yet. One bit per possible id, so the set can never
+/// overflow and costs a fixed 8 KiB, allocated on the connection's first
+/// QoS 2 PUBLISH and dropped with the connection.
+#[derive(Default)]
+pub(crate) struct AwaitingRelease {
+    words: Option<Box<[u64; PACKET_ID_WORDS]>>,
+}
+
+impl AwaitingRelease {
+    /// Word index and bit mask for `packet_id`.
+    fn position(packet_id: NonZeroU16) -> (usize, u64) {
+        let index = usize::from(packet_id.get());
+        (
+            index / ID_BITS_PER_WORD,
+            1_u64 << (index % ID_BITS_PER_WORD),
+        )
+    }
+
+    /// Record `packet_id`. `true` when it was not already awaiting release.
+    fn record(&mut self, packet_id: NonZeroU16) -> bool {
+        let (word, bit) = Self::position(packet_id);
+        let words = self
+            .words
+            .get_or_insert_with(|| Box::new([0; PACKET_ID_WORDS]));
+        let fresh = words[word] & bit == 0;
+        words[word] |= bit;
+        fresh
+    }
+
+    /// Forget `packet_id`, reporting whether it was awaiting release.
+    fn release(&mut self, packet_id: NonZeroU16) -> ReleaseOutcome {
+        let (word, bit) = Self::position(packet_id);
+        let Some(words) = self.words.as_mut() else {
+            return ReleaseOutcome::UnknownPacketId;
+        };
+        if words[word] & bit == 0 {
+            return ReleaseOutcome::UnknownPacketId;
+        }
+        words[word] &= !bit;
+        ReleaseOutcome::Released
+    }
+}
+
+/// Whether a PUBREL named a packet id that was awaiting release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReleaseOutcome {
+    Released,
+    UnknownPacketId,
+}
+
 /// What the packet loop owes for one decoded packet. Pure: the caller performs
 /// every effect. Borrows the packet, so the QoS 0 path allocates nothing.
 #[derive(Debug)]
 pub(crate) enum Disposition<'a> {
     /// Hand the payload to the event seam, then keep reading.
     Deliver(&'a rmqtt_codec::types::Publish),
-    /// Hand the payload to the event seam, THEN flush the PUBACK. The variant
-    /// name carries the ordering decision (AC-2).
-    DeliverThenAck(&'a rmqtt_codec::types::Publish, NonZeroU16),
+    /// Hand the payload to the event seam, THEN flush the reply (PUBACK for
+    /// QoS 1, PUBREC for QoS 2). The variant name carries the ordering decision.
+    DeliverThenReply(&'a rmqtt_codec::types::Publish, Reply),
     /// Flush this reply, then keep reading.
     Reply(Reply),
     /// Client asked to close. The session reports `SessionOutcome::Served`.
@@ -333,9 +416,13 @@ pub(crate) enum Disposition<'a> {
 }
 
 /// Decide one post-handshake packet. IO-free, tracing-free, panic-free, and
-/// total over `MqttPacket` with no `_` arm.
+/// total over `MqttPacket` with no `_` arm. QoS 2 state lives in the
+/// caller-owned `awaiting`, which this call updates.
 #[allow(clippy::too_many_lines)] // one total match over three exhaustive enums; splitting buys nothing
-pub(crate) fn dispatch(packet: &MqttPacket) -> Disposition<'_> {
+pub(crate) fn dispatch<'a>(
+    packet: &'a MqttPacket,
+    awaiting: &mut AwaitingRelease,
+) -> Disposition<'a> {
     match packet {
         MqttPacket::V3(PacketV3::Connect(_)) | MqttPacket::V5(PacketV5::Connect(_)) => {
             Disposition::Violation(Violation::DuplicateConnect)
@@ -346,11 +433,16 @@ pub(crate) fn dispatch(packet: &MqttPacket) -> Disposition<'_> {
             }
             match (publish.qos, publish.packet_id) {
                 (QoS::AtMostOnce, _) => Disposition::Deliver(publish),
-                (QoS::AtLeastOnce, Some(id)) => Disposition::DeliverThenAck(publish, id),
-                (QoS::AtLeastOnce, None) => {
+                (QoS::AtLeastOnce, Some(id)) => {
+                    Disposition::DeliverThenReply(publish, Reply::PublishAck(id))
+                }
+                (QoS::AtLeastOnce | QoS::ExactlyOnce, None) => {
                     Disposition::Violation(Violation::PublishMissingPacketId)
                 }
-                (QoS::ExactlyOnce, _) => Disposition::Violation(Violation::Qos2FlowNotImplemented),
+                (QoS::ExactlyOnce, Some(id)) if awaiting.record(id) => {
+                    Disposition::DeliverThenReply(publish, Reply::PublishReceived(id))
+                }
+                (QoS::ExactlyOnce, Some(id)) => Disposition::Reply(Reply::PublishReceived(id)),
             }
         }
         MqttPacket::V3(PacketV3::PingRequest) | MqttPacket::V5(PacketV5::PingRequest) => {
@@ -395,19 +487,20 @@ pub(crate) fn dispatch(packet: &MqttPacket) -> Disposition<'_> {
             | PacketV5::UnsubscribeAck(_)
             | PacketV5::PingResponse,
         ) => Disposition::Violation(Violation::ServerOnlyPacket),
+        MqttPacket::V3(PacketV3::PublishRelease { packet_id }) => Disposition::Reply(
+            Reply::PublishComplete(*packet_id, awaiting.release(*packet_id)),
+        ),
+        MqttPacket::V5(PacketV5::PublishRelease(release)) => Disposition::Reply(
+            Reply::PublishComplete(release.packet_id, awaiting.release(release.packet_id)),
+        ),
         MqttPacket::V3(
-            PacketV3::PublishReceived { .. }
-            | PacketV3::PublishRelease { .. }
+            PacketV3::PublishAck { .. }
+            | PacketV3::PublishReceived { .. }
             | PacketV3::PublishComplete { .. },
         )
         | MqttPacket::V5(
-            PacketV5::PublishReceived(_)
-            | PacketV5::PublishRelease(_)
-            | PacketV5::PublishComplete(_),
-        ) => Disposition::Violation(Violation::Qos2FlowNotImplemented),
-        MqttPacket::V3(PacketV3::PublishAck { .. }) | MqttPacket::V5(PacketV5::PublishAck(_)) => {
-            Disposition::Violation(Violation::PublishAckFromClient)
-        }
+            PacketV5::PublishAck(_) | PacketV5::PublishReceived(_) | PacketV5::PublishComplete(_),
+        ) => Disposition::Violation(Violation::PublishAckFromClient),
         MqttPacket::V5(PacketV5::Auth(_)) => Disposition::Violation(Violation::AuthNotNegotiated),
         MqttPacket::Version(_) => Disposition::Violation(Violation::VersionProbe),
     }
@@ -467,12 +560,12 @@ mod tests {
     #[test]
     fn dispatch_qos0_publish_delivers() {
         let binding = v3_publish_fixture();
-        match dispatch(&binding) {
+        match dispatch(&binding, &mut AwaitingRelease::default()) {
             Disposition::Deliver(_) => {}
             other => panic!("expected Deliver, got {other:?}"),
         }
         let binding = v5_publish_fixture();
-        match dispatch(&binding) {
+        match dispatch(&binding, &mut AwaitingRelease::default()) {
             Disposition::Deliver(_) => {}
             other => panic!("expected Deliver, got {other:?}"),
         }
@@ -482,14 +575,14 @@ mod tests {
     #[test]
     fn dispatch_duplicate_connect_is_violation() {
         let binding = MqttPacket::V3(PacketV3::Connect(Box::<rmqtt_codec::v3::Connect>::default()));
-        let v3 = dispatch(&binding);
+        let v3 = dispatch(&binding, &mut AwaitingRelease::default());
         assert!(matches!(
             v3,
             Disposition::Violation(Violation::DuplicateConnect)
         ));
 
         let binding = MqttPacket::V5(PacketV5::Connect(Box::<rmqtt_codec::v5::Connect>::default()));
-        let v5 = dispatch(&binding);
+        let v5 = dispatch(&binding, &mut AwaitingRelease::default());
         assert!(matches!(
             v5,
             Disposition::Violation(Violation::DuplicateConnect)
@@ -553,7 +646,7 @@ mod tests {
             status: vec![rmqtt_codec::v3::SubscribeReturnCode::Failure],
         });
         assert!(matches!(
-            dispatch(&v3_suback),
+            dispatch(&v3_suback, &mut AwaitingRelease::default()),
             Disposition::Violation(Violation::ServerOnlyPacket)
         ));
 
@@ -564,13 +657,13 @@ mod tests {
             reason_string: None,
         }));
         assert!(matches!(
-            dispatch(&v5_puback),
+            dispatch(&v5_puback, &mut AwaitingRelease::default()),
             Disposition::Violation(Violation::PublishAckFromClient)
         ));
 
         let probe = MqttPacket::Version(ProtocolVersion::MQTT3);
         assert!(matches!(
-            dispatch(&probe),
+            dispatch(&probe, &mut AwaitingRelease::default()),
             Disposition::Violation(Violation::VersionProbe)
         ));
     }
@@ -623,7 +716,7 @@ mod tests {
             v5_unsuback,
             v5_pingresp,
         ] {
-            match dispatch(&packet) {
+            match dispatch(&packet, &mut AwaitingRelease::default()) {
                 Disposition::Violation(Violation::ServerOnlyPacket) => {}
                 other => panic!("expected ServerOnlyPacket for {packet:?}, got {other:?}"),
             }
@@ -656,19 +749,45 @@ mod tests {
         MqttPacket::V5(PacketV5::Publish(Box::new(publish)))
     }
 
-    /// AC-1 — a QoS 1 PUBLISH routes to `DeliverThenAck` carrying its packet id.
+    fn v3_qos2_publish(packet_id: Option<NonZeroU16>) -> MqttPacket {
+        let publish = TypesPublish {
+            dup: false,
+            retain: false,
+            qos: QoS::ExactlyOnce,
+            topic: "t".into(),
+            packet_id,
+            payload: bytes::Bytes::from_static(&[0x09, 0xC4, 0x03, 0xF5]),
+            properties: None,
+        };
+        MqttPacket::V3(PacketV3::Publish(Box::new(publish)))
+    }
+
+    fn v5_qos2_publish(packet_id: Option<NonZeroU16>) -> MqttPacket {
+        let publish = TypesPublish {
+            dup: false,
+            retain: false,
+            qos: QoS::ExactlyOnce,
+            topic: "t".into(),
+            packet_id,
+            payload: bytes::Bytes::from_static(&[0x09, 0xC4, 0x03, 0xF5]),
+            properties: None,
+        };
+        MqttPacket::V5(PacketV5::Publish(Box::new(publish)))
+    }
+
+    /// AC-1 (F2.1) — a QoS 1 PUBLISH routes to `DeliverThenReply` carrying a PUBACK for its packet id.
     #[test]
-    fn dispatch_qos1_publish_delivers_then_acks() {
+    fn dispatch_qos1_publish_delivers_then_replies_puback() {
         let id = NonZeroU16::new(1).expect("non-zero");
         let binding = v3_qos1_publish(Some(id));
-        match dispatch(&binding) {
-            Disposition::DeliverThenAck(_, got_id) => assert_eq!(got_id, id),
-            other => panic!("expected DeliverThenAck, got {other:?}"),
+        match dispatch(&binding, &mut AwaitingRelease::default()) {
+            Disposition::DeliverThenReply(_, Reply::PublishAck(got_id)) => assert_eq!(got_id, id),
+            other => panic!("expected DeliverThenReply(PublishAck), got {other:?}"),
         }
         let binding = v5_qos1_publish(Some(id));
-        match dispatch(&binding) {
-            Disposition::DeliverThenAck(_, got_id) => assert_eq!(got_id, id),
-            other => panic!("expected DeliverThenAck, got {other:?}"),
+        match dispatch(&binding, &mut AwaitingRelease::default()) {
+            Disposition::DeliverThenReply(_, Reply::PublishAck(got_id)) => assert_eq!(got_id, id),
+            other => panic!("expected DeliverThenReply(PublishAck), got {other:?}"),
         }
     }
 
@@ -677,9 +796,240 @@ mod tests {
     #[test]
     fn dispatch_qos1_publish_without_packet_id_is_violation() {
         let binding = v5_qos1_publish(None);
-        match dispatch(&binding) {
+        match dispatch(&binding, &mut AwaitingRelease::default()) {
             Disposition::Violation(Violation::PublishMissingPacketId) => {}
             other => panic!("expected Violation(PublishMissingPacketId), got {other:?}"),
+        }
+    }
+
+    /// AC-1 — a QoS 2 PUBLISH routes to `DeliverThenReply` carrying a PUBREC
+    /// for its packet id, on both protocol versions with a fresh
+    /// `AwaitingRelease` each.
+    #[test]
+    fn dispatch_qos2_publish_delivers_then_replies_pubrec() {
+        let id = NonZeroU16::new(37).expect("non-zero");
+        let binding = v3_qos2_publish(Some(id));
+        match dispatch(&binding, &mut AwaitingRelease::default()) {
+            Disposition::DeliverThenReply(_, Reply::PublishReceived(got)) => assert_eq!(got, id),
+            other => panic!("expected DeliverThenReply(PublishReceived), got {other:?}"),
+        }
+        let binding = v5_qos2_publish(Some(id));
+        match dispatch(&binding, &mut AwaitingRelease::default()) {
+            Disposition::DeliverThenReply(_, Reply::PublishReceived(got)) => assert_eq!(got, id),
+            other => panic!("expected DeliverThenReply(PublishReceived), got {other:?}"),
+        }
+    }
+
+    /// AC-2 — a QoS 2 PUBLISH repeated before its PUBREL is acknowledged
+    /// again without a second delivery.
+    #[test]
+    fn dispatch_qos2_repeat_before_release_replies_pubrec_without_delivery() {
+        let id = NonZeroU16::new(37).expect("non-zero");
+        let mut awaiting = AwaitingRelease::default();
+        let binding = v3_qos2_publish(Some(id));
+        match dispatch(&binding, &mut awaiting) {
+            Disposition::DeliverThenReply(_, Reply::PublishReceived(got)) => assert_eq!(got, id),
+            other => panic!("expected DeliverThenReply(PublishReceived), got {other:?}"),
+        }
+        let binding = v3_qos2_publish(Some(id));
+        match dispatch(&binding, &mut awaiting) {
+            Disposition::Reply(Reply::PublishReceived(got)) => assert_eq!(got, id),
+            other => panic!("expected Reply(PublishReceived), got {other:?}"),
+        }
+    }
+
+    /// AC-4, AC-5 — PUBREL releases a QoS 2 packet id, and a PUBLISH reusing
+    /// that id afterward is delivered again rather than treated as a repeat.
+    /// Run for both protocol versions, each with its own fresh
+    /// `AwaitingRelease`.
+    #[test]
+    fn dispatch_pubrel_releases_and_the_packet_id_is_reusable() {
+        let id37 = NonZeroU16::new(37).expect("non-zero");
+
+        let mut awaiting = AwaitingRelease::default();
+        let publish = v3_qos2_publish(Some(id37));
+        match dispatch(&publish, &mut awaiting) {
+            Disposition::DeliverThenReply(_, Reply::PublishReceived(got)) => assert_eq!(got, id37),
+            other => panic!("expected DeliverThenReply(PublishReceived), got {other:?}"),
+        }
+        match dispatch(&publish, &mut awaiting) {
+            Disposition::Reply(Reply::PublishReceived(got)) => assert_eq!(got, id37),
+            other => panic!("expected Reply(PublishReceived), got {other:?}"),
+        }
+        let pubrel = MqttPacket::V3(PacketV3::PublishRelease { packet_id: id37 });
+        match dispatch(&pubrel, &mut awaiting) {
+            Disposition::Reply(Reply::PublishComplete(got, ReleaseOutcome::Released)) => {
+                assert_eq!(got, id37);
+            }
+            other => panic!("expected Reply(PublishComplete(Released)), got {other:?}"),
+        }
+        match dispatch(&pubrel, &mut awaiting) {
+            Disposition::Reply(Reply::PublishComplete(got, ReleaseOutcome::UnknownPacketId)) => {
+                assert_eq!(got, id37);
+            }
+            other => panic!("expected Reply(PublishComplete(UnknownPacketId)), got {other:?}"),
+        }
+        match dispatch(&publish, &mut awaiting) {
+            Disposition::DeliverThenReply(_, Reply::PublishReceived(got)) => assert_eq!(got, id37),
+            other => panic!("expected DeliverThenReply(PublishReceived), got {other:?}"),
+        }
+
+        let mut awaiting = AwaitingRelease::default();
+        let publish = v5_qos2_publish(Some(id37));
+        match dispatch(&publish, &mut awaiting) {
+            Disposition::DeliverThenReply(_, Reply::PublishReceived(got)) => assert_eq!(got, id37),
+            other => panic!("expected DeliverThenReply(PublishReceived), got {other:?}"),
+        }
+        match dispatch(&publish, &mut awaiting) {
+            Disposition::Reply(Reply::PublishReceived(got)) => assert_eq!(got, id37),
+            other => panic!("expected Reply(PublishReceived), got {other:?}"),
+        }
+        let pubrel = MqttPacket::V5(PacketV5::PublishRelease(rmqtt_codec::v5::PublishAck2 {
+            packet_id: id37,
+            reason_code: rmqtt_codec::v5::PublishAck2Reason::Success,
+            properties: Vec::new(),
+            reason_string: None,
+        }));
+        match dispatch(&pubrel, &mut awaiting) {
+            Disposition::Reply(Reply::PublishComplete(got, ReleaseOutcome::Released)) => {
+                assert_eq!(got, id37);
+            }
+            other => panic!("expected Reply(PublishComplete(Released)), got {other:?}"),
+        }
+        match dispatch(&pubrel, &mut awaiting) {
+            Disposition::Reply(Reply::PublishComplete(got, ReleaseOutcome::UnknownPacketId)) => {
+                assert_eq!(got, id37);
+            }
+            other => panic!("expected Reply(PublishComplete(UnknownPacketId)), got {other:?}"),
+        }
+        match dispatch(&publish, &mut awaiting) {
+            Disposition::DeliverThenReply(_, Reply::PublishReceived(got)) => assert_eq!(got, id37),
+            other => panic!("expected DeliverThenReply(PublishReceived), got {other:?}"),
+        }
+    }
+
+    /// AC-9 — packet ids are tracked independently across word boundaries:
+    /// 1 and 2 share a bitset word, 63 and 64 straddle a word boundary, and
+    /// 65535 is the last representable id.
+    #[test]
+    fn dispatch_qos2_tracks_outstanding_packet_ids_independently() {
+        let id1 = NonZeroU16::new(1).expect("non-zero");
+        let id2 = NonZeroU16::new(2).expect("non-zero");
+        let id63 = NonZeroU16::new(63).expect("non-zero");
+        let id64 = NonZeroU16::new(64).expect("non-zero");
+        let id65535 = NonZeroU16::new(65535).expect("non-zero");
+        let mut awaiting = AwaitingRelease::default();
+
+        for id in [id1, id2, id63, id64, id65535] {
+            let publish = v3_qos2_publish(Some(id));
+            match dispatch(&publish, &mut awaiting) {
+                Disposition::DeliverThenReply(_, Reply::PublishReceived(got)) => {
+                    assert_eq!(got, id);
+                }
+                other => {
+                    panic!("expected DeliverThenReply(PublishReceived) for {id}, got {other:?}")
+                }
+            }
+        }
+
+        let pubrel1 = MqttPacket::V3(PacketV3::PublishRelease { packet_id: id1 });
+        match dispatch(&pubrel1, &mut awaiting) {
+            Disposition::Reply(Reply::PublishComplete(got, ReleaseOutcome::Released)) => {
+                assert_eq!(got, id1);
+            }
+            other => panic!("expected Reply(PublishComplete(Released)), got {other:?}"),
+        }
+
+        for id in [id2, id63, id64, id65535] {
+            let publish = v3_qos2_publish(Some(id));
+            match dispatch(&publish, &mut awaiting) {
+                Disposition::Reply(Reply::PublishReceived(got)) => assert_eq!(got, id),
+                other => panic!("expected Reply(PublishReceived) for {id}, got {other:?}"),
+            }
+        }
+
+        let publish1 = v3_qos2_publish(Some(id1));
+        match dispatch(&publish1, &mut awaiting) {
+            Disposition::DeliverThenReply(_, Reply::PublishReceived(got)) => assert_eq!(got, id1),
+            other => panic!("expected DeliverThenReply(PublishReceived), got {other:?}"),
+        }
+
+        for id in [id2, id63, id64, id65535] {
+            let pubrel = MqttPacket::V3(PacketV3::PublishRelease { packet_id: id });
+            match dispatch(&pubrel, &mut awaiting) {
+                Disposition::Reply(Reply::PublishComplete(got, ReleaseOutcome::Released)) => {
+                    assert_eq!(got, id);
+                }
+                other => {
+                    panic!("expected Reply(PublishComplete(Released)) for {id}, got {other:?}")
+                }
+            }
+        }
+
+        let pubrel65535_again = MqttPacket::V3(PacketV3::PublishRelease { packet_id: id65535 });
+        match dispatch(&pubrel65535_again, &mut awaiting) {
+            Disposition::Reply(Reply::PublishComplete(got, ReleaseOutcome::UnknownPacketId)) => {
+                assert_eq!(got, id65535);
+            }
+            other => panic!("expected Reply(PublishComplete(UnknownPacketId)), got {other:?}"),
+        }
+
+        match dispatch(&pubrel1, &mut awaiting) {
+            Disposition::Reply(Reply::PublishComplete(got, ReleaseOutcome::Released)) => {
+                assert_eq!(got, id1);
+            }
+            other => panic!("expected Reply(PublishComplete(Released)), got {other:?}"),
+        }
+    }
+
+    /// AC-10 — a QoS 2 PUBLISH with no packet id is a protocol violation,
+    /// for both v3 and v5.
+    #[test]
+    fn dispatch_qos2_publish_without_packet_id_is_violation() {
+        let v3 = v3_qos2_publish(None);
+        match dispatch(&v3, &mut AwaitingRelease::default()) {
+            Disposition::Violation(Violation::PublishMissingPacketId) => {}
+            other => panic!("expected Violation(PublishMissingPacketId), got {other:?}"),
+        }
+        let v5 = v5_qos2_publish(None);
+        match dispatch(&v5, &mut AwaitingRelease::default()) {
+            Disposition::Violation(Violation::PublishMissingPacketId) => {}
+            other => panic!("expected Violation(PublishMissingPacketId), got {other:?}"),
+        }
+    }
+
+    /// Q6 — the QoS 1 path never touches the awaiting-release set: a QoS 1
+    /// PUBLISH reusing an id that awaits a QoS 2 release is delivered and
+    /// acknowledged every time, and the QoS 2 id still releases afterwards.
+    /// A dedup check bolted onto the QoS 1 arm would suppress the second
+    /// PUBACK; a QoS 1 arm that cleared the bit would report `UnknownPacketId`.
+    #[test]
+    fn dispatch_qos1_publish_does_not_disturb_an_awaiting_qos2_packet_id() {
+        let id = NonZeroU16::new(37).expect("non-zero");
+        let mut awaiting = AwaitingRelease::default();
+
+        let qos2 = v3_qos2_publish(Some(id));
+        match dispatch(&qos2, &mut awaiting) {
+            Disposition::DeliverThenReply(_, Reply::PublishReceived(got)) => assert_eq!(got, id),
+            other => panic!("expected DeliverThenReply(PublishReceived), got {other:?}"),
+        }
+
+        let qos1 = v3_qos1_publish(Some(id));
+        for attempt in 1..=2 {
+            match dispatch(&qos1, &mut awaiting) {
+                Disposition::DeliverThenReply(_, Reply::PublishAck(got)) => assert_eq!(got, id),
+                other => panic!(
+                    "expected DeliverThenReply(PublishAck) on attempt {attempt}, got {other:?}"
+                ),
+            }
+        }
+
+        let pubrel = MqttPacket::V3(PacketV3::PublishRelease { packet_id: id });
+        match dispatch(&pubrel, &mut awaiting) {
+            Disposition::Reply(Reply::PublishComplete(got, ReleaseOutcome::Released)) => {
+                assert_eq!(got, id);
+            }
+            other => panic!("expected Reply(PublishComplete(Released)), got {other:?}"),
         }
     }
 
@@ -707,6 +1057,60 @@ mod tests {
         assert_eq!(
             encode(v5, ProtocolVersion::MQTT5),
             vec![0x40, 0x04, 0x00, 0x01, 0x00, 0x00]
+        );
+    }
+
+    /// AC-7 — PUBREC and PUBCOMP render byte-exact per version, including the
+    /// v5 `PacketIdNotFound` (0x92) reason on an unknown-id PUBCOMP.
+    #[test]
+    fn publish_received_and_complete_render_per_version() {
+        let id = NonZeroU16::new(37).expect("non-zero");
+
+        assert_eq!(
+            encode(
+                Reply::PublishReceived(id).render(ProtocolVersion::MQTT3),
+                ProtocolVersion::MQTT3
+            ),
+            vec![0x50, 0x02, 0x00, 0x25]
+        );
+        assert_eq!(
+            encode(
+                Reply::PublishReceived(id).render(ProtocolVersion::MQTT5),
+                ProtocolVersion::MQTT5
+            ),
+            vec![0x50, 0x04, 0x00, 0x25, 0x00, 0x00]
+        );
+
+        assert_eq!(
+            encode(
+                Reply::PublishComplete(id, ReleaseOutcome::Released).render(ProtocolVersion::MQTT3),
+                ProtocolVersion::MQTT3
+            ),
+            vec![0x70, 0x02, 0x00, 0x25]
+        );
+        assert_eq!(
+            encode(
+                Reply::PublishComplete(id, ReleaseOutcome::Released).render(ProtocolVersion::MQTT5),
+                ProtocolVersion::MQTT5
+            ),
+            vec![0x70, 0x04, 0x00, 0x25, 0x00, 0x00]
+        );
+
+        assert_eq!(
+            encode(
+                Reply::PublishComplete(id, ReleaseOutcome::UnknownPacketId)
+                    .render(ProtocolVersion::MQTT3),
+                ProtocolVersion::MQTT3
+            ),
+            vec![0x70, 0x02, 0x00, 0x25]
+        );
+        assert_eq!(
+            encode(
+                Reply::PublishComplete(id, ReleaseOutcome::UnknownPacketId)
+                    .render(ProtocolVersion::MQTT5),
+                ProtocolVersion::MQTT5
+            ),
+            vec![0x70, 0x04, 0x00, 0x25, 0x92, 0x00]
         );
     }
 
@@ -756,7 +1160,7 @@ mod tests {
     fn dispatch_subscribe_refuses_every_filter() {
         let id = NonZeroU16::new(1).expect("non-zero");
         let binding = v3_subscribe(id, vec![("a", QoS::AtMostOnce), ("b/c", QoS::AtMostOnce)]);
-        match dispatch(&binding) {
+        match dispatch(&binding, &mut AwaitingRelease::default()) {
             Disposition::Reply(Reply::SubscribeRefusal(got_id, n)) => {
                 assert_eq!(got_id, id);
                 assert_eq!(n.get(), 2);
@@ -765,7 +1169,7 @@ mod tests {
         }
 
         let binding = v5_subscribe(id, None, vec![("x", SubscriptionOptions::default())]);
-        match dispatch(&binding) {
+        match dispatch(&binding, &mut AwaitingRelease::default()) {
             Disposition::Reply(Reply::SubscribeRefusal(got_id, n)) => {
                 assert_eq!(got_id, id);
                 assert_eq!(n.get(), 1);
@@ -782,13 +1186,13 @@ mod tests {
         let id = NonZeroU16::new(1).expect("non-zero");
         let binding = v3_subscribe(id, vec![]);
         assert!(matches!(
-            dispatch(&binding),
+            dispatch(&binding, &mut AwaitingRelease::default()),
             Disposition::Violation(Violation::EmptyTopicFilterList)
         ));
 
         let binding = v5_subscribe(id, None, vec![]);
         assert!(matches!(
-            dispatch(&binding),
+            dispatch(&binding, &mut AwaitingRelease::default()),
             Disposition::Violation(Violation::EmptyTopicFilterList)
         ));
     }
@@ -993,7 +1397,7 @@ mod tests {
                 ("$share/g/t", SubscriptionOptions::default()),
             ],
         );
-        match dispatch(&binding) {
+        match dispatch(&binding, &mut AwaitingRelease::default()) {
             Disposition::Reply(Reply::SubscribeRefusal(got_id, n)) => {
                 assert_eq!(got_id, id);
                 assert_eq!(n.get(), 3);
@@ -1013,7 +1417,7 @@ mod tests {
         let id37 = NonZeroU16::new(37).expect("non-zero");
 
         let binding = v3_unsubscribe(id1, vec!["a", "b/c"]);
-        match dispatch(&binding) {
+        match dispatch(&binding, &mut AwaitingRelease::default()) {
             Disposition::Reply(Reply::UnsubscribeAck(got_id, n)) => {
                 assert_eq!(got_id, id1);
                 assert_eq!(n.get(), 2);
@@ -1022,7 +1426,7 @@ mod tests {
         }
 
         let binding = v3_unsubscribe(id37, vec!["t"]);
-        match dispatch(&binding) {
+        match dispatch(&binding, &mut AwaitingRelease::default()) {
             Disposition::Reply(Reply::UnsubscribeAck(got_id, n)) => {
                 assert_eq!(got_id, id37, "id must be propagated, not hardcoded 1");
                 assert_eq!(n.get(), 1);
@@ -1031,7 +1435,7 @@ mod tests {
         }
 
         let binding = v5_unsubscribe(id1, vec!["x"]);
-        match dispatch(&binding) {
+        match dispatch(&binding, &mut AwaitingRelease::default()) {
             Disposition::Reply(Reply::UnsubscribeAck(got_id, n)) => {
                 assert_eq!(got_id, id1);
                 assert_eq!(n.get(), 1);
@@ -1050,7 +1454,7 @@ mod tests {
     fn dispatch_v5_unsubscribe_propagates_id_and_filter_count() {
         let id37 = NonZeroU16::new(37).expect("non-zero");
         let binding = v5_unsubscribe(id37, vec!["a", "b/c"]);
-        match dispatch(&binding) {
+        match dispatch(&binding, &mut AwaitingRelease::default()) {
             Disposition::Reply(Reply::UnsubscribeAck(got_id, n)) => {
                 assert_eq!(got_id, id37, "id must be propagated, not hardcoded 1");
                 assert_eq!(n.get(), 2, "one status byte per requested filter");
@@ -1085,12 +1489,22 @@ mod tests {
             Reply::UnsubscribeAck(id, one).timeout_context(),
             super::super::handler::TIMEOUT_CTX_UNSUBACK_FLUSH
         );
+        assert_eq!(
+            Reply::PublishReceived(id).timeout_context(),
+            super::super::handler::TIMEOUT_CTX_PUBREC_FLUSH
+        );
+        assert_eq!(
+            Reply::PublishComplete(id, ReleaseOutcome::Released).timeout_context(),
+            super::super::handler::TIMEOUT_CTX_PUBCOMP_FLUSH
+        );
 
         let contexts = [
             Reply::PingResponse.timeout_context(),
             Reply::PublishAck(id).timeout_context(),
             Reply::SubscribeRefusal(id, one).timeout_context(),
             Reply::UnsubscribeAck(id, one).timeout_context(),
+            Reply::PublishReceived(id).timeout_context(),
+            Reply::PublishComplete(id, ReleaseOutcome::Released).timeout_context(),
         ];
         let mut distinct = contexts.to_vec();
         distinct.sort_unstable();
@@ -1110,13 +1524,13 @@ mod tests {
         let id = NonZeroU16::new(1).expect("non-zero");
         let binding = v3_unsubscribe(id, vec![]);
         assert!(matches!(
-            dispatch(&binding),
+            dispatch(&binding, &mut AwaitingRelease::default()),
             Disposition::Violation(Violation::EmptyTopicFilterList)
         ));
 
         let binding = v5_unsubscribe(id, vec![]);
         assert!(matches!(
-            dispatch(&binding),
+            dispatch(&binding, &mut AwaitingRelease::default()),
             Disposition::Violation(Violation::EmptyTopicFilterList)
         ));
     }
@@ -1131,7 +1545,7 @@ mod tests {
     fn empty_filter_list_disconnect_encodes_protocol_error() {
         let id = NonZeroU16::new(1).expect("non-zero");
         for binding in [v5_subscribe(id, None, vec![]), v5_unsubscribe(id, vec![])] {
-            let violation = match dispatch(&binding) {
+            let violation = match dispatch(&binding, &mut AwaitingRelease::default()) {
                 Disposition::Violation(v @ Violation::EmptyTopicFilterList) => v,
                 other => panic!("expected Violation(EmptyTopicFilterList), got {other:?}"),
             };
@@ -1222,89 +1636,6 @@ mod tests {
         );
     }
 
-    /// AC-8 — PUBREC / PUBREL / PUBCOMP close under `Qos2FlowNotImplemented`.
-    /// Both versions of each, three packet types: six inputs, one variant.
-    #[test]
-    fn dispatch_qos2_flow_packets_are_violations() {
-        let id = NonZeroU16::new(1).expect("non-zero");
-
-        let v3_pubrec = MqttPacket::V3(PacketV3::PublishReceived { packet_id: id });
-        assert!(matches!(
-            dispatch(&v3_pubrec),
-            Disposition::Violation(Violation::Qos2FlowNotImplemented)
-        ));
-        let v3_pubrel = MqttPacket::V3(PacketV3::PublishRelease { packet_id: id });
-        assert!(matches!(
-            dispatch(&v3_pubrel),
-            Disposition::Violation(Violation::Qos2FlowNotImplemented)
-        ));
-        let v3_pubcomp = MqttPacket::V3(PacketV3::PublishComplete { packet_id: id });
-        assert!(matches!(
-            dispatch(&v3_pubcomp),
-            Disposition::Violation(Violation::Qos2FlowNotImplemented)
-        ));
-
-        let v5_pubrec = MqttPacket::V5(PacketV5::PublishReceived(rmqtt_codec::v5::PublishAck {
-            packet_id: id,
-            reason_code: PublishAckReason::Success,
-            properties: Vec::new(),
-            reason_string: None,
-        }));
-        assert!(matches!(
-            dispatch(&v5_pubrec),
-            Disposition::Violation(Violation::Qos2FlowNotImplemented)
-        ));
-        let v5_pubrel = MqttPacket::V5(PacketV5::PublishRelease(rmqtt_codec::v5::PublishAck2 {
-            packet_id: id,
-            reason_code: rmqtt_codec::v5::PublishAck2Reason::Success,
-            properties: Vec::new(),
-            reason_string: None,
-        }));
-        assert!(matches!(
-            dispatch(&v5_pubrel),
-            Disposition::Violation(Violation::Qos2FlowNotImplemented)
-        ));
-        let v5_pubcomp = MqttPacket::V5(PacketV5::PublishComplete(rmqtt_codec::v5::PublishAck2 {
-            packet_id: id,
-            reason_code: rmqtt_codec::v5::PublishAck2Reason::Success,
-            properties: Vec::new(),
-            reason_string: None,
-        }));
-        assert!(matches!(
-            dispatch(&v5_pubcomp),
-            Disposition::Violation(Violation::Qos2FlowNotImplemented)
-        ));
-    }
-
-    /// AC-9 — a QoS 2 PUBLISH exceeds `MAX_QOS` and is rejected before the
-    // `(qos, packet_id)` match. The arm that names QoS 2 specifically
-    // (`Qos2FlowNotImplemented`) is reserved for F2.2, when `MAX_QOS` rises
-    // to `ExactlyOnce` and the guard above no longer fires.
-    #[test]
-    fn dispatch_qos2_publish_exceeds_max_qos() {
-        let id = NonZeroU16::new(1).expect("non-zero");
-        let publish = TypesPublish {
-            dup: false,
-            retain: false,
-            qos: QoS::ExactlyOnce,
-            topic: "t".into(),
-            packet_id: Some(id),
-            payload: bytes::Bytes::from_static(&[0x09, 0xC4, 0x03, 0xF5]),
-            properties: None,
-        };
-
-        let v3 = MqttPacket::V3(PacketV3::Publish(Box::new(publish.clone())));
-        assert!(matches!(
-            dispatch(&v3),
-            Disposition::Violation(Violation::PublishQosAboveMaximum)
-        ));
-        let v5 = MqttPacket::V5(PacketV5::Publish(Box::new(publish)));
-        assert!(matches!(
-            dispatch(&v5),
-            Disposition::Violation(Violation::PublishQosAboveMaximum)
-        ));
-    }
-
     /// AC-10 — v5 AUTH without a negotiated method closes as
     /// `AuthNotNegotiated`. v3 has no AUTH packet.
     #[test]
@@ -1318,7 +1649,7 @@ mod tests {
         };
         let binding = MqttPacket::V5(PacketV5::Auth(auth));
         assert!(matches!(
-            dispatch(&binding),
+            dispatch(&binding, &mut AwaitingRelease::default()),
             Disposition::Violation(Violation::AuthNotNegotiated)
         ));
     }
@@ -1332,7 +1663,7 @@ mod tests {
 
         let v3 = MqttPacket::V3(PacketV3::PublishAck { packet_id: id });
         assert!(matches!(
-            dispatch(&v3),
+            dispatch(&v3, &mut AwaitingRelease::default()),
             Disposition::Violation(Violation::PublishAckFromClient)
         ));
 
@@ -1343,7 +1674,76 @@ mod tests {
             reason_string: None,
         }));
         assert!(matches!(
-            dispatch(&v5),
+            dispatch(&v5, &mut AwaitingRelease::default()),
+            Disposition::Violation(Violation::PublishAckFromClient)
+        ));
+    }
+
+    /// AC-6 — a PUBREL for a packet id that is not awaiting release
+    /// completes as `UnknownPacketId`, carrying that id, rather than closing.
+    #[test]
+    fn dispatch_pubrel_for_unknown_packet_id_completes_as_unknown() {
+        let id = NonZeroU16::new(37).expect("non-zero");
+
+        let v3 = MqttPacket::V3(PacketV3::PublishRelease { packet_id: id });
+        match dispatch(&v3, &mut AwaitingRelease::default()) {
+            Disposition::Reply(Reply::PublishComplete(got, ReleaseOutcome::UnknownPacketId)) => {
+                assert_eq!(got, id);
+            }
+            other => panic!("expected Reply(PublishComplete(UnknownPacketId)), got {other:?}"),
+        }
+
+        let v5 = MqttPacket::V5(PacketV5::PublishRelease(rmqtt_codec::v5::PublishAck2 {
+            packet_id: id,
+            reason_code: rmqtt_codec::v5::PublishAck2Reason::Success,
+            properties: Vec::new(),
+            reason_string: None,
+        }));
+        match dispatch(&v5, &mut AwaitingRelease::default()) {
+            Disposition::Reply(Reply::PublishComplete(got, ReleaseOutcome::UnknownPacketId)) => {
+                assert_eq!(got, id);
+            }
+            other => panic!("expected Reply(PublishComplete(UnknownPacketId)), got {other:?}"),
+        }
+    }
+
+    /// AC-8 — a PUBREC or PUBCOMP sent by a client closes as
+    /// `PublishAckFromClient`; this server never publishes a QoS 2 PUBLISH.
+    #[test]
+    fn dispatch_client_pubrec_and_pubcomp_are_violations() {
+        let id = NonZeroU16::new(37).expect("non-zero");
+
+        let v3_pubrec = MqttPacket::V3(PacketV3::PublishReceived { packet_id: id });
+        assert!(matches!(
+            dispatch(&v3_pubrec, &mut AwaitingRelease::default()),
+            Disposition::Violation(Violation::PublishAckFromClient)
+        ));
+
+        let v3_pubcomp = MqttPacket::V3(PacketV3::PublishComplete { packet_id: id });
+        assert!(matches!(
+            dispatch(&v3_pubcomp, &mut AwaitingRelease::default()),
+            Disposition::Violation(Violation::PublishAckFromClient)
+        ));
+
+        let v5_pubrec = MqttPacket::V5(PacketV5::PublishReceived(rmqtt_codec::v5::PublishAck {
+            packet_id: id,
+            reason_code: PublishAckReason::Success,
+            properties: Vec::new(),
+            reason_string: None,
+        }));
+        assert!(matches!(
+            dispatch(&v5_pubrec, &mut AwaitingRelease::default()),
+            Disposition::Violation(Violation::PublishAckFromClient)
+        ));
+
+        let v5_pubcomp = MqttPacket::V5(PacketV5::PublishComplete(rmqtt_codec::v5::PublishAck2 {
+            packet_id: id,
+            reason_code: rmqtt_codec::v5::PublishAck2Reason::Success,
+            properties: Vec::new(),
+            reason_string: None,
+        }));
+        assert!(matches!(
+            dispatch(&v5_pubcomp, &mut AwaitingRelease::default()),
             Disposition::Violation(Violation::PublishAckFromClient)
         ));
     }
@@ -1354,14 +1754,6 @@ mod tests {
     #[test]
     fn qos_not_supported_disconnect_encodes_9b() {
         let pkt = Violation::PublishQosAboveMaximum
-            .disconnect(ProtocolVersion::MQTT5, None)
-            .expect("v5 disconnect");
-        assert_eq!(
-            encode(pkt, ProtocolVersion::MQTT5),
-            vec![0xE0, 0x02, 0x9B, 0x00]
-        );
-
-        let pkt = Violation::Qos2FlowNotImplemented
             .disconnect(ProtocolVersion::MQTT5, None)
             .expect("v5 disconnect");
         assert_eq!(
@@ -1441,7 +1833,7 @@ mod tests {
     /// AC-6 — a CONNACK `honest_v5_connack` produces must hold every fixed-size
     /// reply and the v5 violation DISCONNECT. The plan's whole policy rests on
     /// a fitting CONNACK also guaranteeing every fixed reply fits, so this
-    /// passes today (12 against a 6-byte maximum) and fails the moment
+    /// passes today (10 against a 6-byte maximum) and fails the moment
     /// `honest_v5_connack` shrinks below any fixed reply — the moment the
     /// CONNACK-only threshold this plan reasons about becomes a lie.
     #[test]
@@ -1464,6 +1856,9 @@ mod tests {
             Reply::PublishAck(id),
             Reply::SubscribeRefusal(id, one),
             Reply::UnsubscribeAck(id, one),
+            Reply::PublishReceived(id),
+            Reply::PublishComplete(id, ReleaseOutcome::Released),
+            Reply::PublishComplete(id, ReleaseOutcome::UnknownPacketId),
         ];
         for version in [ProtocolVersion::MQTT3, ProtocolVersion::MQTT5] {
             for reply in fixed {
@@ -1501,8 +1896,8 @@ mod tests {
         let ack = MqttPacket::V5(PacketV5::ConnectAck(Box::new(ack)));
         let len = encoded_len(ack, ProtocolVersion::MQTT5).expect("encode capability CONNACK");
         assert!(
-            len <= 15,
-            "capability CONNACK with server_keepalive_sec must encode to <= 15 bytes; got {len}"
+            len <= 13,
+            "capability CONNACK with server_keepalive_sec must encode to <= 13 bytes; got {len}"
         );
     }
 
@@ -1612,6 +2007,9 @@ mod tests {
             Reply::PublishAck(id),
             Reply::SubscribeRefusal(id, filters),
             Reply::UnsubscribeAck(id, filters),
+            Reply::PublishReceived(id),
+            Reply::PublishComplete(id, ReleaseOutcome::Released),
+            Reply::PublishComplete(id, ReleaseOutcome::UnknownPacketId),
         ];
         for version in [ProtocolVersion::MQTT3, ProtocolVersion::MQTT5] {
             for reply in replies {
@@ -1658,7 +2056,6 @@ mod tests {
             Violation::EmptyTopicFilterList,
             Violation::ReplyOverMaxPacketSize,
             Violation::ServerOnlyPacket,
-            Violation::Qos2FlowNotImplemented,
             Violation::PublishAckFromClient,
             Violation::AuthNotNegotiated,
             Violation::PublishQosAboveMaximum,
