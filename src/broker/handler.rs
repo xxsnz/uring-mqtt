@@ -353,11 +353,10 @@ where
 /// Hands a PUBLISH's payload to the worker's ingest seam. A payload
 /// `parse_sensor_data` cannot read is counted here through
 /// `note_unparseable_payload`; a reading the event channel cannot take is
-/// counted inside `EventSender::send`, under a separate counter per reason
-/// (channel full, receiver closed). Every discard therefore carries a
-/// lifetime total and a rate-limited warn. None of them reaches the caller,
-/// because none changes what the caller does: the PUBACK or PUBREC is sent
-/// either way, and QoS 0 has no ack to send at all.
+/// discarded inside `EventSender::send`, which counts and warns when the
+/// channel is full and only debug-logs a closed receiver. None of these
+/// reaches the caller, because none changes what the caller does: the
+/// PUBACK or PUBREC is sent either way, and QoS 0 has no ack to send at all.
 fn deliver_publish(event_tx: &EventSender, publish: &rmqtt_codec::types::Publish) {
     tracing::debug!("PUBLISH {} len: {}", publish.topic, publish.payload.len());
     match parse_sensor_data(&publish.payload) {
@@ -472,9 +471,9 @@ const SENSOR_V1_LEN: usize = 4;
 /// - bytes 0-1: temperature (i16, scale 0.01°C)
 /// - bytes 2-3: pressure (u16, scale 1.0 hPa)
 ///
-/// A longer payload is rejected rather than truncated: accepting its first
-/// four bytes would report a reading the publisher never sent and silently
-/// drop the rest.
+/// A longer payload is rejected rather than truncated: its first four bytes
+/// may not be a reading at all, and the parser cannot tell, so accepting
+/// them could report a reading the publisher never sent.
 #[inline(always)]
 fn parse_sensor_data(data: &[u8]) -> Option<Event> {
     if data.len() != SENSOR_V1_LEN {
@@ -895,7 +894,7 @@ pub(crate) mod tests {
 
     /// `SENSOR_V1_LEN` is the whole format: a shorter payload has no reading
     /// to read and a longer one is a format this parser cannot identify.
-    /// Truncating the longer one would report a reading nobody sent.
+    /// Truncating the longer one could report a reading nobody sent.
     #[test]
     fn parse_sensor_data_accepts_only_the_exact_sensor_v1_width() {
         assert!(matches!(
@@ -2144,11 +2143,12 @@ pub(crate) mod tests {
         );
     }
 
-    /// A closed receiver keeps its own lifetime counter and its own warn, so an
-    /// acknowledged reading that can never reach the callback is visible at
-    /// normal log levels — without the overflow total absorbing it.
+    /// A closed receiver is debug-logged only and counted nowhere (decision log
+    /// 2026-09-11): `process_events` holds the receiver until every sender is
+    /// gone, so no running connection reaches this branch. The overflow total
+    /// must not absorb the discard either.
     #[test]
-    fn closed_receiver_discard_is_counted_apart_from_overflow_drops() {
+    fn closed_receiver_discard_is_debug_logged_and_not_counted() {
         // Case (a): fresh channel, drop receiver, send.
         let sink_a = capture_logs();
         {
@@ -2164,24 +2164,25 @@ pub(crate) mod tests {
                 "closed-receiver discard must not increment the overflow counter"
             );
             assert_eq!(
-                tx.closed_discards_total(),
-                1,
-                "closed-receiver discard must increment its own counter"
+                tx.unparseable_total(),
+                0,
+                "closed-receiver discard must not increment the unparseable counter"
             );
         }
         let logs_a =
             String::from_utf8(sink_a.lock().expect("log buffer").clone()).expect("utf8 logs");
         assert!(
-            !logs_a.contains("dropped total"),
-            "closed-receiver discard must not emit a drop-warn, got: {logs_a}"
+            has_line_at(&logs_a, "DEBUG", &["worker 11", "event receiver closed"]),
+            "closed-receiver discard must be debug-logged, got: {logs_a}"
+        );
+        assert_eq!(
+            count_lines_at(&logs_a, "WARN", "event receiver closed"),
+            0,
+            "closed-receiver discard must not warn, got: {logs_a}"
         );
         assert!(
-            has_line_at(
-                &logs_a,
-                "WARN",
-                &["worker 11", "event receiver closed", "1 discarded total"]
-            ),
-            "first closed-receiver discard must warn, got: {logs_a}"
+            !logs_a.contains("dropped total"),
+            "closed-receiver discard must not emit a drop-warn, got: {logs_a}"
         );
 
         // Case (b): overflow into a still-open channel, then drop the receiver
@@ -2217,9 +2218,9 @@ pub(crate) mod tests {
                 "closed-receiver discards must not add to dropped total"
             );
             assert_eq!(
-                tx.closed_discards_total(),
-                1,
-                "the closure-branch discard belongs to the closed-discard counter"
+                tx.unparseable_total(),
+                0,
+                "closed-receiver discards must not add to unparseable total"
             );
         }
         let logs_b =
@@ -2231,38 +2232,70 @@ pub(crate) mod tests {
             drop_warn_lines_b, 1,
             "expected exactly one drop-warn line for case (b), got {drop_warn_lines_b}: {logs_b}"
         );
-        let closed_warn_lines_b = count_lines_at(&logs_b, "WARN", "discarded total");
+        assert!(
+            has_line_at(&logs_b, "DEBUG", &["worker 11", "event receiver closed"]),
+            "closed-receiver discard after overflow must be debug-logged, got: {logs_b}"
+        );
         assert_eq!(
-            closed_warn_lines_b, 1,
-            "expected exactly one closed-discard warn for case (b), got {closed_warn_lines_b}: {logs_b}"
+            count_lines_at(&logs_b, "WARN", "event receiver closed"),
+            0,
+            "closed-receiver discard must not warn in case (b), got: {logs_b}"
         );
     }
 
-    /// The two discard counters keep separate cadences: the closed-receiver
-    /// warn fires at #1 and #100 only, and never lands in the overflow total.
-    #[test]
-    fn closed_receiver_discard_warns_on_first_and_every_hundredth() {
-        let sink = capture_logs();
-        let (tx, rx) = event_channel(13);
-        drop(rx);
-        for _ in 0..100 {
-            tx.send(Event::SensorV1 {
-                temperature: 0,
-                pressure: 0,
-            });
-        }
-        assert_eq!(tx.closed_discards_total(), 100);
-        assert_eq!(tx.dropped_total(), 0);
+    /// One full cadence period of `should_log_count`: a counted discard path
+    /// warns again at this total, so a burst of this size crosses the boundary
+    /// the reverted closed-receiver counter used to warn on.
+    const CLOSED_DISCARD_BURST: usize = 100;
 
+    /// The closed-receiver counter is gone at every cadence boundary, not only
+    /// on the first discard: `CLOSED_DISCARD_BURST` discards onto a closed
+    /// receiver stay at DEBUG and leave both lifetime counters at zero (decision
+    /// log 2026-09-11). The sibling test above sends once per case, so only this
+    /// one rules out a counter that warns from the hundredth discard onward.
+    #[test]
+    fn repeated_closed_receiver_discards_never_warn_at_any_cadence() {
+        let sink = capture_logs();
+        {
+            let (tx, rx) = event_channel(23);
+            drop(rx);
+            for _ in 0..CLOSED_DISCARD_BURST {
+                tx.send(Event::SensorV1 {
+                    temperature: 0,
+                    pressure: 0,
+                });
+            }
+            assert_eq!(
+                tx.dropped_total(),
+                0,
+                "a burst of closed-receiver discards must not raise the overflow counter"
+            );
+            assert_eq!(
+                tx.unparseable_total(),
+                0,
+                "a burst of closed-receiver discards must not raise the unparseable counter"
+            );
+        }
         let logs = String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
-        assert!(
-            has_line_at(&logs, "WARN", &["worker 13", "100 discarded total"]),
-            "every-100th closed-discard warn missing, got: {logs}"
-        );
-        let closed_warn_lines = count_lines_at(&logs, "WARN", "discarded total");
+        let debug_lines = count_lines_at(&logs, "DEBUG", "event receiver closed");
         assert_eq!(
-            closed_warn_lines, 2,
-            "expected exactly two closed-discard warns, got {closed_warn_lines}: {logs}"
+            debug_lines, CLOSED_DISCARD_BURST,
+            "expected one DEBUG line per discard, got {debug_lines}: {logs}"
+        );
+        assert_eq!(
+            count_lines_at(&logs, "WARN", "event receiver closed"),
+            0,
+            "no closed-receiver discard may warn at any cadence, got: {logs}"
+        );
+        assert_eq!(
+            count_lines_at(&logs, "WARN", "dropped total"),
+            0,
+            "closed-receiver discards must not emit a drop-warn, got: {logs}"
+        );
+        assert_eq!(
+            count_lines_at(&logs, "WARN", "unparseable total"),
+            0,
+            "closed-receiver discards must not emit an unparseable warn, got: {logs}"
         );
     }
 

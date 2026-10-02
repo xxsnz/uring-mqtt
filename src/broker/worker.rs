@@ -91,10 +91,9 @@ fn should_log_count(total: u64) -> bool {
 
 /// Shared bookkeeping between sender clones and the receiver.
 struct EventChannelState {
-    depth: Cell<usize>,         // events currently queued
-    dropped: Cell<u64>,         // lifetime overflow drops (never reset)
-    closed_discards: Cell<u64>, // lifetime discards onto a closed receiver
-    unparseable: Cell<u64>,     // lifetime payloads no parser could read
+    depth: Cell<usize>,     // events currently queued
+    dropped: Cell<u64>,     // lifetime overflow drops (never reset)
+    unparseable: Cell<u64>, // lifetime payloads no parser could read
 }
 
 #[derive(Clone)]
@@ -106,13 +105,12 @@ pub(crate) struct EventSender {
 
 impl EventSender {
     /// Offers `event` to the worker's callback. A full channel increments the
-    /// drop counter; a receiver that has gone away increments the separate
-    /// closed-discard counter. Each counter warns on its own
-    /// `should_log_count` cadence, and the two stay apart so an overflow total
-    /// never absorbs a teardown discard. Either way the event is discarded and
-    /// the caller is not told: a QoS 1 PUBACK and a QoS 2 PUBREC are both sent
-    /// for every well-formed PUBLISH regardless, so a publisher is never left
-    /// holding an inflight slot for a reading this broker has dropped.
+    /// drop counter and warns on the `should_log_count` cadence; a receiver
+    /// that has gone away is debug-logged only, and is not counted. Either way
+    /// the event is discarded and the caller is not told: a QoS 1 PUBACK and a
+    /// QoS 2 PUBREC are both sent for every well-formed PUBLISH regardless, so
+    /// a publisher is never left holding an inflight slot for a reading this
+    /// broker has dropped.
     pub(crate) fn send(&self, event: Event) {
         if self.tx.is_closed() {
             self.note_closed();
@@ -137,20 +135,15 @@ impl EventSender {
         }
     }
 
-    /// Count one reading discarded because the callback's receiver is gone,
-    /// and warn on the `should_log_count` cadence. Acknowledged readings that
-    /// can never reach the callback are otherwise invisible at normal log
-    /// levels.
+    /// Debug-log one reading discarded because the callback's receiver is
+    /// gone. Not counted (decision log 2026-09-11): `process_events` holds the
+    /// receiver until every sender is gone, so only runtime teardown closes it
+    /// while a sender still exists, and no running connection reaches here.
     fn note_closed(&self) {
-        let total = self.state.closed_discards.get() + 1;
-        self.state.closed_discards.set(total);
-        if should_log_count(total) {
-            tracing::warn!(
-                "worker {}: event receiver closed, event discarded ({} discarded total)",
-                self.worker_id,
-                total
-            );
-        }
+        tracing::debug!(
+            "worker {}: event receiver closed, event discarded",
+            self.worker_id
+        );
     }
 
     /// Count one PUBLISH payload no parser could read, and warn on the
@@ -196,7 +189,6 @@ pub(crate) fn event_channel(worker_id: usize) -> (EventSender, EventReceiver) {
     let state = Rc::new(EventChannelState {
         depth: Cell::new(0),
         dropped: Cell::new(0),
-        closed_discards: Cell::new(0),
         unparseable: Cell::new(0),
     });
     let (tx, rx) = local_sync::mpsc::unbounded::channel::<Event>();
@@ -469,10 +461,6 @@ mod tests {
     impl EventSender {
         pub(crate) fn dropped_total(&self) -> u64 {
             self.state.dropped.get()
-        }
-
-        pub(crate) fn closed_discards_total(&self) -> u64 {
-            self.state.closed_discards.get()
         }
 
         pub(crate) fn unparseable_total(&self) -> u64 {
