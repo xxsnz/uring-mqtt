@@ -436,41 +436,30 @@ mod tests {
     #[test]
     fn reading_logs_on_first_and_every_hundredth_with_the_running_total() {
         const PAYLOAD: [u8; 4] = [0x09, 0xC4, 0x03, 0xF5];
+        // Two full cadence periods, so the 200th reading must log as well.
+        const READINGS: u64 = 200;
 
         let readings = AtomicU64::new(0);
         let rejected = AtomicU64::new(0);
         let logs = captured_with_spec("info", || {
-            for _ in 0..100 {
+            for _ in 0..READINGS {
                 record_payload("t", &PAYLOAD, &readings, &rejected);
             }
         });
 
-        assert_eq!(readings.load(Ordering::Relaxed), 100, "readings count");
+        assert_eq!(readings.load(Ordering::Relaxed), READINGS, "readings count");
         assert_eq!(rejected.load(Ordering::Relaxed), 0, "rejected count");
 
-        let info_lines: Vec<&str> = logs
+        let labels: Vec<&str> = logs
             .lines()
             .filter(|l| l.split_whitespace().nth(1) == Some("INFO"))
+            .filter_map(|l| l.split("Reading #").nth(1))
+            .filter_map(|rest| rest.split(':').next())
             .collect();
-        assert!(
-            info_lines.iter().any(|l| l.contains("Reading #1:")),
-            "first reading must be labelled #1, got:\n{logs}"
-        );
-        assert!(
-            info_lines.iter().any(|l| l.contains("Reading #100:")),
-            "hundredth reading must be labelled #100, got:\n{logs}"
-        );
-        assert!(
-            !info_lines.iter().any(|l| l.contains("Reading #0:")),
-            "no reading may be labelled #0, got:\n{logs}"
-        );
-        let reading_lines = info_lines
-            .iter()
-            .filter(|l| l.contains("Reading #"))
-            .count();
         assert_eq!(
-            reading_lines, 2,
-            "exactly the 1st and 100th readings, got {reading_lines}:\n{logs}"
+            labels,
+            ["1", "100", "200"],
+            "expected exactly the 1st, 100th and 200th readings, labelled with the running total, got:\n{logs}"
         );
     }
 }
