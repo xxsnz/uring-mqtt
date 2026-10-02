@@ -25,23 +25,19 @@ fn main() -> Result<(), uring_mqtt::Error> {
 }
 ```
 
-### With Event Callback
+### With a Publish Callback
 
 ```rust
 use std::sync::Arc;
-use uring_mqtt::{BrokerConfig, Event, MqttBroker};
+use uring_mqtt::{BrokerConfig, MqttBroker, Publish};
 
 fn main() -> Result<(), uring_mqtt::Error> {
     let config = BrokerConfig::new("0.0.0.0:1883");
 
-    let callback = Arc::new(|event: Event| {
-        match event {
-            Event::SensorV1 { temperature, pressure } => {
-                println!("T: {:.2}°C, P: {} hPa",
-                    f32::from(temperature) / 100.0,
-                    pressure);
-            }
-        }
+    let callback = Arc::new(|publish: &Publish| {
+        // `{:?}` escapes the topic: a client-chosen topic carrying CR/LF
+        // would otherwise forge what looks like a second output line.
+        println!("{:?}: {} bytes", publish.topic(), publish.payload().len());
     });
 
     MqttBroker::run_with_callback(config, Some(callback))

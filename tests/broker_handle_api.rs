@@ -3,13 +3,15 @@
 //! ingest server through `BrokerHandle::is_running` (AC-10, AC-11), and an
 //! embedder that calls `run_with_callback` at the default worker count gets
 //! `Err(Error::Worker(_))` back instead of a hang when a callback panics
-//! (AC-6, AC-7). The in-crate tests cover the same criteria from inside
+//! (AC-6, AC-7). An embedder also builds a `Publish` with the public
+//! constructor and runs its own callback against it, with no server at all
+//! (AC-22). The in-crate tests cover the same criteria from inside
 //! `src/broker/mod.rs`; these prove the workflows are reachable through the
 //! published API only.
 
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
-use uring_mqtt::{BrokerConfig, Error, Event, MqttBroker};
+use uring_mqtt::{BrokerConfig, Error, MqttBroker, Publish, PublishCallback, QoS};
 
 /// Workers started by the retained-handle test — more than one, so the
 /// signal is not trivially satisfied by a single dying thread.
@@ -94,13 +96,18 @@ fn connect_and_publish(
 }
 
 /// A callback that panics on `PANIC_TEMPERATURE` and ignores every other
-/// reading. `EventCallback` is not re-exported at the crate root, so an
-/// embedder spells the trait-object type out — as this does.
-fn panicking_callback() -> std::sync::Arc<dyn Fn(Event) + Send + Sync> {
-    std::sync::Arc::new(|event| {
-        let Event::SensorV1 { temperature, .. } = event;
+/// reading. `PublishCallback` is re-exported at the crate root, so the
+/// embedder uses the named alias rather than spelling the trait-object type.
+fn panicking_callback() -> PublishCallback {
+    std::sync::Arc::new(|event: &Publish| {
+        let payload = event.payload();
         assert!(
-            temperature != PANIC_TEMPERATURE,
+            payload.len() >= 2,
+            "test publishes must encode the marker in payload[0..2]"
+        );
+        let marker = i16::from_be_bytes([payload[0], payload[1]]);
+        assert!(
+            marker != PANIC_TEMPERATURE,
             "integration test callback panic"
         );
     })
@@ -200,6 +207,127 @@ fn run_with_callback_returns_worker_error_when_a_callback_panics() {
     assert!(
         elapsed <= RUN_RETURN_BOUND,
         "run_with_callback returned only after {elapsed:?}"
+    );
+}
+
+/// AC-22 — the embedder workflow `Publish::new` exists for (Q9): a callback is
+/// unit-tested through the published API alone, with no io_uring server. Every
+/// QoS variant round-trips through the accessors, and the constructed value
+/// drives a real `PublishCallback`.
+#[test]
+fn publish_constructed_through_the_public_api_drives_a_callback() {
+    /// Topic and payload the constructor must hand back unchanged.
+    const TOPIC: &str = "sensors/rack-1/temp";
+    const PAYLOAD: [u8; 4] = [0x09, 0xC4, 0x03, 0xF5];
+
+    /// What the callback recorded for one publish: topic, payload length,
+    /// QoS and RETAIN.
+    type SeenPublish = (String, usize, QoS, bool);
+    type SeenSink = std::sync::Arc<std::sync::Mutex<Vec<SeenPublish>>>;
+
+    let seen: SeenSink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let callback: PublishCallback = std::sync::Arc::new(move |event: &Publish| {
+        sink.lock().expect("sink poisoned").push((
+            event.topic().to_string(),
+            event.payload().len(),
+            event.qos(),
+            event.retain(),
+        ));
+    });
+
+    for (qos, retain) in [
+        (QoS::AtMostOnce, false),
+        (QoS::AtLeastOnce, true),
+        (QoS::ExactlyOnce, false),
+    ] {
+        let publish = Publish::new(TOPIC, &PAYLOAD, qos, retain);
+        assert_eq!(publish.topic(), TOPIC, "topic round-trip for {qos:?}");
+        assert_eq!(
+            publish.payload(),
+            &PAYLOAD,
+            "payload round-trip for {qos:?}"
+        );
+        assert_eq!(publish.qos(), qos, "qos round-trip");
+        assert_eq!(publish.retain(), retain, "retain round-trip for {qos:?}");
+        callback(&publish);
+    }
+
+    let seen = seen.lock().expect("sink poisoned").clone();
+    assert_eq!(
+        seen,
+        vec![
+            (TOPIC.to_string(), PAYLOAD.len(), QoS::AtMostOnce, false),
+            (TOPIC.to_string(), PAYLOAD.len(), QoS::AtLeastOnce, true),
+            (TOPIC.to_string(), PAYLOAD.len(), QoS::ExactlyOnce, false),
+        ],
+        "callback saw every constructed publish unchanged"
+    );
+}
+
+/// AC-9, AC-10 — the drop total is part of the published surface: an embedder
+/// holding a `BrokerHandle` calls `dropped_publishes` and gets 0 while its
+/// callback keeps up with real traffic. The in-crate tests force overflow
+/// through a test-only hook; from outside the crate only the public getter and
+/// its value on a server that drops nothing are observable, which is exactly
+/// what an embedder's monitoring loop depends on.
+#[test]
+fn dropped_publishes_reads_zero_through_the_published_api_while_the_callback_keeps_up() {
+    /// Temperature of the one reading this test publishes — any value the
+    /// panicking callback does not key on.
+    const QUIET_TEMPERATURE: i16 = 2500;
+
+    let (tx, rx) = std::sync::mpsc::channel::<(bool, u64, u64)>();
+    let _h = std::thread::Builder::new()
+        .name("api-dropped-publishes".into())
+        .spawn(move || {
+            let outcome = (|| -> Result<(), Error> {
+                let port = find_free_port();
+                let addr: std::net::SocketAddr = format!("127.0.0.1:{port}")
+                    .parse()
+                    .expect("parse loopback addr");
+                let config = BrokerConfig::new(format!("127.0.0.1:{port}"))
+                    .num_workers(WORKERS)
+                    .drain_timeout_secs(DRAIN_TIMEOUT_SECS);
+
+                let (seen_tx, seen_rx) = std::sync::mpsc::channel::<usize>();
+                let callback: PublishCallback = std::sync::Arc::new(move |publish: &Publish| {
+                    let _ = seen_tx.send(publish.payload().len());
+                });
+                let handle = MqttBroker::start_with_callback(config, Some(callback))?;
+                let before = handle.dropped_publishes();
+
+                let client = connect_and_publish(addr, QUIET_TEMPERATURE)
+                    .map_err(|_| Error::Worker("publish did not reach the server".into()))?;
+                // The callback ran, so the publish was not discarded — the
+                // 0 below is a drop total on a server that did ingest, not on
+                // an idle one.
+                let delivered = seen_rx.recv_timeout(HARNESS_TIMEOUT).is_ok();
+                let after = handle.dropped_publishes();
+
+                drop(client);
+                handle.shutdown();
+                drop(handle);
+                let _ = tx.send((delivered, before, after));
+                Ok(())
+            })();
+            if outcome.is_err() {
+                let _ = tx.send((false, u64::MAX, u64::MAX));
+            }
+        })
+        .expect("spawn harness");
+
+    let Ok((delivered, before, after)) = rx.recv_timeout(HARNESS_TIMEOUT) else {
+        panic!("harness did not report within {HARNESS_TIMEOUT:?}")
+    };
+    assert!(
+        delivered,
+        "the callback never ran, so the drop total below would prove nothing"
+    );
+    assert_eq!(before, 0, "a freshly started server reported a drop");
+    assert_eq!(
+        after, 0,
+        "a publish the callback received was counted as dropped"
     );
 }
 

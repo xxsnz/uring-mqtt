@@ -2,9 +2,11 @@ use monoio::io::{AsyncReadRent, Canceller};
 use monoio::net::{ListenerConfig, TcpListener};
 use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use super::handler::handle_client;
-use super::{BrokerConfig, Event, EventCallback};
+use super::{BrokerConfig, Publish, PublishCallback};
 use crate::error::Error;
 use crate::pool::BufferPool;
 
@@ -91,34 +93,32 @@ fn should_log_count(total: u64) -> bool {
 
 /// Shared bookkeeping between sender clones and the receiver.
 struct EventChannelState {
-    depth: Cell<usize>,     // events currently queued
-    dropped: Cell<u64>,     // lifetime overflow drops (never reset)
-    unparseable: Cell<u64>, // lifetime payloads no parser could read
+    depth: Cell<usize>,      // events currently queued
+    dropped: Arc<AtomicU64>, // lifetime overflow drops (never reset); read by BrokerHandle
 }
 
 #[derive(Clone)]
 pub(crate) struct EventSender {
-    tx: local_sync::mpsc::unbounded::Tx<Event>,
+    tx: local_sync::mpsc::unbounded::Tx<Publish>,
     state: Rc<EventChannelState>,
     worker_id: usize,
 }
 
 impl EventSender {
-    /// Offers `event` to the worker's callback. A full channel increments the
+    /// Offers `publish` to the worker's callback. A full channel increments the
     /// drop counter and warns on the `should_log_count` cadence; a receiver
     /// that has gone away is debug-logged only, and is not counted. Either way
     /// the event is discarded and the caller is not told: a QoS 1 PUBACK and a
     /// QoS 2 PUBREC are both sent for every well-formed PUBLISH regardless, so
-    /// a publisher is never left holding an inflight slot for a reading this
+    /// a publisher is never left holding an inflight slot for a publish this
     /// broker has dropped.
-    pub(crate) fn send(&self, event: Event) {
+    pub(crate) fn send(&self, publish: Publish) {
         if self.tx.is_closed() {
             self.note_closed();
             return;
         }
         if self.state.depth.get() >= EVENT_CHANNEL_CAPACITY {
-            let total = self.state.dropped.get() + 1;
-            self.state.dropped.set(total);
+            let total = self.state.dropped.fetch_add(1, Ordering::Relaxed) + 1;
             if should_log_count(total) {
                 tracing::warn!(
                     "worker {}: event channel full, dropped event ({} dropped total)",
@@ -128,7 +128,7 @@ impl EventSender {
             }
             return;
         }
-        if let Ok(()) = self.tx.send(event) {
+        if let Ok(()) = self.tx.send(publish) {
             self.state.depth.set(self.state.depth.get() + 1);
         } else {
             self.note_closed();
@@ -146,22 +146,6 @@ impl EventSender {
         );
     }
 
-    /// Count one PUBLISH payload no parser could read, and warn on the
-    /// `should_log_count` cadence. The PUBLISH is still acknowledged, so
-    /// without this counter a stream of malformed readings is indistinguishable
-    /// from successful ingest.
-    pub(crate) fn note_unparseable_payload(&self) {
-        let total = self.state.unparseable.get() + 1;
-        self.state.unparseable.set(total);
-        if should_log_count(total) {
-            tracing::warn!(
-                "worker {}: unparseable PUBLISH payload, reading discarded ({} unparseable total)",
-                self.worker_id,
-                total
-            );
-        }
-    }
-
     /// Events currently queued behind this sender.
     #[cfg(test)]
     fn queued_depth(&self) -> usize {
@@ -170,12 +154,12 @@ impl EventSender {
 }
 
 pub(crate) struct EventReceiver {
-    rx: local_sync::mpsc::unbounded::Rx<Event>,
+    rx: local_sync::mpsc::unbounded::Rx<Publish>,
     state: Rc<EventChannelState>,
 }
 
 impl EventReceiver {
-    pub(crate) async fn recv(&mut self) -> Option<Event> {
+    pub(crate) async fn recv(&mut self) -> Option<Publish> {
         let item = self.rx.recv().await;
         if item.is_some() {
             self.state.depth.set(self.state.depth.get() - 1);
@@ -185,13 +169,15 @@ impl EventReceiver {
 }
 
 /// Build a new bounded facade over a `local-sync` unbounded channel.
-pub(crate) fn event_channel(worker_id: usize) -> (EventSender, EventReceiver) {
+pub(crate) fn event_channel(
+    worker_id: usize,
+    dropped: Arc<AtomicU64>,
+) -> (EventSender, EventReceiver) {
     let state = Rc::new(EventChannelState {
         depth: Cell::new(0),
-        dropped: Cell::new(0),
-        unparseable: Cell::new(0),
+        dropped,
     });
-    let (tx, rx) = local_sync::mpsc::unbounded::channel::<Event>();
+    let (tx, rx) = local_sync::mpsc::unbounded::channel::<Publish>();
     (
         EventSender {
             tx,
@@ -200,6 +186,36 @@ pub(crate) fn event_channel(worker_id: usize) -> (EventSender, EventReceiver) {
         },
         EventReceiver { rx, state },
     )
+}
+
+/// Test hook: per `BrokerConfig::overflow_token`, how many publishes beyond
+/// capacity each worker (indexed by worker id) offers its own event channel
+/// during setup, before its event processor exists — real per-worker overflow
+/// without depending on TCP read sizes. Keyed by token, not bind address: a
+/// parallel test may reuse the same port, and `SO_REUSEPORT` lets both bind.
+#[cfg(test)]
+pub(crate) static SETUP_OVERFLOW: std::sync::Mutex<Vec<(u64, Vec<usize>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Fill `tx` to capacity and overflow it by this worker's `SETUP_OVERFLOW`
+/// entry. No token, or no entry for it, offers nothing.
+#[cfg(test)]
+fn force_setup_overflow(token: Option<u64>, worker_id: usize, tx: &EventSender) {
+    let Some(token) = token else {
+        return;
+    };
+    let Some(overflow) = SETUP_OVERFLOW
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(key, _)| *key == token)
+        .and_then(|(_, per_worker)| per_worker.get(worker_id).copied())
+    else {
+        return;
+    };
+    for _ in 0..EVENT_CHANNEL_CAPACITY + overflow {
+        tx.send(Publish::fixture("t", &[]));
+    }
 }
 
 /// Set by a worker once it passes the go barrier. Read by that thread's
@@ -229,15 +245,18 @@ impl PostGoFlag {
 /// own report (panic → drop → channel disconnect). Blocking `go_rx.recv()` is
 /// safe — nothing else progresses on this runtime until the accept loop
 /// starts.
-#[allow(clippy::too_many_lines)] // shutdown/drain machinery (watcher, cancelable_accept, done-channel, abort select, deadline force-close) pushes the body past the pedantic 100-line boundary; mirrors handler.rs's identical allowance
+#[allow(clippy::too_many_lines)]
+// shutdown/drain machinery (watcher, cancelable_accept, done-channel, abort select, deadline force-close) pushes the body past the pedantic 100-line boundary; mirrors handler.rs's identical allowance
+#[allow(clippy::too_many_arguments)] // every argument is a distinct per-worker resource start_with_callback creates before the thread exists
 pub async fn run_worker(
     worker_id: usize,
     config: BrokerConfig,
-    callback: Option<EventCallback>,
+    callback: Option<PublishCallback>,
     ready_tx: std::sync::mpsc::Sender<(usize, Result<(), Error>)>,
     go_rx: std::sync::mpsc::Receiver<bool>,
     shutdown_signal: std::os::unix::net::UnixStream,
     post_go: PostGoFlag,
+    dropped: Arc<AtomicU64>,
 ) -> Result<(), Error> {
     tracing::info!("Worker {} starting", worker_id);
 
@@ -285,7 +304,10 @@ pub async fn run_worker(
     ));
 
     // Thread-local event channel
-    let (event_tx, event_rx) = event_channel(worker_id);
+    let (event_tx, event_rx) = event_channel(worker_id, dropped);
+
+    #[cfg(test)]
+    force_setup_overflow(config.overflow_token, worker_id, &event_tx);
 
     // Spawn event processor task
     let callback_clone = callback.clone();
@@ -435,12 +457,12 @@ pub async fn run_worker(
 }
 
 /// Process events from the local channel.
-async fn process_events(mut rx: EventReceiver, callback: Option<EventCallback>) {
-    while let Some(event) = rx.recv().await {
+async fn process_events(mut rx: EventReceiver, callback: Option<PublishCallback>) {
+    while let Some(publish) = rx.recv().await {
         if let Some(ref cb) = callback {
-            cb(event);
+            cb(&publish);
         } else {
-            tracing::trace!("Event: {:?}", event);
+            tracing::trace!("Publish: {:?}", publish);
         }
     }
 }
@@ -460,11 +482,7 @@ mod tests {
 
     impl EventSender {
         pub(crate) fn dropped_total(&self) -> u64 {
-            self.state.dropped.get()
-        }
-
-        pub(crate) fn unparseable_total(&self) -> u64 {
-            self.state.unparseable.get()
+            self.state.dropped.load(Ordering::Relaxed)
         }
     }
 
@@ -504,30 +522,24 @@ mod tests {
         fut.as_mut().poll(&mut ctx)
     }
 
-    /// Try to receive the next event with a fresh future on each call. The
+    /// Try to receive the next publish with a fresh future on each call. The
     /// `recv` future returned by `local_sync` is single-shot, and the borrow
     /// checker forces a fresh borrow of `rx` per call to release the previous
     /// one before another `rx.recv()` can be issued.
-    fn try_recv(rx: &mut EventReceiver, waker: &Waker) -> Poll<Option<Event>> {
+    fn try_recv(rx: &mut EventReceiver, waker: &Waker) -> Poll<Option<Publish>> {
         let mut fut = pin!(rx.recv());
         poll_once(&mut fut, waker)
     }
 
     #[test]
     fn event_yielded_when_channel_not_full() {
-        let (tx, mut rx) = event_channel(0);
-        tx.send(Event::SensorV1 {
-            temperature: 2500,
-            pressure: 1013,
-        });
+        let (tx, mut rx) = event_channel(0, Arc::default());
+        tx.send(Publish::fixture("t", &[0x09, 0xC4, 0x03, 0xF5]));
         let (waker_arc, waker) = flag_waker();
         match try_recv(&mut rx, &waker) {
-            Poll::Ready(Some(Event::SensorV1 {
-                temperature,
-                pressure,
-            })) => {
-                assert_eq!(temperature, 2500);
-                assert_eq!(pressure, 1013);
+            Poll::Ready(Some(publish)) => {
+                assert_eq!(publish.topic(), "t");
+                assert_eq!(publish.payload(), &[0x09, 0xC4, 0x03, 0xF5][..]);
             }
             other => panic!("expected Ready(Some), got {other:?}"),
         }
@@ -539,21 +551,20 @@ mod tests {
 
     #[test]
     fn channel_accepts_exactly_capacity_and_drops_the_rest() {
-        let (tx1, mut rx) = event_channel(0);
+        let (tx1, mut rx) = event_channel(0, Arc::default());
         let tx2 = tx1.clone();
         let total = EVENT_CHANNEL_CAPACITY + 3;
         for i in 0..total {
-            let t = i16::try_from(i).expect("fixture index fits i16");
+            let publish = Publish::fixture(
+                "t",
+                &u32::try_from(i)
+                    .expect("fixture index fits u32")
+                    .to_be_bytes(),
+            );
             if i % 2 == 0 {
-                tx1.send(Event::SensorV1 {
-                    temperature: t,
-                    pressure: u16::try_from(i).expect("fixture index fits u16"),
-                });
+                tx1.send(publish);
             } else {
-                tx2.send(Event::SensorV1 {
-                    temperature: t,
-                    pressure: u16::try_from(i).expect("fixture index fits u16"),
-                });
+                tx2.send(publish);
             }
         }
         assert_eq!(tx1.dropped_total(), 3);
@@ -566,8 +577,10 @@ mod tests {
         let mut received = Vec::with_capacity(EVENT_CHANNEL_CAPACITY);
         for _ in 0..EVENT_CHANNEL_CAPACITY {
             match try_recv(&mut rx, &waker) {
-                Poll::Ready(Some(Event::SensorV1 { temperature, .. })) => {
-                    received.push(temperature);
+                Poll::Ready(Some(publish)) => {
+                    received.push(u32::from_be_bytes(
+                        publish.payload().try_into().expect("4-byte key"),
+                    ));
                 }
                 other => panic!("expected Ready(Some), got {other:?}"),
             }
@@ -577,10 +590,10 @@ mod tests {
 
         assert_eq!(received.len(), EVENT_CHANNEL_CAPACITY);
         // First EVENT_CHANNEL_CAPACITY distinct indices, in send order.
-        for (idx, temp) in received.iter().enumerate() {
+        for (idx, key) in received.iter().enumerate() {
             assert_eq!(
-                *temp,
-                i16::try_from(idx).expect("fixture index fits i16"),
+                *key,
+                u32::try_from(idx).expect("fixture index fits u32"),
                 "received index {idx} out of order"
             );
         }
@@ -594,18 +607,12 @@ mod tests {
     /// (`acks_qos1_publish_when_ingest_receiver_is_closed`).
     #[test]
     fn full_channel_send_is_dropped_without_occupying_a_slot() {
-        let (tx, _rx) = event_channel(0);
-        for i in 0..EVENT_CHANNEL_CAPACITY {
-            tx.send(Event::SensorV1 {
-                temperature: i16::try_from(i).expect("fixture index fits i16"),
-                pressure: 1013,
-            });
+        let (tx, _rx) = event_channel(0, Arc::default());
+        for _ in 0..EVENT_CHANNEL_CAPACITY {
+            tx.send(Publish::fixture("t", &[]));
         }
         assert_eq!(tx.queued_depth(), EVENT_CHANNEL_CAPACITY);
-        tx.send(Event::SensorV1 {
-            temperature: 0,
-            pressure: 1013,
-        });
+        tx.send(Publish::fixture("t", &[]));
         assert_eq!(tx.dropped_total(), 1);
         assert_eq!(
             tx.queued_depth(),
@@ -616,20 +623,14 @@ mod tests {
 
     #[test]
     fn sender_recovers_after_drain() {
-        let (tx, mut rx) = event_channel(0);
+        let (tx, mut rx) = event_channel(0, Arc::default());
         let (_, waker) = flag_waker();
 
         // Fill to capacity; one extra is dropped.
-        for i in 0..EVENT_CHANNEL_CAPACITY {
-            tx.send(Event::SensorV1 {
-                temperature: i16::try_from(i).expect("fits i16"),
-                pressure: 0,
-            });
+        for _ in 0..EVENT_CHANNEL_CAPACITY {
+            tx.send(Publish::fixture("t", &[]));
         }
-        tx.send(Event::SensorV1 {
-            temperature: 9999,
-            pressure: 0,
-        });
+        tx.send(Publish::fixture("t", &[]));
         assert_eq!(tx.dropped_total(), 1);
 
         // Drain everything via manual polls.
@@ -641,17 +642,10 @@ mod tests {
         }
 
         // Sender recovers; the next send succeeds and is deliverable.
-        tx.send(Event::SensorV1 {
-            temperature: 1234,
-            pressure: 7,
-        });
+        tx.send(Publish::fixture("t", &[0x04, 0xD2, 0x00, 0x07]));
         match try_recv(&mut rx, &waker) {
-            Poll::Ready(Some(Event::SensorV1 {
-                temperature,
-                pressure,
-            })) => {
-                assert_eq!(temperature, 1234);
-                assert_eq!(pressure, 7);
+            Poll::Ready(Some(publish)) => {
+                assert_eq!(publish.payload(), &[0x04, 0xD2, 0x00, 0x07][..]);
             }
             other => panic!("expected Ready(Some), got {other:?}"),
         }
@@ -660,7 +654,7 @@ mod tests {
 
     #[test]
     fn recv_pending_is_woken_by_send() {
-        let (tx, mut rx) = event_channel(0);
+        let (tx, mut rx) = event_channel(0, Arc::default());
         let (waker_arc, waker) = flag_waker();
 
         // Empty channel: poll must return Pending, flag stays false.
@@ -670,10 +664,7 @@ mod tests {
             "waker fired without cause"
         );
 
-        tx.send(Event::SensorV1 {
-            temperature: 2500,
-            pressure: 1013,
-        });
+        tx.send(Publish::fixture("t", &[0x09, 0xC4, 0x03, 0xF5]));
         assert!(
             waker_arc.flag.load(AtomicOrdering::SeqCst),
             "send did not wake pending recv"
@@ -681,12 +672,9 @@ mod tests {
 
         // Re-poll with the now-woken context: must yield the queued event.
         match try_recv(&mut rx, &waker) {
-            Poll::Ready(Some(Event::SensorV1 {
-                temperature,
-                pressure,
-            })) => {
-                assert_eq!(temperature, 2500);
-                assert_eq!(pressure, 1013);
+            Poll::Ready(Some(publish)) => {
+                assert_eq!(publish.topic(), "t");
+                assert_eq!(publish.payload(), &[0x09, 0xC4, 0x03, 0xF5][..]);
             }
             other => panic!("expected Ready(Some), got {other:?}"),
         }
@@ -694,7 +682,7 @@ mod tests {
 
     #[test]
     fn dropping_last_sender_wakes_pending_recv() {
-        let (tx, mut rx) = event_channel(0);
+        let (tx, mut rx) = event_channel(0, Arc::default());
         let (waker_arc, waker) = flag_waker();
 
         assert!(matches!(try_recv(&mut rx, &waker), Poll::Pending));
@@ -810,6 +798,7 @@ mod tests {
                     go_rx,
                     sig_worker,
                     PostGoFlag::unarmed(),
+                    Arc::default(),
                 ));
                 let _ = res_tx.send(r);
             })
@@ -924,6 +913,7 @@ mod tests {
                     go_rx,
                     sig_worker,
                     PostGoFlag::unarmed(),
+                    Arc::default(),
                 ));
                 let _ = res_tx.send(r);
             })
@@ -972,6 +962,7 @@ mod tests {
                     go_rx,
                     sig_worker,
                     post_go.clone(),
+                    Arc::default(),
                 ));
                 let _ = res_tx.send((r, post_go.is_armed()));
             })
@@ -1019,6 +1010,7 @@ mod tests {
                     go_rx,
                     sig_worker,
                     post_go.clone(),
+                    Arc::default(),
                 ));
                 let _ = res_tx.send((r, post_go.is_armed()));
             })
@@ -1066,6 +1058,7 @@ mod tests {
                     go_rx,
                     sig_worker,
                     post_go.clone(),
+                    Arc::default(),
                 ));
                 let _ = res_tx.send((r, post_go.is_armed()));
             })
@@ -1134,6 +1127,7 @@ mod tests {
                     go_a_rx,
                     sig_a_worker,
                     PostGoFlag::unarmed(),
+                    Arc::default(),
                 ));
                 let _ = res_a_tx.send(r);
             })
@@ -1153,6 +1147,7 @@ mod tests {
                     go_b_rx,
                     sig_b_worker,
                     PostGoFlag::unarmed(),
+                    Arc::default(),
                 ));
                 let _ = res_b_tx.send(r);
             })
@@ -1253,6 +1248,7 @@ mod tests {
                     go_a_rx,
                     sig_a_worker,
                     PostGoFlag::unarmed(),
+                    Arc::default(),
                 ));
                 let _ = res_a_tx.send(r);
             })
@@ -1273,6 +1269,7 @@ mod tests {
                         go_b_rx,
                         sig_b_worker,
                         PostGoFlag::unarmed(),
+                        Arc::default(),
                     ))
                 }));
                 let _ = res_b_tx.send(r);
@@ -1394,6 +1391,7 @@ mod tests {
                     go_rx,
                     sig_worker,
                     PostGoFlag::unarmed(),
+                    Arc::default(),
                 ));
                 let _ = res_tx.send(r);
             })
@@ -1463,6 +1461,7 @@ mod tests {
                     go_rx,
                     sig_worker,
                     PostGoFlag::unarmed(),
+                    Arc::default(),
                 ));
                 let _ = res_tx.send(r);
             })
@@ -1555,6 +1554,7 @@ mod tests {
                     go_rx,
                     sig_worker,
                     PostGoFlag::unarmed(),
+                    Arc::default(),
                 ));
                 let _ = res_tx.send(r);
             })
@@ -1651,6 +1651,7 @@ mod tests {
                     go_rx,
                     sig_worker,
                     PostGoFlag::unarmed(),
+                    Arc::default(),
                 ));
                 let _ = res_tx.send(r);
             })
@@ -1737,6 +1738,7 @@ mod tests {
                     go_rx,
                     sig_worker,
                     PostGoFlag::unarmed(),
+                    Arc::default(),
                 ));
                 let _ = res_tx.send(r);
             })
@@ -1802,6 +1804,7 @@ mod tests {
                     go_rx,
                     sig_worker,
                     PostGoFlag::unarmed(),
+                    Arc::default(),
                 ));
                 let _ = res_tx.send(r);
             })

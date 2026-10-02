@@ -162,6 +162,10 @@ pub(crate) enum Violation {
     AuthNotNegotiated,
     /// PUBLISH whose QoS exceeds `handshake::MAX_QOS`.
     PublishQosAboveMaximum,
+    /// PUBLISH whose topic name is empty or contains `+` or `#`.
+    InvalidTopicName,
+    /// v5 PUBLISH carrying a Topic Alias; the CONNACK advertises a Topic Alias Maximum of 0.
+    TopicAliasInvalid,
     /// The framed stream yielded a decoder rejection mid-session.
     MalformedPacket,
     /// `MqttPacket::Version(_)`. Unreachable through `CodecPair`; closes
@@ -198,6 +202,12 @@ impl Violation {
             Violation::VersionProbe => {
                 "protocol violation: codec yielded a bare protocol-version item"
             }
+            Violation::InvalidTopicName => {
+                "protocol violation: PUBLISH topic name empty or containing a wildcard"
+            }
+            Violation::TopicAliasInvalid => {
+                "protocol violation: PUBLISH topic alias without an advertised alias maximum"
+            }
         }
     }
 
@@ -218,7 +228,9 @@ impl Violation {
                 | Violation::AuthNotNegotiated
                 | Violation::PublishQosAboveMaximum
                 | Violation::MalformedPacket
-                | Violation::VersionProbe,
+                | Violation::VersionProbe
+                | Violation::InvalidTopicName
+                | Violation::TopicAliasInvalid,
                 ProtocolVersion::MQTT3,
             ) => None,
             (
@@ -228,7 +240,8 @@ impl Violation {
                 | Violation::ServerOnlyPacket
                 | Violation::PublishAckFromClient
                 | Violation::AuthNotNegotiated
-                | Violation::VersionProbe,
+                | Violation::VersionProbe
+                | Violation::InvalidTopicName,
                 ProtocolVersion::MQTT5,
             ) => Some(rmqtt_codec::v5::DisconnectReasonCode::ProtocolError),
             (Violation::MalformedPacket, ProtocolVersion::MQTT5) => {
@@ -239,6 +252,9 @@ impl Violation {
             }
             (Violation::PublishQosAboveMaximum, ProtocolVersion::MQTT5) => {
                 Some(rmqtt_codec::v5::DisconnectReasonCode::QosNotSupported)
+            }
+            (Violation::TopicAliasInvalid, ProtocolVersion::MQTT5) => {
+                Some(rmqtt_codec::v5::DisconnectReasonCode::TopicAliasInvalid)
             }
         }
     }
@@ -431,6 +447,16 @@ pub(crate) fn dispatch<'a>(
             if publish.qos > crate::broker::handshake::MAX_QOS {
                 return Disposition::Violation(Violation::PublishQosAboveMaximum);
             }
+            if publish
+                .properties
+                .as_ref()
+                .is_some_and(|p| p.topic_alias.is_some())
+            {
+                return Disposition::Violation(Violation::TopicAliasInvalid);
+            }
+            if let Some(violation) = topic_name_violation(&publish.topic) {
+                return Disposition::Violation(violation);
+            }
             match (publish.qos, publish.packet_id) {
                 (QoS::AtMostOnce, _) => Disposition::Deliver(publish),
                 (QoS::AtLeastOnce, Some(id)) => {
@@ -503,6 +529,22 @@ pub(crate) fn dispatch<'a>(
         ) => Disposition::Violation(Violation::PublishAckFromClient),
         MqttPacket::V5(PacketV5::Auth(_)) => Disposition::Violation(Violation::AuthNotNegotiated),
         MqttPacket::Version(_) => Disposition::Violation(Violation::VersionProbe),
+    }
+}
+
+/// Classify a PUBLISH topic name under the validity rules an embedder's
+/// `on_publish` callback depends on. A topic containing U+0000 makes the
+/// MQTT string malformed (MQTT 5.0 §1.5.4); an empty topic name without a
+/// Topic Alias, or one containing the wildcard characters `+` / `#`, is a
+/// protocol error (MQTT 5.0 §3.3.2.1, MQTT 5.0 §4.13 error handling). A
+/// non-empty topic with no wildcards and no NUL passes.
+fn topic_name_violation(topic: &str) -> Option<Violation> {
+    if topic.contains('\0') {
+        Some(Violation::MalformedPacket)
+    } else if topic.is_empty() || topic.contains('+') || topic.contains('#') {
+        Some(Violation::InvalidTopicName)
+    } else {
+        None
     }
 }
 
@@ -771,6 +813,39 @@ mod tests {
             packet_id,
             payload: bytes::Bytes::from_static(&[0x09, 0xC4, 0x03, 0xF5]),
             properties: None,
+        };
+        MqttPacket::V5(PacketV5::Publish(Box::new(publish)))
+    }
+
+    /// v3 PUBLISH with a caller-chosen topic, QoS and packet id.
+    fn v3_publish(topic: &str, qos: QoS, packet_id: Option<NonZeroU16>) -> MqttPacket {
+        let publish = TypesPublish {
+            dup: false,
+            retain: false,
+            qos,
+            topic: topic.into(),
+            packet_id,
+            payload: bytes::Bytes::from_static(&[0x09, 0xC4, 0x03, 0xF5]),
+            properties: None,
+        };
+        MqttPacket::V3(PacketV3::Publish(Box::new(publish)))
+    }
+
+    /// v5 PUBLISH with a caller-chosen topic, QoS, packet id and properties.
+    fn v5_publish_with_properties(
+        topic: &str,
+        qos: QoS,
+        packet_id: Option<NonZeroU16>,
+        properties: Option<rmqtt_codec::v5::PublishProperties>,
+    ) -> MqttPacket {
+        let publish = TypesPublish {
+            dup: false,
+            retain: false,
+            qos,
+            topic: topic.into(),
+            packet_id,
+            payload: bytes::Bytes::from_static(&[0x09, 0xC4, 0x03, 0xF5]),
+            properties,
         };
         MqttPacket::V5(PacketV5::Publish(Box::new(publish)))
     }
@@ -1762,6 +1837,134 @@ mod tests {
         );
     }
 
+    /// AC-11, AC-11a — a PUBLISH whose topic name is empty, or contains a
+    /// wildcard (`+`, `#`), is `Violation::InvalidTopicName`, checked for v3
+    /// QoS 0, v5 QoS 0 and v3 QoS 2. A NUL byte in the topic is
+    /// `Violation::MalformedPacket` instead. The invalid QoS 2 PUBLISH must
+    /// record nothing in `AwaitingRelease`: a valid QoS 2 PUBLISH reusing the
+    /// same packet id on the same tracker still delivers. A control topic
+    /// containing a literal space, but no wildcard or NUL, still delivers.
+    #[test]
+    fn dispatch_publish_with_invalid_topic_name_is_violation() {
+        let id = NonZeroU16::new(1).expect("non-zero");
+        for topic in ["", "a/+", "a/#"] {
+            let v3 = v3_publish(topic, QoS::AtMostOnce, None);
+            match dispatch(&v3, &mut AwaitingRelease::default()) {
+                Disposition::Violation(Violation::InvalidTopicName) => {}
+                other => {
+                    panic!("expected Violation(InvalidTopicName) for v3 {topic:?}, got {other:?}")
+                }
+            }
+
+            let v5 = v5_publish_with_properties(topic, QoS::AtMostOnce, None, None);
+            match dispatch(&v5, &mut AwaitingRelease::default()) {
+                Disposition::Violation(Violation::InvalidTopicName) => {}
+                other => {
+                    panic!("expected Violation(InvalidTopicName) for v5 {topic:?}, got {other:?}")
+                }
+            }
+
+            let mut awaiting = AwaitingRelease::default();
+            let v3_qos2 = v3_publish(topic, QoS::ExactlyOnce, Some(id));
+            match dispatch(&v3_qos2, &mut awaiting) {
+                Disposition::Violation(Violation::InvalidTopicName) => {}
+                other => panic!(
+                    "expected Violation(InvalidTopicName) for v3 QoS 2 {topic:?}, got {other:?}"
+                ),
+            }
+
+            let valid_qos2 = v3_publish("t", QoS::ExactlyOnce, Some(id));
+            match dispatch(&valid_qos2, &mut awaiting) {
+                Disposition::DeliverThenReply(_, Reply::PublishReceived(got)) => {
+                    assert_eq!(got, id);
+                }
+                other => panic!(
+                    "expected DeliverThenReply(PublishReceived) after the invalid QoS 2 \
+                     PUBLISH recorded nothing, got {other:?}"
+                ),
+            }
+        }
+
+        let nul_topic = "a\0b";
+        let v3 = v3_publish(nul_topic, QoS::AtMostOnce, None);
+        match dispatch(&v3, &mut AwaitingRelease::default()) {
+            Disposition::Violation(Violation::MalformedPacket) => {}
+            other => panic!("expected Violation(MalformedPacket) for v3 NUL topic, got {other:?}"),
+        }
+        let v5 = v5_publish_with_properties(nul_topic, QoS::AtMostOnce, None, None);
+        match dispatch(&v5, &mut AwaitingRelease::default()) {
+            Disposition::Violation(Violation::MalformedPacket) => {}
+            other => panic!("expected Violation(MalformedPacket) for v5 NUL topic, got {other:?}"),
+        }
+
+        let control = v3_publish("a/b c", QoS::AtMostOnce, None);
+        match dispatch(&control, &mut AwaitingRelease::default()) {
+            Disposition::Deliver(_) => {}
+            other => panic!("expected Deliver for control topic \"a/b c\", got {other:?}"),
+        }
+    }
+
+    /// AC-12 — a v5 PUBLISH carrying a Topic Alias is
+    /// `Violation::TopicAliasInvalid`, regardless of its topic name. A v5
+    /// PUBLISH with default properties (no Topic Alias) still delivers.
+    #[test]
+    fn dispatch_v5_publish_with_topic_alias_is_violation() {
+        let alias = NonZeroU16::new(1).expect("non-zero");
+        for topic in ["", "t", "a/#"] {
+            let properties = Some(rmqtt_codec::v5::PublishProperties {
+                topic_alias: Some(alias),
+                ..Default::default()
+            });
+            let v5 = v5_publish_with_properties(topic, QoS::AtMostOnce, None, properties);
+            match dispatch(&v5, &mut AwaitingRelease::default()) {
+                Disposition::Violation(Violation::TopicAliasInvalid) => {}
+                other => panic!(
+                    "expected Violation(TopicAliasInvalid) for topic {topic:?}, got {other:?}"
+                ),
+            }
+        }
+
+        let control = v5_publish_with_properties(
+            "t",
+            QoS::AtMostOnce,
+            None,
+            Some(rmqtt_codec::v5::PublishProperties::default()),
+        );
+        match dispatch(&control, &mut AwaitingRelease::default()) {
+            Disposition::Deliver(_) => {}
+            other => panic!("expected Deliver for default properties, got {other:?}"),
+        }
+    }
+
+    /// AC-13, AC-14 — `InvalidTopicName` disconnects with `ProtocolError`
+    /// (0x82); `TopicAliasInvalid` disconnects with `TopicAliasInvalid`
+    /// (0x94). Neither violation sends a v3 DISCONNECT.
+    #[test]
+    fn topic_violations_disconnect_with_their_v5_reason_codes() {
+        let invalid_topic = Violation::InvalidTopicName
+            .disconnect(ProtocolVersion::MQTT5, None)
+            .expect("v5 disconnect");
+        assert_eq!(
+            encode(invalid_topic, ProtocolVersion::MQTT5),
+            vec![0xE0, 0x02, 0x82, 0x00]
+        );
+
+        let topic_alias = Violation::TopicAliasInvalid
+            .disconnect(ProtocolVersion::MQTT5, None)
+            .expect("v5 disconnect");
+        assert_eq!(
+            encode(topic_alias, ProtocolVersion::MQTT5),
+            vec![0xE0, 0x02, 0x94, 0x00]
+        );
+
+        assert!(Violation::InvalidTopicName
+            .disconnect(ProtocolVersion::MQTT3, None)
+            .is_none());
+        assert!(Violation::TopicAliasInvalid
+            .disconnect(ProtocolVersion::MQTT3, None)
+            .is_none());
+    }
+
     /// AC-17 — a decoder rejection carrying the typed source flags as a
     /// protocol violation. The `DecodeError` is preserved through the IO
     /// adapter at `src/codec/mqtt.rs:60`, so the probe can find it.
@@ -2061,6 +2264,8 @@ mod tests {
             Violation::PublishQosAboveMaximum,
             Violation::MalformedPacket,
             Violation::VersionProbe,
+            Violation::InvalidTopicName,
+            Violation::TopicAliasInvalid,
         ];
         let e0 = encodes();
         for violation in violations {

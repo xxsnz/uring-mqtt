@@ -1,4 +1,4 @@
-//! Simple MQTT broker example using uring-mqtt.
+//! Simple MQTT ingest example using uring-mqtt: decodes SensorV1 readings from every PUBLISH payload.
 //!
 //! Logging: `RUST_LOG` controls verbosity (default `info`). Use
 //! `RUST_LOG=uring_mqtt=debug` for the broker's timeout diagnostics
@@ -8,7 +8,76 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use uring_mqtt::{BrokerConfig, Event, MqttBroker};
+use uring_mqtt::{BrokerConfig, MqttBroker, Publish};
+
+/// SensorV1 reading (temperature in 0.01°C, pressure in hPa).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SensorV1 {
+    temperature: i16,
+    pressure: u16,
+}
+
+/// Exact SensorV1 payload width. The length is the whole format: there is no
+/// version byte and no length prefix, so a payload of any other width is a
+/// different format this parser cannot identify.
+const SENSOR_V1_LEN: usize = 4;
+
+/// Log the first and every LOG_EVERY-th reading, and warn on the first and
+/// every LOG_EVERY-th rejected payload.
+const LOG_EVERY: u64 = 100;
+
+/// Scale from centi-degrees to degrees (SensorV1 stores temperature as i16 in 0.01°C).
+const CENTI_DEGREES_PER_DEGREE: f32 = 100.0;
+
+/// Parse binary sensor data (SensorV1 format).
+///
+/// Format: exactly `SENSOR_V1_LEN` bytes big-endian
+/// - bytes 0-1: temperature (i16, scale 0.01°C)
+/// - bytes 2-3: pressure (u16, scale 1.0 hPa)
+///
+/// A longer payload is rejected rather than truncated: its first four bytes
+/// may not be a reading at all, and the parser cannot tell, so accepting
+/// them could report a reading the publisher never sent.
+#[inline(always)]
+fn parse_sensor_data(data: &[u8]) -> Option<SensorV1> {
+    if data.len() != SENSOR_V1_LEN {
+        return None;
+    }
+    Some(SensorV1 {
+        temperature: i16::from_be_bytes([data[0], data[1]]),
+        pressure: u16::from_be_bytes([data[2], data[3]]),
+    })
+}
+
+/// Decode one PUBLISH payload: count successful readings, count and warn on
+/// anything else so an acknowledged payload never disappears silently at
+/// default log levels.
+fn record_payload(topic: &str, payload: &[u8], readings: &AtomicU64, rejected: &AtomicU64) {
+    if let Some(r) = parse_sensor_data(payload) {
+        // `fetch_add` returns the previous count, so add 1 to report the
+        // running total: the first reading is #1, not #0.
+        let total = readings.fetch_add(1, Ordering::Relaxed) + 1;
+        if total == 1 || total.is_multiple_of(LOG_EVERY) {
+            tracing::info!(
+                "Reading #{}: temp={:.2}°C, pressure={}hPa",
+                total,
+                f32::from(r.temperature) / CENTI_DEGREES_PER_DEGREE,
+                r.pressure
+            );
+        }
+    } else {
+        let total = rejected.fetch_add(1, Ordering::Relaxed) + 1;
+        if total == 1 || total.is_multiple_of(LOG_EVERY) {
+            // `{:?}` renders the topic debug-escaped: a client-chosen topic
+            // carrying CR/LF would otherwise forge what looks like a second
+            // log entry.
+            tracing::warn!(
+                "not a SensorV1 reading on topic {topic:?}: {} bytes ({total} rejected total)",
+                payload.len()
+            );
+        }
+    }
+}
 
 /// Build the example's log filter from a `RUST_LOG`-style spec. An empty
 /// spec defaults to `info` so an unset environment is never silent; a bare
@@ -30,8 +99,9 @@ fn main() -> Result<(), uring_mqtt::Error> {
         .with_env_filter(env_filter_from_env())
         .init();
 
-    // Track events across all workers
-    let event_count = Arc::new(AtomicU64::new(0));
+    // Track readings and rejected payloads across all workers
+    let readings = Arc::new(AtomicU64::new(0));
+    let rejected = Arc::new(AtomicU64::new(0));
 
     // Configure broker
     let config = BrokerConfig::new("0.0.0.0:1883")
@@ -41,25 +111,9 @@ fn main() -> Result<(), uring_mqtt::Error> {
 
     tracing::info!("Starting MQTT broker on 0.0.0.0:1883");
 
-    // Create event callback
-    let counter = event_count.clone();
-    let callback = Arc::new(move |event: Event| {
-        let count = counter.fetch_add(1, Ordering::Relaxed);
-        if count.is_multiple_of(100) {
-            match event {
-                Event::SensorV1 {
-                    temperature,
-                    pressure,
-                } => {
-                    tracing::info!(
-                        "Event #{}: temp={:.2}°C, pressure={}hPa",
-                        count,
-                        f32::from(temperature) / 100.0,
-                        pressure
-                    );
-                }
-            }
-        }
+    // Create the publish callback
+    let callback = Arc::new(move |publish: &Publish| {
+        record_payload(publish.topic(), publish.payload(), &readings, &rejected);
     });
 
     // Start broker (returns once startup completes; handle owns the lifecycle)
@@ -81,7 +135,10 @@ fn main() -> Result<(), uring_mqtt::Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{env_filter, env_filter_from_env};
+    use super::{
+        env_filter, env_filter_from_env, parse_sensor_data, record_payload, SensorV1, SENSOR_V1_LEN,
+    };
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     type LogSink = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
 
@@ -263,6 +320,157 @@ mod tests {
         assert!(
             !has_line_at(&logs, "DEBUG", &["debug probe line"]),
             "expected NO DEBUG line when RUST_LOG is empty, got:\n{logs}"
+        );
+    }
+
+    #[test]
+    fn parse_sensor_data_accepts_only_the_exact_sensor_v1_width() {
+        assert_eq!(
+            parse_sensor_data(&[0x09, 0xC4, 0x03, 0xF5]),
+            Some(SensorV1 {
+                temperature: 2500,
+                pressure: 1013
+            })
+        );
+        // 0xFF38 as i16 big-endian is -200.
+        assert_eq!(
+            parse_sensor_data(&[0xFF, 0x38, 0x00, 0x00]),
+            Some(SensorV1 {
+                temperature: -200,
+                pressure: 0
+            })
+        );
+        for len in 0..SENSOR_V1_LEN {
+            assert_eq!(
+                parse_sensor_data(&vec![0u8; len]),
+                None,
+                "len={len} must not parse"
+            );
+        }
+        assert_eq!(
+            parse_sensor_data(&[0u8; SENSOR_V1_LEN + 1]),
+            None,
+            "len {} must not parse",
+            SENSOR_V1_LEN + 1
+        );
+    }
+
+    #[test]
+    fn non_sensor_payload_warns_on_first_and_every_hundredth() {
+        const FORGING_TOPIC: &str = "other/t\r\nforged";
+        const PAYLOAD: [u8; 5] = [1, 2, 3, 4, 5];
+
+        let readings = AtomicU64::new(0);
+        let rejected = AtomicU64::new(0);
+        let logs = captured_with_spec("info", || {
+            for _ in 0..100 {
+                record_payload(FORGING_TOPIC, &PAYLOAD, &readings, &rejected);
+            }
+        });
+
+        assert_eq!(rejected.load(Ordering::Relaxed), 100, "rejected count");
+        assert_eq!(readings.load(Ordering::Relaxed), 0, "readings count");
+
+        let warn_lines: Vec<&str> = logs
+            .lines()
+            .filter(|l| l.split_whitespace().nth(1) == Some("WARN"))
+            .collect();
+        assert!(
+            warn_lines
+                .iter()
+                .any(|l| l.contains(r#""other/t\r\nforged""#)),
+            "first warn must contain the debug-escaped topic in quotes, got:\n{logs}"
+        );
+        assert!(
+            warn_lines.iter().any(|l| l.contains("5 bytes")),
+            "first warn must name the payload length, got:\n{logs}"
+        );
+        assert!(
+            warn_lines.iter().any(|l| l.contains("(1 rejected total)")),
+            "first warn must show 1 rejected total, got:\n{logs}"
+        );
+        assert!(
+            warn_lines
+                .iter()
+                .all(|l| !l.trim_start().starts_with("forged")),
+            "no captured line may start with the unescaped topic, got:\n{logs}"
+        );
+        assert!(
+            warn_lines
+                .iter()
+                .any(|l| l.contains("(100 rejected total)")),
+            "100th warn must show 100 rejected total, got:\n{logs}"
+        );
+        let rejected_total_lines = warn_lines
+            .iter()
+            .filter(|l| l.contains("rejected total"))
+            .count();
+        assert_eq!(
+            rejected_total_lines, 2,
+            "exactly the 1st and 100th warns, got {rejected_total_lines}:\n{logs}"
+        );
+    }
+
+    #[test]
+    fn sensor_v1_payload_is_a_reading_not_a_rejection() {
+        const PAYLOAD: [u8; 4] = [0x09, 0xC4, 0x03, 0xF5];
+
+        let readings = AtomicU64::new(0);
+        let rejected = AtomicU64::new(0);
+        let logs = captured_with_spec("info", || {
+            record_payload("t", &PAYLOAD, &readings, &rejected);
+        });
+
+        assert_eq!(readings.load(Ordering::Relaxed), 1, "readings count");
+        assert_eq!(rejected.load(Ordering::Relaxed), 0, "rejected count");
+        assert!(
+            has_line_at(&logs, "INFO", &["temp=25.00°C, pressure=1013hPa"]),
+            "expected INFO line with the reading, got:\n{logs}"
+        );
+        assert!(
+            !has_line_at(&logs, "WARN", &["rejected total"]),
+            "expected no WARN line for a valid reading, got:\n{logs}"
+        );
+    }
+
+    #[test]
+    fn reading_logs_on_first_and_every_hundredth_with_the_running_total() {
+        const PAYLOAD: [u8; 4] = [0x09, 0xC4, 0x03, 0xF5];
+
+        let readings = AtomicU64::new(0);
+        let rejected = AtomicU64::new(0);
+        let logs = captured_with_spec("info", || {
+            for _ in 0..100 {
+                record_payload("t", &PAYLOAD, &readings, &rejected);
+            }
+        });
+
+        assert_eq!(readings.load(Ordering::Relaxed), 100, "readings count");
+        assert_eq!(rejected.load(Ordering::Relaxed), 0, "rejected count");
+
+        let info_lines: Vec<&str> = logs
+            .lines()
+            .filter(|l| l.split_whitespace().nth(1) == Some("INFO"))
+            .collect();
+        assert!(
+            info_lines.iter().any(|l| l.contains("Reading #1:")),
+            "first reading must be labelled #1, got:\n{logs}"
+        );
+        assert!(
+            info_lines.iter().any(|l| l.contains("Reading #100:")),
+            "hundredth reading must be labelled #100, got:\n{logs}"
+        );
+        assert!(
+            !info_lines.iter().any(|l| l.contains("Reading #0:")),
+            "no reading may be labelled #0, got:\n{logs}"
+        );
+        let reading_lines = info_lines
+            .iter()
+            .filter(|l| l.contains("Reading #"))
+            .count();
+        assert_eq!(
+            reading_lines, 2,
+            "exactly the 1st and 100th readings, got {reading_lines}:\n{logs}"
         );
     }
 }

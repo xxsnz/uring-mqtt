@@ -4,6 +4,7 @@ mod packet;
 pub(crate) mod worker;
 
 use crate::error::Error;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Default `drain_timeout_secs` for `BrokerConfig::new`. Five seconds gives
@@ -29,6 +30,10 @@ pub struct BrokerConfig {
     pub num_workers: Option<usize>,
     /// TCP listen backlog
     pub backlog: i32,
+    /// Test hook key: selects this broker's `worker::SETUP_OVERFLOW` entry.
+    /// A key, not the bind address — two tests may share a port.
+    #[cfg(test)]
+    pub(crate) overflow_token: Option<u64>,
 }
 
 impl BrokerConfig {
@@ -41,6 +46,8 @@ impl BrokerConfig {
             drain_timeout_secs: DEFAULT_DRAIN_TIMEOUT_SECS,
             num_workers: None,
             backlog: 1024,
+            #[cfg(test)]
+            overflow_token: None,
         }
     }
 
@@ -73,6 +80,13 @@ impl BrokerConfig {
         self.backlog = backlog;
         self
     }
+
+    /// Test hook: see `overflow_token`.
+    #[cfg(test)]
+    pub(crate) fn overflow_token(mut self, token: u64) -> Self {
+        self.overflow_token = Some(token);
+        self
+    }
 }
 
 impl Default for BrokerConfig {
@@ -81,15 +95,107 @@ impl Default for BrokerConfig {
     }
 }
 
-/// Event emitted by the broker when sensor data is received.
-#[derive(Debug, Clone, Copy)]
-pub enum Event {
-    /// Sensor data received (temperature in 0.01°C, pressure in hPa)
-    SensorV1 { temperature: i16, pressure: u16 },
+/// Quality of service of an inbound PUBLISH.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QoS {
+    /// QoS 0.
+    AtMostOnce,
+    /// QoS 1.
+    AtLeastOnce,
+    /// QoS 2.
+    ExactlyOnce,
 }
 
-/// Callback type for handling events per worker.
-pub type EventCallback = Arc<dyn Fn(Event) + Send + Sync>;
+/// One inbound PUBLISH as the [`PublishCallback`] sees it.
+///
+/// `Clone` shares the received topic and payload buffers (no copy), so a
+/// callback hands work to another thread by cloning, and a clone held
+/// long-term keeps the whole received read buffer alive — copy `payload()`
+/// with `to_vec()` to retain only the bytes.
+#[derive(Debug, Clone)]
+pub struct Publish {
+    /// The decoded PUBLISH with `properties` cleared, so a clone shares the
+    /// topic and payload buffers and copies nothing else.
+    inner: rmqtt_codec::types::Publish,
+}
+
+/// Callback invoked once per ingested PUBLISH (see
+/// [`MqttBroker::start_with_callback`]).
+pub type PublishCallback = Arc<dyn Fn(&Publish) + Send + Sync>;
+
+impl Publish {
+    /// Build a `Publish` from the codec's decoded value. Clears `properties`
+    /// so the public surface never leaks v5 internals and the clone's
+    /// `topic` / `payload` buffers are the ones the codec already holds.
+    pub(crate) fn from_codec(publish: &rmqtt_codec::types::Publish) -> Self {
+        Self {
+            inner: rmqtt_codec::types::Publish {
+                dup: publish.dup,
+                retain: publish.retain,
+                qos: publish.qos,
+                topic: publish.topic.clone(),
+                packet_id: publish.packet_id,
+                payload: publish.payload.clone(),
+                properties: None,
+            },
+        }
+    }
+
+    /// Topic name of the PUBLISH as UTF-8 text — a `ByteString` deref to
+    /// `str`.
+    pub fn topic(&self) -> &str {
+        &self.inner.topic
+    }
+
+    /// Exact payload bytes of the PUBLISH.
+    pub fn payload(&self) -> &[u8] {
+        &self.inner.payload
+    }
+
+    /// RETAIN flag of the PUBLISH.
+    pub fn retain(&self) -> bool {
+        self.inner.retain
+    }
+
+    /// QoS of the PUBLISH.
+    pub fn qos(&self) -> QoS {
+        match self.inner.qos {
+            rmqtt_codec::types::QoS::AtMostOnce => QoS::AtMostOnce,
+            rmqtt_codec::types::QoS::AtLeastOnce => QoS::AtLeastOnce,
+            rmqtt_codec::types::QoS::ExactlyOnce => QoS::ExactlyOnce,
+        }
+    }
+
+    /// Builds a `Publish` an embedder can hand to its own callback in
+    /// tests. Copies `topic` and `payload`; `dup` is `false`, no packet id,
+    /// no properties.
+    pub fn new(topic: &str, payload: &[u8], qos: QoS, retain: bool) -> Self {
+        let codec_qos = match qos {
+            QoS::AtMostOnce => rmqtt_codec::types::QoS::AtMostOnce,
+            QoS::AtLeastOnce => rmqtt_codec::types::QoS::AtLeastOnce,
+            QoS::ExactlyOnce => rmqtt_codec::types::QoS::ExactlyOnce,
+        };
+        Self {
+            inner: rmqtt_codec::types::Publish {
+                dup: false,
+                retain,
+                qos: codec_qos,
+                topic: topic.to_string().into(),
+                packet_id: None,
+                payload: bytes::Bytes::copy_from_slice(payload),
+                properties: None,
+            },
+        }
+    }
+
+    /// Builds a `Publish` carrying only `topic` and `payload`, suitable for
+    /// driving worker and handler tests without reaching into the codec.
+    /// QoS is `AtMostOnce`, RETAIN is `false`, no packet id, no properties.
+    #[cfg(test)]
+    pub(crate) fn fixture(topic: &str, payload: &[u8]) -> Self {
+        Self::new(topic, payload, QoS::AtMostOnce, false)
+    }
+}
 
 /// Cloneable cross-thread shutdown trigger. Signal = take + drop the
 /// main-side socketpair ends (EOF is the level-persistent wake).
@@ -132,6 +238,7 @@ impl ShutdownHandle {
 pub struct BrokerHandle {
     trigger: ShutdownHandle,
     handles: Vec<std::thread::JoinHandle<Result<(), Error>>>,
+    dropped: Vec<Arc<AtomicU64>>,
 }
 
 impl BrokerHandle {
@@ -155,6 +262,15 @@ impl BrokerHandle {
             .handles
             .iter()
             .any(std::thread::JoinHandle::is_finished)
+    }
+
+    /// Lifetime count of PUBLISH packets, at any QoS, that were discarded
+    /// instead of reaching the callback because a worker's event channel was
+    /// full, summed over every worker. A discard is counted whether or not
+    /// its acknowledgement was later written; each one is also warned on the
+    /// shared cadence. Monotonic; never reset.
+    pub fn dropped_publishes(&self) -> u64 {
+        self.dropped.iter().map(|d| d.load(Ordering::Relaxed)).sum()
     }
 
     /// Wait for every worker thread to exit, aggregating their terminal
@@ -247,10 +363,16 @@ impl MqttBroker {
     /// Start the MQTT ingest server with an optional event callback.
     ///
     /// # Callback contract
-    /// The callback runs on worker threads. It must return promptly: blocking
-    /// stalls that worker's event processing AND its shutdown. A panic inside
-    /// the callback unwinds the worker thread (monoio's task harness does not
-    /// catch it) and surfaces from [`BrokerHandle::join`] as
+    /// The callback runs on worker threads. It is invoked with a [`Publish`]
+    /// once per PUBLISH the server ingests, on the worker thread that owns
+    /// the connection, in the order the worker received them. A PUBACK or
+    /// PUBREC means the PUBLISH was accepted for processing, not that the
+    /// callback ran: the callback runs later, before or after the
+    /// acknowledgement is written, and never for a PUBLISH dropped because
+    /// the worker's event channel was full. It must return promptly:
+    /// blocking stalls that worker's event processing AND its shutdown. A panic
+    /// inside the callback unwinds the worker thread (monoio's task harness
+    /// does not catch it) and surfaces from [`BrokerHandle::join`] as
     /// [`Error::Worker(_)`]. Never call [`BrokerHandle::join`] or drop a
     /// [`BrokerHandle`] from inside an event callback. That panic also signals
     /// shutdown to the remaining workers, so the whole ingest server stops
@@ -258,9 +380,10 @@ impl MqttBroker {
     /// unwinding: an application built with the `panic = "abort"` profile
     /// setting terminates at the panic site instead, with no shutdown signal
     /// and no drain.
+    #[allow(clippy::too_many_lines)] // per-worker resource creation, runtime build, supervise loop, and handle assembly push the body past the pedantic 100-line boundary
     pub fn start_with_callback(
         config: BrokerConfig,
-        callback: Option<EventCallback>,
+        callback: Option<PublishCallback>,
     ) -> Result<BrokerHandle, Error> {
         let num_workers = config.num_workers.unwrap_or_else(|| {
             std::thread::available_parallelism().map_or(4, std::num::NonZero::get)
@@ -293,6 +416,10 @@ impl MqttBroker {
             signal_ends: std::sync::Arc::new(std::sync::Mutex::new(Some(signal_ends))),
         };
 
+        // One lifetime drop counter per worker, shared with its event channel
+        // and readable after `start` returns.
+        let dropped: Vec<Arc<AtomicU64>> = (0..num_workers).map(|_| Arc::default()).collect();
+
         // Startup barrier: every worker's fallible setup (runtime build, bind,
         // state/channel/processor spawn) completes before we fan out go/abort.
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -300,7 +427,7 @@ impl MqttBroker {
         let mut handles: Vec<std::thread::JoinHandle<Result<(), Error>>> =
             Vec::with_capacity(num_workers);
 
-        for worker_id in 0..num_workers {
+        for (worker_id, worker_dropped) in dropped.iter().cloned().enumerate() {
             let config = config.clone();
             let callback = callback.clone();
             let trigger = trigger.clone();
@@ -336,7 +463,14 @@ impl MqttBroker {
                         }
                     };
                     runtime.block_on(worker::run_worker(
-                        worker_id, config, callback, ready_tx, go_rx, worker_end, post_go,
+                        worker_id,
+                        config,
+                        callback,
+                        ready_tx,
+                        go_rx,
+                        worker_end,
+                        post_go,
+                        worker_dropped,
                     ))
                 }) {
                 Ok(h) => handles.push(h),
@@ -366,7 +500,11 @@ impl MqttBroker {
             return Err(e);
         }
 
-        Ok(BrokerHandle { trigger, handles })
+        Ok(BrokerHandle {
+            trigger,
+            handles,
+            dropped,
+        })
     }
 
     /// Run the MQTT broker with the given configuration. Equivalent to
@@ -386,10 +524,10 @@ impl MqttBroker {
     ///
     /// # Arguments
     /// * `config` - Broker configuration
-    /// * `callback` - Optional callback invoked for each event (called from worker thread)
+    /// * `callback` - Optional callback invoked with each ingested [`Publish`] (called from worker thread)
     pub fn run_with_callback(
         config: BrokerConfig,
-        callback: Option<EventCallback>,
+        callback: Option<PublishCallback>,
     ) -> Result<(), Error> {
         Self::start_with_callback(config, callback)?.join()
     }
@@ -522,65 +660,12 @@ mod tests {
     }
 
     #[test]
-    fn test_event_sensor_v1() {
-        let event = Event::SensorV1 {
-            temperature: 2500, // 25.00°C
-            pressure: 1013,    // 1013 hPa
-        };
-
-        match event {
-            Event::SensorV1 {
-                temperature,
-                pressure,
-            } => {
-                assert_eq!(temperature, 2500);
-                assert_eq!(pressure, 1013);
-            }
-        }
-    }
-
-    #[test]
-    fn test_event_clone_copy() {
-        let event1 = Event::SensorV1 {
-            temperature: 100,
-            pressure: 500,
-        };
-
-        // Test Copy - event1 remains valid after assignment
-        let event2 = event1;
-        let event3 = event1;
-        let event4 = event1;
-
-        match (event2, event3, event4) {
-            (
-                Event::SensorV1 {
-                    temperature: t2, ..
-                },
-                Event::SensorV1 {
-                    temperature: t3, ..
-                },
-                Event::SensorV1 {
-                    temperature: t4, ..
-                },
-            ) => {
-                assert_eq!(t2, 100);
-                assert_eq!(t3, 100);
-                assert_eq!(t4, 100);
-            }
-        }
-    }
-
-    #[test]
-    fn test_event_debug() {
-        let event = Event::SensorV1 {
-            temperature: -500,
-            pressure: 900,
-        };
-
-        let debug_str = format!("{event:?}");
-        assert!(debug_str.contains("SensorV1"));
-        assert!(debug_str.contains("-500"));
-        assert!(debug_str.contains("900"));
+    fn publish_new_reports_its_arguments() {
+        let p = Publish::new("a/b", &[0xDE, 0xAD], QoS::AtLeastOnce, true);
+        assert_eq!(p.topic(), "a/b");
+        assert_eq!(p.payload(), &[0xDE, 0xAD]);
+        assert_eq!(p.qos(), QoS::AtLeastOnce);
+        assert!(p.retain());
     }
 
     /// AC-1 — when a worker's listener bind fails, `MqttBroker::run` MUST
@@ -651,11 +736,11 @@ mod tests {
         let port = find_free_port();
         let addr_str = format!("127.0.0.1:{port}");
         let addr: std::net::SocketAddr = addr_str.parse().expect("parse addr");
-        let (cb_tx, cb_rx) = std::sync::mpsc::channel::<Event>();
+        let (cb_tx, cb_rx) = std::sync::mpsc::channel::<Publish>();
 
         let config = BrokerConfig::new(addr_str).num_workers(1);
-        let cb: EventCallback = std::sync::Arc::new(move |event: Event| {
-            let _ = cb_tx.send(event);
+        let cb: PublishCallback = std::sync::Arc::new(move |event: &Publish| {
+            let _ = cb_tx.send(event.clone());
         });
         let broker_handle = std::thread::Builder::new()
             .name("broker-publish-callback".into())
@@ -691,14 +776,13 @@ mod tests {
         stream.write_all(&publish).expect("write PUBLISH");
 
         match cb_rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(Event::SensorV1 {
-                temperature,
-                pressure,
-            }) => {
-                assert_eq!(temperature, 2500);
-                assert_eq!(pressure, 1013);
+            Ok(publish) => {
+                assert_eq!(publish.topic(), "t");
+                assert_eq!(publish.payload(), &[0x09, 0xC4, 0x03, 0xF5]);
+                assert_eq!(publish.qos(), QoS::AtMostOnce);
+                assert!(!publish.retain());
             }
-            other => panic!("expected Event::SensorV1 {{ 2500, 1013 }}, got {other:?}"),
+            other => panic!("expected Publish on topic 't', got {other:?}"),
         }
 
         // Detached broker thread keeps running until process exit — F1.4 owns
@@ -713,11 +797,11 @@ mod tests {
         let port = find_free_port();
         let addr_str = format!("127.0.0.1:{port}");
         let addr: std::net::SocketAddr = addr_str.parse().expect("parse addr");
-        let (cb_tx, cb_rx) = std::sync::mpsc::channel::<Event>();
+        let (cb_tx, cb_rx) = std::sync::mpsc::channel::<Publish>();
 
         let config = BrokerConfig::new(addr_str).num_workers(1);
-        let cb: EventCallback = std::sync::Arc::new(move |event: Event| {
-            let _ = cb_tx.send(event);
+        let cb: PublishCallback = std::sync::Arc::new(move |event: &Publish| {
+            let _ = cb_tx.send(event.clone());
         });
         let broker_handle = std::thread::Builder::new()
             .name("broker-qos2-callback".into())
@@ -766,14 +850,12 @@ mod tests {
         assert_eq!(pubrecs, [0x50, 0x02, 0x00, 0x01, 0x50, 0x02, 0x00, 0x01]);
 
         match cb_rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(Event::SensorV1 {
-                temperature,
-                pressure,
-            }) => {
-                assert_eq!(temperature, 2500);
-                assert_eq!(pressure, 1013);
+            Ok(publish) => {
+                assert_eq!(publish.topic(), "t");
+                assert_eq!(publish.payload(), &[0x09, 0xC4, 0x03, 0xF5]);
+                assert_eq!(publish.qos(), QoS::ExactlyOnce);
             }
-            other => panic!("expected Event::SensorV1 {{ 2500, 1013 }}, got {other:?}"),
+            other => panic!("expected Publish on topic 't' (QoS 2), got {other:?}"),
         }
 
         stream.write_all(&pubrel).expect("write PUBREL");
@@ -821,11 +903,11 @@ mod tests {
         let port = find_free_port();
         let addr_str = format!("127.0.0.1:{port}");
         let addr: std::net::SocketAddr = addr_str.parse().expect("parse addr");
-        let (cb_tx, cb_rx) = std::sync::mpsc::channel::<Event>();
+        let (cb_tx, cb_rx) = std::sync::mpsc::channel::<Publish>();
 
         let config = BrokerConfig::new(addr_str).num_workers(1);
-        let cb: EventCallback = std::sync::Arc::new(move |event: Event| {
-            let _ = cb_tx.send(event);
+        let cb: PublishCallback = std::sync::Arc::new(move |event: &Publish| {
+            let _ = cb_tx.send(event.clone());
         });
         let broker_handle = std::thread::Builder::new()
             .name("broker-qos2-scope".into())
@@ -872,14 +954,12 @@ mod tests {
             assert_eq!(pubrec, [0x50, 0x02, 0x00, 0x01]);
 
             match cb_rx.recv_timeout(Duration::from_secs(5)) {
-                Ok(Event::SensorV1 {
-                    temperature,
-                    pressure,
-                }) => {
-                    assert_eq!(temperature, 2500);
-                    assert_eq!(pressure, 1013);
+                Ok(publish) => {
+                    assert_eq!(publish.topic(), "t");
+                    assert_eq!(publish.payload(), &[0x09, 0xC4, 0x03, 0xF5]);
+                    assert_eq!(publish.qos(), QoS::ExactlyOnce);
                 }
-                other => panic!("session {session}: expected Event::SensorV1, got {other:?}"),
+                other => panic!("session {session}: expected Publish, got {other:?}"),
             }
 
             // Drop the socket with packet id 1 still awaiting release.
@@ -1618,7 +1698,7 @@ mod tests {
     #[allow(clippy::too_many_lines)] // bounded multi-worker lifecycle harness covers discovery, trigger, and observation
     #[test]
     fn callback_panic_shuts_down_siblings_and_surfaces_as_join_error() {
-        const PANIC_TEMPERATURE: i16 = -1;
+        const PANIC_MARKER: i16 = -1;
         const SETUP_BUDGET: Duration = Duration::from_secs(30);
         const OBSERVE_BUDGET: Duration = Duration::from_secs(20);
 
@@ -1629,11 +1709,18 @@ mod tests {
             .num_workers(2)
             .drain_timeout_secs(1);
         let (cb_tx, cb_rx) = std::sync::mpsc::channel::<(i16, String)>();
-        let cb: EventCallback = std::sync::Arc::new(move |event: Event| {
-            let Event::SensorV1 { temperature, .. } = event;
-            assert!(temperature != PANIC_TEMPERATURE, "test callback panic");
+        let cb: PublishCallback = std::sync::Arc::new(move |event: &Publish| {
+            // The wire test PUBLISH lays the marker at payload[0..2] (the
+            // generic Publish view must not invent schema knowledge to expose it).
+            let payload = event.payload();
+            assert!(
+                payload.len() >= 2,
+                "test publishes must encode the marker in payload[0..2]"
+            );
+            let marker = i16::from_be_bytes([payload[0], payload[1]]);
+            assert!(marker != PANIC_MARKER, "test callback panic");
             let _ = cb_tx.send((
-                temperature,
+                marker,
                 std::thread::current()
                     .name()
                     .unwrap_or("unnamed")
@@ -1718,7 +1805,7 @@ mod tests {
                     let observe_deadline = t0 + OBSERVE_BUDGET;
                     let mut panic_publish: [u8; 9] =
                         [0x30, 0x07, 0x00, 0x01, b't', 0x09, 0xC4, 0x03, 0xF5];
-                    panic_publish[5..7].copy_from_slice(&PANIC_TEMPERATURE.to_be_bytes());
+                    panic_publish[5..7].copy_from_slice(&PANIC_MARKER.to_be_bytes());
                     victim
                         .set_write_timeout(Some(
                             observe_deadline.saturating_duration_since(Instant::now()),
@@ -2119,5 +2206,101 @@ mod tests {
             false_after_exit,
             "is_running stayed true for more than 10 s after shutdown()"
         );
+    }
+
+    // AC-9 + AC-9a + AC-10 wiring — every worker of a `BrokerHandle` returns
+    // by `MqttBroker::start_with_callback` overflows its own event channel by
+    // a distinct count via the test setup hook inside `run_worker`, and the
+    // handle's `dropped_publishes` sums them on demand.
+
+    /// Per-worker overflow forced by the setup hook; distinct so a missed
+    /// worker changes the sum.
+    const WORKER_OVERFLOWS: [usize; 2] = [2, 5];
+    /// Sum of `WORKER_OVERFLOWS`.
+    const EXPECTED_DROPS: u64 = 7;
+
+    /// Source of hook keys. A fresh key per registration means a parallel
+    /// test that reuses the same port can never select this entry.
+    static NEXT_OVERFLOW_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+    /// Removes its own `SETUP_OVERFLOW` entry on drop.
+    struct OverflowRegistration(u64);
+
+    impl OverflowRegistration {
+        fn new(per_worker: &[usize]) -> Self {
+            let token = NEXT_OVERFLOW_TOKEN.fetch_add(1, Ordering::Relaxed);
+            worker::SETUP_OVERFLOW
+                .lock()
+                .expect("hook lock")
+                .push((token, per_worker.to_vec()));
+            Self(token)
+        }
+
+        fn token(&self) -> u64 {
+            self.0
+        }
+    }
+
+    impl Drop for OverflowRegistration {
+        fn drop(&mut self) {
+            worker::SETUP_OVERFLOW
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|(key, _)| *key != self.0);
+        }
+    }
+
+    #[test]
+    fn dropped_publishes_sums_full_channel_drops_from_every_worker() {
+        let addr = format!("127.0.0.1:{}", find_free_port());
+        // Declared BEFORE `handle`: on unwind the handle's `Drop` stops the
+        // workers first and the entry is removed after.
+        let registration = OverflowRegistration::new(&WORKER_OVERFLOWS);
+        let handle = MqttBroker::start(
+            BrokerConfig::new(addr)
+                .num_workers(WORKER_OVERFLOWS.len())
+                .overflow_token(registration.token()),
+        )
+        .expect("start");
+        assert_eq!(
+            handle.dropped_publishes(),
+            EXPECTED_DROPS,
+            "handle must sum every worker's own overflow"
+        );
+        handle.shutdown();
+        assert!(handle.join().is_ok(), "clean shutdown");
+    }
+
+    #[test]
+    fn dropped_publishes_reads_the_live_counters() {
+        let counters: Vec<Arc<AtomicU64>> = vec![Arc::default(), Arc::default()];
+        let (tx0, _rx0) = worker::event_channel(0, counters[0].clone());
+        let (tx1, _rx1) = worker::event_channel(1, counters[1].clone());
+
+        let handle = BrokerHandle {
+            trigger: ShutdownHandle {
+                signal_ends: Arc::new(std::sync::Mutex::new(None)),
+            },
+            handles: Vec::new(),
+            dropped: counters,
+        };
+        assert_eq!(handle.dropped_publishes(), 0);
+
+        for _ in 0..worker::EVENT_CHANNEL_CAPACITY + WORKER_OVERFLOWS[0] {
+            tx0.send(Publish::fixture("t", &[]));
+        }
+        assert_eq!(
+            handle.dropped_publishes(),
+            u64::try_from(WORKER_OVERFLOWS[0]).expect("fits u64"),
+        );
+
+        for _ in 0..worker::EVENT_CHANNEL_CAPACITY + WORKER_OVERFLOWS[1] {
+            tx1.send(Publish::fixture("t", &[]));
+        }
+        assert_eq!(handle.dropped_publishes(), EXPECTED_DROPS);
+
+        // A handle that snapshotted its total at construction reports 0
+        // throughout and fails this check.
+        assert_eq!(handle.dropped_publishes(), EXPECTED_DROPS);
     }
 }
