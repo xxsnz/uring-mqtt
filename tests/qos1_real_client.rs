@@ -7,18 +7,19 @@
 //! fixtures used in the in-crate tests are hand-written byte literals; this
 //! test confirms a real decoder, not `rmqtt-codec`, agrees with them.
 
+#[allow(dead_code)] // each test binary uses a different subset of the shared harness
+mod common;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant};
-use uring_mqtt::{BrokerConfig, MqttBroker};
+use std::time::Duration;
 
 /// One item the driver's forwarding channel carries: a rumqttc event wrapped
 /// in `Result`, the way `Connection::recv` yields it.
 type EventMsg = Result<rumqttc::Event, rumqttc::ConnectionError>;
 /// Receiving end of the driver's forwarding channel. Aliased so clippy's
-/// `type_complexity` does not flag the signature of `next_event`.
+/// `type_complexity` does not flag the channel's `let` annotation.
 type EventReceiver = Receiver<EventMsg>;
 
 /// Client identifier the rumqttc connection presents on CONNECT.
@@ -38,9 +39,6 @@ const REQUEST_CHANNEL_CAP: usize = 16;
 /// Per-worker drain deadline — same value the sibling test
 /// `tests/broker_handle_api.rs` uses; short so teardown is bounded.
 const DRAIN_TIMEOUT_SECS: u64 = 1;
-/// Outer watchdog for the harness thread. The harness's `BrokerHandle::drop`
-/// blocking teardown runs under this bound.
-const HARNESS_TIMEOUT: Duration = Duration::from_secs(45);
 /// Window for the very first `ConnAck` to land after the harness reports
 /// startup complete.
 const CONNACK_BOUND: Duration = Duration::from_secs(5);
@@ -54,13 +52,7 @@ const SUBACK_BOUND: Duration = Duration::from_secs(5);
 const DISCONNECT_OBSERVE_BOUND: Duration = Duration::from_secs(5);
 /// Upper bound on joining the driver thread — exceeded only by a leak.
 const DRIVER_JOIN_BOUND: Duration = Duration::from_secs(10);
-/// How often the bounded join re-checks `JoinHandle::is_finished`. Short
-/// relative to `DRIVER_JOIN_BOUND` so a healthy exit is not padded by a
-/// whole interval, long enough not to spin.
-const DRIVER_POLL_INTERVAL: Duration = Duration::from_millis(50);
-/// Harness thread name — visible in `top -H` and panic backtraces.
-const HARNESS_THREAD_NAME: &str = "itest-mqtt-harness";
-/// Driver thread name — same purpose.
+/// Driver thread name — visible in `top -H` and panic backtraces.
 const DRIVER_THREAD_NAME: &str = "itest-mqtt-driver";
 /// SensorV1 payload bytes the same fixtures the in-crate tests use:
 /// temperature 25.00 °C (0x09C4 = 2500) and pressure 1013 hPa (0x03F5).
@@ -70,216 +62,22 @@ const SENSOR_PAYLOAD: [u8; 4] = [0x09, 0xC4, 0x03, 0xF5];
 /// margin that keeps a scheduling hiccup from timing the wait out.
 const GUARD_BOUND: Duration = Duration::from_secs(1);
 
-fn find_free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind free port");
-    l.local_addr().expect("local_addr").port()
-}
-
-/// One next-incoming-event wait that the brief mandates: drains the channel
-/// under a bound, fails on any second `ConnAck`, any incoming `Disconnect`,
-/// or any `Err` while the session window is open, and returns the next
-/// INCOMING event otherwise. `Outgoing` events are observations of the
-/// client's own requests and carry no information the test wants to assert
-/// on, so they are skipped silently. So is an incoming `PingResp`: rumqttc
-/// sends PINGREQ on its own `KEEP_ALIVE` timer regardless of other traffic
-/// and forwards the response as an ordinary incoming event, so it can land
-/// ahead of an acknowledgment the test is waiting for. Skipping it keeps
-/// that healthy connection from failing the wait; the skip runs under the
-/// SAME deadline, which `remaining` recomputes every iteration. After the
-/// teardown flag flips, an `Err`
-/// is the expected end of a disconnected connection and the helper returns
-/// it instead of panicking — that is why the window has an end.
-///
-/// The session window opens the instant a `ConnAck` is observed: the FIRST
-/// `ConnAck` is what step 3 waits for, and any SUBSEQUENT `ConnAck` is the
-/// "client silently reconnected" failure mode the brief calls out.
-#[allow(clippy::result_large_err)]
-fn next_event(
-    rx: &EventReceiver,
-    bound: Duration,
-    teardown: &AtomicBool,
-    session_open: &mut bool,
-) -> Result<rumqttc::Event, RumqttcOutcome> {
-    let started = Instant::now();
-    loop {
-        let remaining = bound.saturating_sub(started.elapsed());
-        if remaining.is_zero() {
-            return Err(RumqttcOutcome::TimedOut(bound));
-        }
-        match rx.recv_timeout(remaining) {
-            Ok(Ok(event)) => match event {
-                rumqttc::Event::Outgoing(_)
-                | rumqttc::Event::Incoming(rumqttc::Packet::PingResp) => {}
-                rumqttc::Event::Incoming(packet @ rumqttc::Packet::ConnAck(_)) => {
-                    if *session_open {
-                        return Err(RumqttcOutcome::UnexpectedConnAck);
-                    }
-                    *session_open = true;
-                    return Ok(rumqttc::Event::Incoming(packet));
-                }
-                rumqttc::Event::Incoming(rumqttc::Packet::Disconnect) => {
-                    if *session_open && !teardown.load(Ordering::SeqCst) {
-                        return Err(RumqttcOutcome::UnexpectedDisconnect);
-                    }
-                    return Ok(rumqttc::Event::Incoming(rumqttc::Packet::Disconnect));
-                }
-                incoming @ rumqttc::Event::Incoming(_) => return Ok(incoming),
-            },
-            Ok(Err(err)) => {
-                if teardown.load(Ordering::SeqCst) {
-                    return Err(RumqttcOutcome::ClosedAfterDisconnect(err));
-                }
-                return Err(RumqttcOutcome::ConnectionError(err));
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                return Err(RumqttcOutcome::TimedOut(bound));
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(RumqttcOutcome::DriverChannelClosed);
-            }
-        }
-    }
-}
-
-/// Wait for the OUTGOING `Disconnect` event, skipping everything ahead of it
-/// in the channel. rumqttc queues that event only after `Disconnect.write`
-/// AND the socket flush have both succeeded (0.24.0 `state.rs:464-470`,
-/// `eventloop.rs:229-238`), so observing it proves the DISCONNECT actually
-/// reached the wire — `client.disconnect()` returning `Ok` proves only that
-/// a request was enqueued. `Err` items are skipped here rather than
-/// classified: the driver thread already judged each one against the
-/// teardown flag at the instant it observed it, which is the only point
-/// where that judgement is race-free.
-#[allow(clippy::result_large_err)]
-fn await_outgoing_disconnect(rx: &EventReceiver, bound: Duration) -> Result<(), RumqttcOutcome> {
-    let started = Instant::now();
-    loop {
-        let remaining = bound.saturating_sub(started.elapsed());
-        if remaining.is_zero() {
-            return Err(RumqttcOutcome::TimedOut(bound));
-        }
-        match rx.recv_timeout(remaining) {
-            Ok(Ok(rumqttc::Event::Outgoing(rumqttc::Outgoing::Disconnect))) => return Ok(()),
-            Ok(_) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                return Err(RumqttcOutcome::TimedOut(bound));
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(RumqttcOutcome::DisconnectNeverSent);
-            }
-        }
-    }
-}
-
-/// Distinguish the kinds of failure the test's waits can produce, so the
-/// panic messages name the actual cause.
-#[allow(clippy::result_large_err)]
-enum RumqttcOutcome {
-    TimedOut(Duration),
-    UnexpectedConnAck,
-    UnexpectedDisconnect,
-    ConnectionError(rumqttc::ConnectionError),
-    ClosedAfterDisconnect(rumqttc::ConnectionError),
-    DriverChannelClosed,
-    DisconnectNeverSent,
-}
-
-impl RumqttcOutcome {
-    fn describe(&self) -> String {
-        match self {
-            Self::TimedOut(d) => format!("timed out waiting {d:?}"),
-            Self::UnexpectedConnAck => "received an unexpected second ConnAck".to_string(),
-            Self::UnexpectedDisconnect => {
-                "received an incoming Disconnect before the session ended".to_string()
-            }
-            Self::ConnectionError(e) => format!("rumqttc connection error: {e}"),
-            Self::ClosedAfterDisconnect(e) => {
-                format!("rumqttc reported terminal error after teardown flag was set: {e}")
-            }
-            Self::DriverChannelClosed => "event forwarding channel closed unexpectedly".to_string(),
-            Self::DisconnectNeverSent => {
-                "connection ended without ever emitting the outgoing Disconnect".to_string()
-            }
-        }
-    }
-}
-
-fn assert_outcome(outcome: Result<rumqttc::Event, RumqttcOutcome>, label: &str) -> rumqttc::Event {
-    match outcome {
-        Ok(event) => event,
-        Err(err) => panic!("{label}: {}", err.describe()),
-    }
-}
-
 #[test]
 #[allow(clippy::too_many_lines)]
 fn qos1_and_qos2_publishes_complete_and_session_survives_refused_subscribe() {
-    let (harness_tx, harness_rx) = std::sync::mpsc::channel::<Result<u16, String>>();
-    let (teardown_tx, teardown_rx) = std::sync::mpsc::channel::<Result<(), String>>();
-    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-    let port = find_free_port();
-    let harness_port = port;
-    let _harness = thread::Builder::new()
-        .name(HARNESS_THREAD_NAME.to_string())
-        .spawn(move || {
-            let outcome: Result<(), String> = (|| -> Result<(), String> {
-                let addr = format!("127.0.0.1:{harness_port}");
-                let config = BrokerConfig::new(addr)
-                    .num_workers(1)
-                    .drain_timeout_secs(DRAIN_TIMEOUT_SECS);
-                let handle = MqttBroker::start(config).map_err(|e| e.to_string())?;
-                let _ = harness_tx.send(Ok(harness_port));
-                // Block until the test thread signals it is done with the
-                // broker. Without this, `handle` would drop here, the
-                // broker would shut down, and the rumqttc client would hit
-                // "Connection refused" before its first packet left.
-                // Bounded so a test that hangs cannot leak the harness.
-                match release_rx.recv_timeout(HARNESS_TIMEOUT) {
-                    Ok(())
-                    | Err(
-                        std::sync::mpsc::RecvTimeoutError::Timeout
-                        | std::sync::mpsc::RecvTimeoutError::Disconnected,
-                    ) => {}
-                }
-                // Teardown BEFORE reporting, the same way the sibling
-                // harnesses in `tests/broker_handle_api.rs` do it: the
-                // shutdown drain and the blocking worker joins run here,
-                // inside the window the test's completion wait bounds, so a
-                // stalled `BrokerHandle::drop` fails the test instead of
-                // outliving it unobserved.
-                drop(handle);
-                Ok(())
-            })();
-            if let Err(ref e) = outcome {
-                let _ = harness_tx.send(Err(e.clone()));
-            }
-            let _ = teardown_tx.send(outcome);
-        })
-        .expect("spawn harness");
-
-    // Wait for the harness to confirm the broker is listening.
-    let port = match harness_rx.recv_timeout(HARNESS_TIMEOUT) {
-        Ok(Ok(port)) => port,
-        Ok(Err(e)) => panic!("harness failed to start broker: {e}"),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            panic!("harness did not report within {HARNESS_TIMEOUT:?}")
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            panic!("harness channel closed before reporting startup")
-        }
-    };
+    let harness = common::ServerHarness::start(DRAIN_TIMEOUT_SECS);
 
     // Build the rumqttc blocking client. rumqttc 0.24, not the broker, sends
     // PINGREQ every `KEEP_ALIVE`, which normally keeps the session inside its
     // negotiated 7.5 s idle deadline; `next_event` skips the broker's PINGRESP
     // replies, so they do not interfere with our timing.
-    let mut opts = rumqttc::MqttOptions::new(CLIENT_ID, "127.0.0.1", port);
+    let mut opts = rumqttc::MqttOptions::new(CLIENT_ID, "127.0.0.1", harness.port());
     opts.set_keep_alive(KEEP_ALIVE);
     let (client, mut connection) = rumqttc::Client::new(opts, REQUEST_CHANNEL_CAP);
 
     let (event_tx, event_rx): (Sender<EventMsg>, EventReceiver) = std::sync::mpsc::channel();
     let teardown = Arc::new(AtomicBool::new(false));
-    let mut session_open = false;
+    let mut session = common::Session::new();
 
     // Driver thread: forward every event the connection yields to the main
     // test thread, never swallowing an Err. `recv()` blocks until the
@@ -296,38 +94,16 @@ fn qos1_and_qos2_publishes_complete_and_session_survives_refused_subscribe() {
     // violation would then be read as an ordinary post-disconnect close. The
     // driver reads the flag at the instant the error is observed, which is
     // the only race-free point.
-    let driver_teardown = Arc::clone(&teardown);
-    let driver = thread::Builder::new()
-        .name(DRIVER_THREAD_NAME.to_string())
-        .spawn(move || -> Result<(), String> {
-            loop {
-                match connection.recv() {
-                    Ok(Ok(event)) => {
-                        if event_tx.send(Ok(event)).is_err() {
-                            return Ok(());
-                        }
-                    }
-                    Ok(Err(err)) => {
-                        let in_session = !driver_teardown.load(Ordering::SeqCst);
-                        let described = err.to_string();
-                        let _ = event_tx.send(Err(err));
-                        return if in_session {
-                            Err(format!(
-                                "connection failed while the session was open: {described}"
-                            ))
-                        } else {
-                            Ok(())
-                        };
-                    }
-                    Err(rumqttc::RecvError) => return Ok(()),
-                }
-            }
-        })
-        .expect("spawn driver");
+    let driver = common::spawn_driver(
+        DRIVER_THREAD_NAME,
+        move || connection.recv().ok(),
+        event_tx,
+        Arc::clone(&teardown),
+    );
 
     // Step 3 — wait for the first ConnAck.
-    let connack = assert_outcome(
-        next_event(&event_rx, CONNACK_BOUND, &teardown, &mut session_open),
+    let connack = common::assert_outcome(
+        common::next_event(&event_rx, CONNACK_BOUND, &teardown, &mut session),
         "first ConnAck",
     );
     assert!(
@@ -342,8 +118,8 @@ fn qos1_and_qos2_publishes_complete_and_session_survives_refused_subscribe() {
     client
         .publish("t", rumqttc::QoS::AtLeastOnce, false, SENSOR_PAYLOAD)
         .expect("first publish call");
-    let puback_1 = assert_outcome(
-        next_event(&event_rx, ACK_BOUND, &teardown, &mut session_open),
+    let puback_1 = common::assert_outcome(
+        common::next_event(&event_rx, ACK_BOUND, &teardown, &mut session),
         "first PubAck",
     );
     let first_pkid = match puback_1 {
@@ -357,8 +133,8 @@ fn qos1_and_qos2_publishes_complete_and_session_survives_refused_subscribe() {
     client
         .subscribe("t/#", rumqttc::QoS::AtMostOnce)
         .expect("subscribe call");
-    let suback = assert_outcome(
-        next_event(&event_rx, SUBACK_BOUND, &teardown, &mut session_open),
+    let suback = common::assert_outcome(
+        common::next_event(&event_rx, SUBACK_BOUND, &teardown, &mut session),
         "SubAck",
     );
     let return_codes = match suback {
@@ -383,8 +159,8 @@ fn qos1_and_qos2_publishes_complete_and_session_survives_refused_subscribe() {
     client
         .publish("t", rumqttc::QoS::AtLeastOnce, false, SENSOR_PAYLOAD)
         .expect("second publish call");
-    let puback_2 = assert_outcome(
-        next_event(&event_rx, ACK_BOUND, &teardown, &mut session_open),
+    let puback_2 = common::assert_outcome(
+        common::next_event(&event_rx, ACK_BOUND, &teardown, &mut session),
         "second PubAck",
     );
     let second_pkid = match puback_2 {
@@ -402,16 +178,16 @@ fn qos1_and_qos2_publishes_complete_and_session_survives_refused_subscribe() {
     client
         .publish("t", rumqttc::QoS::ExactlyOnce, false, SENSOR_PAYLOAD)
         .expect("QoS 2 publish call");
-    let pubrec = assert_outcome(
-        next_event(&event_rx, ACK_BOUND, &teardown, &mut session_open),
+    let pubrec = common::assert_outcome(
+        common::next_event(&event_rx, ACK_BOUND, &teardown, &mut session),
         "PubRec",
     );
     let rec_pkid = match pubrec {
         rumqttc::Event::Incoming(rumqttc::Packet::PubRec(rec)) => rec.pkid,
         other => panic!("expected PubRec, got {other:?}"),
     };
-    let pubcomp = assert_outcome(
-        next_event(&event_rx, ACK_BOUND, &teardown, &mut session_open),
+    let pubcomp = common::assert_outcome(
+        common::next_event(&event_rx, ACK_BOUND, &teardown, &mut session),
         "PubComp",
     );
     let comp_pkid = match pubcomp {
@@ -439,28 +215,14 @@ fn qos1_and_qos2_publishes_complete_and_session_survives_refused_subscribe() {
     // `eventloop.rs:80`), so it will only exit when the broker closes the
     // TCP connection — which it does after reading the DISCONNECT we sent.
     // The bounded poll catches any case where the broker never closes.
-    let driver_started = Instant::now();
-    while !driver.is_finished() {
-        assert!(
-            driver_started.elapsed() <= DRIVER_JOIN_BOUND,
-            "connection driver did not exit within {DRIVER_JOIN_BOUND:?} \
-             after client.disconnect()",
-        );
-        thread::sleep(DRIVER_POLL_INTERVAL);
-    }
-    // The driver's verdict on its own terminal error. This is what keeps a
-    // failure that happened INSIDE the session window from being excused by
-    // the now-true teardown flag.
-    if let Err(e) = driver.join().expect("connection driver panicked") {
-        panic!("connection driver: {e}");
-    }
+    common::join_driver(driver, DRIVER_JOIN_BOUND);
 
     // Require the outgoing Disconnect the driver forwarded. Discarding this
     // wait would let a session that died before the DISCONNECT was written
     // count as a clean close; rumqttc emits the event only after the write
     // and flush both succeed, so this is the assertion that the requested
     // disconnect really happened.
-    if let Err(err) = await_outgoing_disconnect(&event_rx, DISCONNECT_OBSERVE_BOUND) {
+    if let Err(err) = common::await_outgoing_disconnect(&event_rx, DISCONNECT_OBSERVE_BOUND) {
         panic!("outgoing Disconnect: {}", err.describe());
     }
 
@@ -468,29 +230,16 @@ fn qos1_and_qos2_publishes_complete_and_session_survives_refused_subscribe() {
     // joined above, so dropping the receiver only releases the channel.
     drop(event_rx);
 
-    // Tell the harness thread it may now drop the BrokerHandle, which
-    // triggers the broker's shutdown drain and worker join. Done last so
-    // every assertion above ran against a live broker.
-    let _ = release_tx.send(());
-
-    // Require the harness's post-teardown report before returning: the
-    // startup message was sent while the broker was still running, so
-    // without this wait the test could pass with the drain still in
-    // flight and a stalled `BrokerHandle::drop` invisible.
-    match teardown_rx.recv_timeout(HARNESS_TIMEOUT) {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => panic!("harness reported a failure: {e}"),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            panic!("harness did not finish broker teardown within {HARNESS_TIMEOUT:?}")
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            panic!("harness channel closed before reporting teardown")
-        }
-    }
+    // Release the harness thread, which then calls BrokerHandle::shutdown()
+    // and join() to run the broker's shutdown drain and worker join to
+    // completion. Done last so every assertion above ran against a live
+    // broker.
+    let report = harness.shutdown_and_join();
+    assert_eq!(report.join, Ok(()), "server join after shutdown");
 }
 
-/// AC-12 — the session window is a local `bool` now, so the guard that reads
-/// it must answer exactly as the shared atomic did: the first `ConnAck`
+/// AC-12 — the session window is a local `Session` now, so the guard that
+/// reads it must answer exactly as the shared atomic did: the first `ConnAck`
 /// opens the window and is returned to step 3, and any later `ConnAck` is
 /// the silent client reconnect the helper exists to catch. The live test
 /// never reaches the second branch, so only this case pins it.
@@ -498,7 +247,7 @@ fn qos1_and_qos2_publishes_complete_and_session_survives_refused_subscribe() {
 fn next_event_opens_the_window_on_the_first_connack_and_refuses_a_second() {
     let (tx, rx) = std::sync::mpsc::channel::<EventMsg>();
     let teardown = AtomicBool::new(false);
-    let mut session_open = false;
+    let mut session = common::Session::new();
 
     tx.send(Ok(rumqttc::Event::Incoming(rumqttc::Packet::ConnAck(
         rumqttc::ConnAck::new(rumqttc::ConnectReturnCode::Success, false),
@@ -506,12 +255,15 @@ fn next_event_opens_the_window_on_the_first_connack_and_refuses_a_second() {
     .expect("queue the first ConnAck");
     assert!(
         matches!(
-            next_event(&rx, GUARD_BOUND, &teardown, &mut session_open),
+            common::next_event(&rx, GUARD_BOUND, &teardown, &mut session),
             Ok(rumqttc::Event::Incoming(rumqttc::Packet::ConnAck(_)))
         ),
         "the first ConnAck is returned to the caller"
     );
-    assert!(session_open, "the first ConnAck opens the session window");
+    assert!(
+        session.is_open(),
+        "the first ConnAck opens the session window"
+    );
 
     tx.send(Ok(rumqttc::Event::Incoming(rumqttc::Packet::ConnAck(
         rumqttc::ConnAck::new(rumqttc::ConnectReturnCode::Success, false),
@@ -519,28 +271,28 @@ fn next_event_opens_the_window_on_the_first_connack_and_refuses_a_second() {
     .expect("queue a second ConnAck");
     assert!(
         matches!(
-            next_event(&rx, GUARD_BOUND, &teardown, &mut session_open),
-            Err(RumqttcOutcome::UnexpectedConnAck)
+            common::next_event(&rx, GUARD_BOUND, &teardown, &mut session),
+            Err(common::RumqttcOutcome::UnexpectedConnAck)
         ),
         "a second ConnAck inside an open window is a failure"
     );
 }
 
-/// AC-12 — the same `bool` decides the incoming-`Disconnect` guard: inside an
-/// open window with the teardown flag still clear it is a failure, and after
-/// the flag flips it is the expected end of the session and is returned.
+/// AC-12 — the same `Session` decides the incoming-`Disconnect` guard: inside
+/// an open window with the teardown flag still clear it is a failure, and
+/// after the flag flips it is the expected end of the session and is returned.
 #[test]
 fn next_event_refuses_an_in_session_disconnect_and_accepts_it_after_teardown() {
     let (tx, rx) = std::sync::mpsc::channel::<EventMsg>();
     let teardown = AtomicBool::new(false);
-    let mut session_open = true;
+    let mut session = common::Session::opened();
 
     tx.send(Ok(rumqttc::Event::Incoming(rumqttc::Packet::Disconnect)))
         .expect("queue the in-session Disconnect");
     assert!(
         matches!(
-            next_event(&rx, GUARD_BOUND, &teardown, &mut session_open),
-            Err(RumqttcOutcome::UnexpectedDisconnect)
+            common::next_event(&rx, GUARD_BOUND, &teardown, &mut session),
+            Err(common::RumqttcOutcome::UnexpectedDisconnect)
         ),
         "a Disconnect before teardown ends the session early"
     );
@@ -550,12 +302,15 @@ fn next_event_refuses_an_in_session_disconnect_and_accepts_it_after_teardown() {
         .expect("queue the teardown Disconnect");
     assert!(
         matches!(
-            next_event(&rx, GUARD_BOUND, &teardown, &mut session_open),
+            common::next_event(&rx, GUARD_BOUND, &teardown, &mut session),
             Ok(rumqttc::Event::Incoming(rumqttc::Packet::Disconnect))
         ),
         "after the teardown flag is set the Disconnect is the expected end"
     );
-    assert!(session_open, "neither Disconnect branch closes the window");
+    assert!(
+        session.is_open(),
+        "neither Disconnect branch closes the window"
+    );
 }
 
 /// AC-13 — `Outgoing` events and the broker's PINGRESP reply are skipped
@@ -566,7 +321,7 @@ fn next_event_refuses_an_in_session_disconnect_and_accepts_it_after_teardown() {
 fn next_event_skips_outgoing_and_pingresp_before_the_awaited_incoming() {
     let (tx, rx) = std::sync::mpsc::channel::<EventMsg>();
     let teardown = AtomicBool::new(false);
-    let mut session_open = true;
+    let mut session = common::Session::opened();
 
     tx.send(Ok(rumqttc::Event::Outgoing(rumqttc::Outgoing::PingReq)))
         .expect("queue the client's own PINGREQ observation");
@@ -579,10 +334,53 @@ fn next_event_skips_outgoing_and_pingresp_before_the_awaited_incoming() {
 
     assert!(
         matches!(
-            next_event(&rx, GUARD_BOUND, &teardown, &mut session_open),
+            common::next_event(&rx, GUARD_BOUND, &teardown, &mut session),
             Ok(rumqttc::Event::Incoming(rumqttc::Packet::PubAck(_)))
         ),
         "the PUBACK behind the skipped events is what the wait returns"
     );
-    assert!(session_open, "skipped events leave the session window open");
+    assert!(
+        session.is_open(),
+        "skipped events leave the session window open"
+    );
+}
+
+/// AC-3 — an outgoing PUBLISH is skipped like any other outgoing event, but
+/// its packet id is recorded in send order first. That record is what ties
+/// an acknowledgement to the publish that earned it, so a broker answering
+/// the wrong flow cannot pass.
+#[test]
+fn next_event_records_outgoing_publish_packet_ids_in_send_order() {
+    let (tx, rx) = std::sync::mpsc::channel::<EventMsg>();
+    let teardown = AtomicBool::new(false);
+    let mut session = common::Session::opened();
+
+    // A QoS 0 publish (pkid 0), then two acknowledged ones, then the PUBACK
+    // the caller is waiting for.
+    for pkid in [0, 7, 9] {
+        tx.send(Ok(rumqttc::Event::Outgoing(rumqttc::Outgoing::Publish(
+            pkid,
+        ))))
+        .expect("queue the client's own publish observation");
+    }
+    tx.send(Ok(rumqttc::Event::Incoming(rumqttc::Packet::PubAck(
+        rumqttc::PubAck::new(7),
+    ))))
+    .expect("queue the awaited PUBACK");
+
+    assert!(
+        matches!(
+            common::next_event(&rx, GUARD_BOUND, &teardown, &mut session),
+            Ok(rumqttc::Event::Incoming(rumqttc::Packet::PubAck(_)))
+        ),
+        "the outgoing publishes are skipped, not returned"
+    );
+    assert_eq!(session.sent_publish_pkid(0), Some(0));
+    assert_eq!(session.sent_publish_pkid(1), Some(7));
+    assert_eq!(session.sent_publish_pkid(2), Some(9));
+    assert_eq!(
+        session.sent_publish_pkid(3),
+        None,
+        "only the observed publishes are recorded"
+    );
 }
