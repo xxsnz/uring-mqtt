@@ -1024,10 +1024,15 @@ const FORCE_CLOSE_DRAIN_SECS: u64 = 5;
 /// deadline even when the refusal is observed a little late.
 const LATE_DRAIN_PROBE_AT: Duration = Duration::from_secs(3);
 /// Drain deadline AC-9 names, and the one the short staying-client test
-/// gives the worker on start. Every other test configures this value too,
-/// but each of them disconnects or drops its client before shutdown, so
-/// only this test holds a live connection across a one-second drain.
+/// gives the worker on start. Most other tests configure a one-second
+/// drain too (`DRAIN_TIMEOUT_SECS`), but only this test keeps a live
+/// client connected across one on purpose.
 const SHORT_DRAIN_SECS: u64 = 1;
+/// How long the short staying-client test holds its own thread still
+/// right after `begin_shutdown()`: twice `SHORT_DRAIN_SECS`, so on an
+/// undelayed harness the force-close at the deadline lands while the test
+/// thread is asleep — schedule stress for any step that needs the drain open.
+const SHORT_DRAIN_STALL: Duration = Duration::from_secs(2 * SHORT_DRAIN_SECS);
 /// Upper bound AC-9 sets on `common::Teardown::join_span` — the harness's own
 /// `BrokerHandle::shutdown()` plus `join()` — in every shutdown test. 10 s
 /// absorbs the longer staying test's 5 s drain and the worker thread
@@ -1062,11 +1067,6 @@ const V3_DRAIN_TOPIC: &str = "itest/v3/during-drain";
 /// Topic the staying-client test publishes to late inside the drain, proving
 /// the worker still serves the connection shortly before the force-close.
 const V3_STAYING_DRAIN_TOPIC: &str = "itest/v3/staying-drain";
-/// Topic the short staying-client test publishes to inside its one-second
-/// drain, proving the worker still serves the connection after the listener
-/// is gone. The one-second window is too short to place the probe late in
-/// the drain, so this one runs as soon as the port refuses.
-const V3_SHORT_DRAIN_TOPIC: &str = "itest/v3/staying-drain-short";
 
 /// AC-9, AC-10 with a drain long enough to probe inside: a rumqttc v3 client
 /// that stays connected after `BrokerHandle::shutdown` holds the drain open
@@ -1106,6 +1106,12 @@ const V3_SHORT_DRAIN_TOPIC: &str = "itest/v3/staying-drain-short";
 /// AC-10 is observed strictly AFTER the teardown report, so the end-of-stream
 /// the client sees is bounded from `join` returning, not from the force-close
 /// racing it.
+///
+/// This is the only staying-client test that sends a publish inside the
+/// drain. The one-second test sets its teardown flag before shutdown and
+/// cannot tell a close at the listener close from one at the deadline, so a
+/// server that closes the client at once yet joins at the deadline is caught
+/// here, by the late round-trip, and nowhere else.
 #[test]
 #[allow(clippy::too_many_lines)]
 fn shutdown_force_closes_a_staying_client_only_after_the_drain_deadline() {
@@ -1223,35 +1229,38 @@ fn shutdown_force_closes_a_staying_client_only_after_the_drain_deadline() {
 }
 
 /// AC-9, AC-10 at the configured one-second deadline: a rumqttc v3 client
-/// that stays connected after `BrokerHandle::shutdown` is still SERVED once
-/// the port refuses, `join` returns no earlier than `SHORT_DRAIN_SECS` and
-/// no later than `JOIN_BOUND` after `BrokerHandle::shutdown()` was called,
-/// and the client then sees its connection end with end-of-stream.
+/// that stays connected after `BrokerHandle::shutdown` holds the drain open,
+/// `join` returns no earlier than `SHORT_DRAIN_SECS` and no later than
+/// `JOIN_BOUND` after `BrokerHandle::shutdown()` was called, and the client
+/// then sees its connection end with end-of-stream.
 ///
-/// This is the same oracle as
+/// This is the only real-client test that deliberately keeps a live
+/// client connected across a configured one-second drain. The raw-socket
+/// in-crate tests `shutdown_then_join_returns_within_drain_deadline` and
+/// `worker_force_closes_all_idle_connections_at_drain_deadline` pin the
+/// same deadline without a protocol client; this test pins it for a
+/// rumqttc session that completed CONNECT and CONNACK.
+///
+/// Nothing here needs the drain to still be open. A one-second drain cannot
+/// hold an in-drain round-trip: the refusal is observed up to one probe
+/// timeout plus one poll interval after the listener closes, and a test
+/// thread descheduled past the deadline would then publish into a
+/// connection a correct server has already force-closed. So the teardown
+/// flag is set BEFORE shutdown starts, every close is classified as
+/// teardown, and the test then sleeps `SHORT_DRAIN_STALL` on purpose. That
+/// stall is schedule stress, not a guarantee: unless the harness or worker
+/// thread is itself delayed by about a second, the force-close lands while
+/// this thread sleeps, so a later step that needs the open drain fails on
+/// almost every run instead of as a rare CI flake.
+///
+/// The cost: this test cannot tell a force-close at the deadline from a
+/// close at the listener close followed by a join at the deadline. The
+/// in-drain liveness probe that rules that out belongs to
 /// `shutdown_force_closes_a_staying_client_only_after_the_drain_deadline`,
-/// at the drain value AC-9 names. Every other test in this file configures
-/// `drain_timeout_secs(1)` as well, but each of them disconnects or drops its
-/// client before shutdown, so a regression confined to a one-second drain
-/// with a LIVE connection would be invisible without this test.
-///
-/// The in-drain liveness fact here is a QoS 1 round-trip, not the bare
-/// refusal observation. A refusal says nothing about this client's socket,
-/// and the teardown flag has to flip before the force-close, so an early
-/// close could otherwise be excused: the driver classifies its terminal
-/// error against the flag at the instant it OBSERVES the error, and a driver
-/// thread descheduled past the flip reads a close that happened at the
-/// listener close as an ordinary post-teardown close, whose queued error
-/// then satisfies the post-join wait. The round-trip closes that race,
-/// because it is consumed while the flag is still clear and no
-/// acknowledgement can arrive on a closed connection. The one-second window
-/// is too short to place that probe LATE inside the drain, so the
-/// shortly-before-the-deadline variant stays in the longer test.
+/// whose five-second drain leaves room for it.
 #[test]
-#[allow(clippy::too_many_lines)]
 fn shutdown_force_closes_a_staying_client_at_the_short_drain_deadline() {
     let harness = common::ServerHarness::start(SHORT_DRAIN_SECS);
-    let port = harness.port();
 
     let mut opts = rumqttc::MqttOptions::new(V3_SHORT_DRAIN_CLIENT_ID, "127.0.0.1", harness.port());
     opts.set_keep_alive(KEEP_ALIVE);
@@ -1280,46 +1289,13 @@ fn shutdown_force_closes_a_staying_client_at_the_short_drain_deadline() {
         "first event was {connack:?}",
     );
 
-    // AC-9's window is timed by the harness thread itself, from its own
-    // `shutdown()` call, which is at or before the worker's drain timer.
-    harness.begin_shutdown();
-    common::wait_until_refusing(port, REFUSING_BOUND);
-
-    // Liveness inside the drain, with the teardown flag still clear: the
-    // listener is gone, yet this connection must still earn a PUBACK and
-    // deliver its payload to the callback. A server that force-closed at the
-    // listener close cannot answer, and the error it leaves is consumed here
-    // as an in-session `ConnectionError` rather than excused as teardown.
-    client
-        .publish(
-            V3_SHORT_DRAIN_TOPIC,
-            rumqttc::QoS::AtLeastOnce,
-            false,
-            QOS1_PAYLOAD.to_vec(),
-        )
-        .expect("in-drain publish call");
-    let puback = common::assert_outcome(
-        common::next_event(&event_rx, ACK_BOUND, &teardown, &mut session),
-        "in-drain PubAck",
-    );
-    assert!(
-        matches!(puback, rumqttc::Event::Incoming(rumqttc::Packet::PubAck(_))),
-        "expected PubAck after the port stopped accepting, got {puback:?}",
-    );
-    assert_eq!(
-        harness.next_publish(CALLBACK_BOUND),
-        seen(
-            V3_SHORT_DRAIN_TOPIC,
-            &QOS1_PAYLOAD,
-            uring_mqtt::QoS::AtLeastOnce,
-            false
-        ),
-        "the in-drain publish reached the callback altered",
-    );
-
-    // Flip the flag before the force-close so it surfaces as
-    // `ClosedAfterDisconnect` rather than a session-window violation.
+    // Set before shutdown starts, so the force-close at the deadline is
+    // classified as teardown however late this thread runs again.
     teardown.store(true, Ordering::SeqCst);
+    // AC-9's window is timed by the harness thread itself, from its own
+    // `shutdown()` call, so the stall below is outside it.
+    harness.begin_shutdown();
+    std::thread::sleep(SHORT_DRAIN_STALL);
 
     let report = harness.finish();
     assert_eq!(report.join, Ok(()), "server join after shutdown");
@@ -1350,7 +1326,7 @@ fn shutdown_force_closes_a_staying_client_at_the_short_drain_deadline() {
     assert_eq!(
         report.unclaimed,
         Vec::new(),
-        "the callback received publishes beyond the one sent",
+        "the callback received a publish although none was sent",
     );
 }
 
