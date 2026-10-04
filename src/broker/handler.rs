@@ -212,6 +212,12 @@ where
             }
             SessionOutcome::Refused
         }
+        ConnectDecision::RefusePersistentSession => {
+            tracing::warn!(
+                "CONNECT refused: persistent session requested (v3 CleanSession=0) from {peer_addr}"
+            );
+            SessionOutcome::Refused
+        }
         ConnectDecision::Accept {
             connack,
             client_id,
@@ -470,14 +476,15 @@ pub(crate) mod tests {
     use std::num::NonZeroU16;
 
     // Wire fixtures (byte literals — server's own encoder never produces expected values).
-    /// v3 CONNECT: ka=60, id "test", flags 0x00. Mirrors `src/codec/version.rs:76-86`.
+    /// v3 CONNECT: ka=60, id "test", flags 0x02 (Clean Session). Same layout as
+    /// `src/codec/version.rs:76-86`, whose flags byte is 0x00 because only version detection reads it.
     const V3_CONNECT_TEST: [u8; 18] = [
-        0x10, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x00, 0x00, 0x3C, 0x00, 0x04, b't',
+        0x10, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x02, 0x00, 0x3C, 0x00, 0x04, b't',
         b'e', b's', b't',
     ];
-    /// v3 CONNECT: ka=1, id "test", flags 0x00 — for keep-alive-expiry tests.
+    /// v3 CONNECT: ka=1, id "test", flags 0x02 (Clean Session) — for keep-alive-expiry tests.
     const V3_CONNECT_TEST_KA1: [u8; 18] = [
-        0x10, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x00, 0x00, 0x01, 0x00, 0x04, b't',
+        0x10, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x02, 0x00, 0x01, 0x00, 0x04, b't',
         b'e', b's', b't',
     ];
     /// v3 CONNECT: ka=60, id "test", reserved flag set (0x01) → decoder emits
@@ -490,12 +497,19 @@ pub(crate) mod tests {
     /// `DecodeError::InvalidProtocol`. Byte index 7 is the only difference from
     /// `V3_CONNECT_TEST`.
     const V3_CONNECT_BAD_PROTOCOL_NAME: [u8; 18] = [
-        0x10, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'X', 0x04, 0x00, 0x00, 0x3C, 0x00, 0x04, b't',
+        0x10, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'X', 0x04, 0x02, 0x00, 0x3C, 0x00, 0x04, b't',
         b'e', b's', b't',
     ];
     /// v3 CONNECT: empty id, clean_session=false → decoder emits `InvalidClientId`.
     const V3_CONNECT_EMPTY_NO_CLEAN: [u8; 14] = [
         0x10, 0x0C, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x00, 0x00, 0x3C, 0x00, 0x00,
+    ];
+    /// v3 CONNECT: ka=60, id "test", flags 0x00 — a named client asking for a
+    /// persistent session (Clean Session 0), which the server refuses without a
+    /// CONNACK. Byte index 9 is the only difference from `V3_CONNECT_TEST`.
+    const V3_CONNECT_PERSISTENT: [u8; 18] = [
+        0x10, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x00, 0x00, 0x3C, 0x00, 0x04, b't',
+        b'e', b's', b't',
     ];
     /// Payload of the `PUBLISH_*_T` fixtures.
     const FIXTURE_PAYLOAD: [u8; 4] = [0x09, 0xC4, 0x03, 0xF5];
@@ -2194,6 +2208,98 @@ pub(crate) mod tests {
         });
     }
 
+    /// AC-2, AC-3, AC-4 — a named v3 CONNECT asking for a persistent session is
+    /// closed with zero bytes written (MQTT-3.2.2-6: no Table 3.1 return code
+    /// applies), the session ends as `SessionOutcome::Refused` — the value the
+    /// worker's accept loop counts as a handshake refusal — and exactly one
+    /// WARN line names the reason and the peer.
+    #[test]
+    fn closes_named_v3_client_asking_for_a_persistent_session_without_connack() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            tcp_write_all(&mut client, &V3_CONNECT_PERSISTENT)
+                .await
+                .expect("write CleanSession=0 CONNECT");
+
+            let got = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(2))
+                .await
+                .expect("read to eof");
+            assert!(
+                got.is_empty(),
+                "expected zero bytes — a CleanSession=0 CONNECT gets no CONNACK — got {got:?}"
+            );
+            let peer = client.local_addr().expect("local_addr").to_string();
+
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            match join_res {
+                Ok(SessionOutcome::Refused) => {}
+                other => panic!("expected SessionOutcome::Refused, got {other:?}"),
+            }
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert_eq!(
+                count_lines_at(&logs, "WARN", "CONNECT refused"),
+                1,
+                "expected exactly one CONNECT-refused WARN line, got: {logs}"
+            );
+            assert!(
+                has_line_at(
+                    &logs,
+                    "WARN",
+                    &[
+                        "CONNECT refused: persistent session requested (v3 CleanSession=0)",
+                        &peer,
+                    ],
+                ),
+                "missing WARN-level persistent-session refusal with complete peer address, got: {logs}"
+            );
+        });
+    }
+
+    /// AC-2, AC-3 — the refusal happens before the packet loop: a client that
+    /// pipelines a QoS 1 PUBLISH behind its CleanSession=0 CONNECT gets neither a
+    /// CONNACK nor a PUBACK, and its reading never reaches the event channel.
+    #[test]
+    fn refused_persistent_session_ingests_no_pipelined_publish() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, mut rx, handle) = spawn_handler(2, 30).await;
+
+            let mut coalesced = Vec::new();
+            coalesced.extend_from_slice(&V3_CONNECT_PERSISTENT);
+            coalesced.extend_from_slice(&PUBLISH_QOS1_T);
+            tcp_write_all(&mut client, &coalesced)
+                .await
+                .expect("coalesced write");
+
+            let got = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(2))
+                .await
+                .expect("read to eof");
+            assert!(
+                got.is_empty(),
+                "expected zero bytes — neither CONNACK nor PUBACK is owed — got {got:?}"
+            );
+
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            match join_res {
+                Ok(SessionOutcome::Refused) => {}
+                other => panic!("expected SessionOutcome::Refused, got {other:?}"),
+            }
+
+            let evt = monoio::time::timeout(Duration::from_millis(300), rx.recv()).await;
+            assert!(
+                matches!(evt, Ok(None)),
+                "expected no event from a refused session's pipelined PUBLISH, got {evt:?}"
+            );
+        });
+    }
+
     #[test]
     fn closes_without_connack_when_first_packet_is_not_connect() {
         let mut rt = build_runtime();
@@ -3749,9 +3855,9 @@ pub(crate) mod tests {
         });
     }
 
-    /// v3 CONNECT: ka=2, id "test", flags 0x00 — for AC-3 keep-alive hardening.
+    /// v3 CONNECT: ka=2, id "test", flags 0x02 (Clean Session) — for AC-3 keep-alive hardening.
     const V3_CONNECT_TEST_KA2: [u8; 18] = [
-        0x10, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x00, 0x00, 0x02, 0x00, 0x04, b't',
+        0x10, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x02, 0x00, 0x02, 0x00, 0x04, b't',
         b'e', b's', b't',
     ];
 
@@ -3768,11 +3874,11 @@ pub(crate) mod tests {
     const V3_CONNECT_FIRST_9: [u8; 9] = [0x10, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04];
 
     /// Last 9 bytes of the v3 CONNECT fixture — completes the CONNECT payload.
-    const V3_CONNECT_LAST_9: [u8; 9] = [0x00, 0x00, 0x3C, 0x00, 0x04, b't', b'e', b's', b't'];
+    const V3_CONNECT_LAST_9: [u8; 9] = [0x02, 0x00, 0x3C, 0x00, 0x04, b't', b'e', b's', b't'];
 
     /// Last 9 bytes of the ka=1 v3 CONNECT fixture — `V3_CONNECT_FIRST_9` is the
     /// shared prefix, so the two together are `V3_CONNECT_TEST_KA1`.
-    const V3_CONNECT_KA1_LAST_9: [u8; 9] = [0x00, 0x00, 0x01, 0x00, 0x04, b't', b'e', b's', b't'];
+    const V3_CONNECT_KA1_LAST_9: [u8; 9] = [0x02, 0x00, 0x01, 0x00, 0x04, b't', b'e', b's', b't'];
 
     /// Bound a `read` so a stuck server cannot hang the test. On expiry
     /// returns `Ok(empty Vec)` so callers asserting "no premature bytes

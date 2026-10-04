@@ -412,6 +412,50 @@ fn v3_client_publish_larger_than_the_initial_read_buffer_reaches_the_callback_in
     );
 }
 
+/// Client identifier the persistent-session v3 connection presents on CONNECT.
+const V3_PERSISTENT_CLIENT_ID: &str = "uring-mqtt-itest-persistent";
+
+/// F2.3 AC-5: a rumqttc v3 client that asks for a persistent session
+/// (`set_clean_session(false)`) is closed before any CONNACK. The first item
+/// its eventloop yields is the end-of-stream error rumqttc raises when the
+/// peer closes while it awaits the CONNACK (0.24.0 `src/framed.rs:37-46`).
+/// The connection is not polled again: rumqttc would reconnect.
+#[test]
+fn v3_client_asking_for_a_persistent_session_is_closed_without_a_connack() {
+    let harness = common::ServerHarness::start(DRAIN_TIMEOUT_SECS);
+
+    let mut opts = rumqttc::MqttOptions::new(V3_PERSISTENT_CLIENT_ID, "127.0.0.1", harness.port());
+    opts.set_clean_session(false);
+    let (client, mut connection) = rumqttc::Client::new(opts, REQUEST_CHANNEL_CAP);
+
+    let started = std::time::Instant::now();
+    let end: rumqttc::ConnectionError = loop {
+        let remaining = CONNACK_BOUND.saturating_sub(started.elapsed());
+        assert!(
+            !remaining.is_zero(),
+            "no CONNACK and no close within {CONNACK_BOUND:?}",
+        );
+        match connection.recv_timeout(remaining) {
+            Ok(Ok(rumqttc::Event::Outgoing(_))) => {}
+            Ok(Ok(incoming)) => panic!(
+                "server answered {incoming:?} to a CleanSession=0 CONNECT: it was not refused",
+            ),
+            Ok(Err(err)) => break err,
+            Err(e) => panic!("connection neither answered nor closed: {e:?}"),
+        }
+    };
+    assert!(
+        common::is_end_of_stream(&end),
+        "expected end-of-stream, got {end:?}",
+    );
+
+    drop(client);
+    drop(connection);
+
+    let report = harness.shutdown_and_join();
+    assert_eq!(report.join, Ok(()), "server join after shutdown");
+}
+
 /// Client identifier the rumqttc v5 connection presents on CONNECT.
 const V5_CLIENT_ID: &str = "uring-mqtt-itest-v5";
 /// Topics the three v5 publishes are sent to, one per QoS level.
@@ -442,7 +486,10 @@ fn v5_client_publishes_at_every_qos_reach_the_callback_exactly() {
 
     // rumqttc v5 forbids keep-alive < 5 s (0.24.0 `src/v5/mod.rs:224`) and
     // defaults to 60 s, so no `set_keep_alive` call here.
-    let opts = rumqttc::v5::MqttOptions::new(V5_CLIENT_ID, "127.0.0.1", harness.port());
+    let mut opts = rumqttc::v5::MqttOptions::new(V5_CLIENT_ID, "127.0.0.1", harness.port());
+    // Clean Start 0: a v5 client asking to continue a session is still served,
+    // with Session Present 0 below (EPIC-SPEC.md §4, "Refused `CleanSession=0`").
+    opts.set_clean_start(false);
     let (client, mut connection) = rumqttc::v5::Client::new(opts, REQUEST_CHANNEL_CAP);
 
     let (event_tx, event_rx): (Sender<V5EventMsg>, V5EventReceiver) = std::sync::mpsc::channel();

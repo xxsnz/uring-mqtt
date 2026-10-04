@@ -37,6 +37,11 @@ pub(crate) enum ConnectDecision {
     /// closes with no reply, the same silent shape the v3 violation close uses.
     /// Always true on v3 and whenever the CONNECT declared no limit.
     Refuse { connack: MqttPacket, sendable: bool },
+    /// Named v3 CONNECT with Clean Session 0: the client asked for a session this
+    /// clean-session-only server cannot keep. Closed without a CONNACK — no MQTT 3.1.1
+    /// Table 3.1 return code applies (MQTT-3.2.2-6). See EPIC-SPEC.md §4,
+    /// "Refused `CleanSession=0`".
+    RefusePersistentSession,
     /// First packet was not CONNECT: close without CONNACK.
     NotConnect,
 }
@@ -82,21 +87,15 @@ pub(crate) fn evaluate_connect(
                     sendable: true,
                 };
             }
-            // `clean_session` is read above and nowhere else: a named client asking
-            // for a persistent session is accepted, and its state still dies with the
-            // connection. That leaves MQTT 3.1.1 §3.1.2.4 ("the Client and Server MUST
-            // store the Session after [they] are disconnected") unsatisfied, which is
-            // the permanent non-goal "Persistent sessions (the crate is
-            // clean-session-only)" in EPIC-PLAN.md "Non-goals" and not a QoS 2 defect:
-            // it does not leave an incomplete QoS 2 exchange redeliverable.
-            // `session_present: false` below is why. It is the protocol's own signal
-            // that no stored state exists for this client id, and §3.2.2.2 obliges a
-            // client that receives it to discard its own session state, so a
-            // conforming client has nothing left to re-send after the reconnect —
-            // §4.4's redelivery duty covers a resumed session, and there is none.
-            // The acceptance and the honest `session_present` are therefore one
-            // mechanism: do not change either half alone. See EPIC-SPEC.md §4,
-            // "Accepted `CleanSession=0`".
+            // A named client asking for a persistent session cannot be served:
+            // the crate stores no session, and MQTT 3.1.1 §4.4 would have the
+            // client re-send an unacknowledged QoS 2 PUBLISH into the next
+            // connection's fresh awaiting-release set, delivering it twice.
+            // No Table 3.1 return code fits, so MQTT-3.2.2-6 directs a close
+            // without a CONNACK. See EPIC-SPEC.md §4, "Refused `CleanSession=0`".
+            if !c.clean_session {
+                return ConnectDecision::RefusePersistentSession;
+            }
             let client_id = if c.client_id.is_empty() {
                 None
             } else {
@@ -260,7 +259,7 @@ mod tests {
 
     #[test]
     fn accepts_v3_connect_with_client_id_and_keepalive() {
-        let packet = v3_connect_with("dev-1", 60, false);
+        let packet = v3_connect_with("dev-1", 60, true);
         let d = evaluate_connect(&packet, 300, peer());
         let ConnectDecision::Accept {
             client_id,
@@ -276,34 +275,61 @@ mod tests {
         assert_eq!(idle_timeout, Duration::from_secs(90));
     }
 
-    /// EPIC-SPEC.md §4 "Accepted `CleanSession=0`" — a named v3 client asking for a
-    /// persistent session is accepted, and the CONNACK it gets reports no stored
-    /// session. `session_present: false` is the load-bearing half, not a detail: it
-    /// is true (the broker keys no state on client id) and it is what MQTT 3.1.1
-    /// §3.2.2.2 makes a conforming client discard its own session state on, so the
-    /// client re-sends no incomplete QoS 2 exchange after a reconnect. An
-    /// implementation that accepted the flag and reported `session_present: true`
-    /// would claim state it does not hold and would invite exactly the duplicate
-    /// delivery this assertion rules out.
+    /// EPIC-SPEC.md §4 "Refused `CleanSession=0`" — a named v3 client asking for
+    /// a persistent session is refused without a CONNACK: the server keeps no
+    /// session state, and MQTT 3.1.1 §4.4 would have the client re-send an
+    /// unacknowledged QoS 2 PUBLISH into a fresh awaiting-release set on its
+    /// next connection, delivering the reading twice.
     #[test]
-    fn accepts_v3_connect_requesting_a_persistent_session() {
+    fn refuses_named_v3_connect_requesting_a_persistent_session() {
         let packet = v3_connect_with("dev-1", 60, false);
         let d = evaluate_connect(&packet, 300, peer());
-        let ConnectDecision::Accept {
-            client_id, connack, ..
-        } = d
-        else {
-            panic!("expected Accept");
-        };
-        assert_eq!(client_id.as_deref(), Some("dev-1"));
-        let MqttPacket::V3(PacketV3::ConnectAck(ack)) = connack else {
-            panic!("expected v3 CONNACK");
-        };
-        assert_eq!(ack.return_code, ConnectAckReason::ConnectionAccepted);
-        assert!(!ack.session_present);
+        assert!(
+            matches!(d, ConnectDecision::RefusePersistentSession),
+            "expected RefusePersistentSession for a named v3 CONNECT with Clean Session 0"
+        );
     }
 
-    /// EPIC-SPEC.md §4 "Accepted `CleanSession=0`", v5 half — however a v5 client
+    /// AC-1 — the Clean Session 0 refusal reads no other CONNECT field: a keep-alive
+    /// of 0, which the accept path answers with the config idle timeout, and a
+    /// keep-alive above the config cap are refused like any other.
+    #[test]
+    fn refuses_persistent_session_whatever_keep_alive_asks() {
+        for keep_alive in [0, 60, 400] {
+            let packet = v3_connect_with("dev-1", keep_alive, false);
+            let d = evaluate_connect(&packet, 300, peer());
+            assert!(
+                matches!(d, ConnectDecision::RefusePersistentSession),
+                "keep_alive {keep_alive}: expected RefusePersistentSession"
+            );
+        }
+    }
+
+    /// AC-1 — a will does not buy a persistent session: the same CONNECT
+    /// `accepts_connect_carrying_will_flag` accepts at Clean Session 1 is refused
+    /// at Clean Session 0.
+    #[test]
+    fn refuses_persistent_session_connect_carrying_will_flag() {
+        let c = Connect {
+            last_will: Some(LastWill {
+                qos: QoS::AtMostOnce,
+                retain: false,
+                topic: "will/topic".to_string().into(),
+                message: Bytes::from_static(b"goodbye"),
+            }),
+            clean_session: false,
+            ..Connect::default()
+        }
+        .client_id("dev-1".to_string());
+        let packet = MqttPacket::V3(PacketV3::Connect(Box::new(c)));
+        let d = evaluate_connect(&packet, 300, peer());
+        assert!(
+            matches!(d, ConnectDecision::RefusePersistentSession),
+            "expected RefusePersistentSession for a CleanSession=0 CONNECT carrying a will"
+        );
+    }
+
+    /// EPIC-SPEC.md §4 "Refused `CleanSession=0`", v5 half — however a v5 client
     /// sets Clean Start, the accepted CONNACK announces a zero session expiry
     /// interval, which tells it the session ends with the connection. The v5 path
     /// therefore needs no discussion at all: the announcement matches what the
@@ -342,7 +368,7 @@ mod tests {
 
     #[test]
     fn keepalive_zero_falls_back_to_config_idle_timeout() {
-        let packet = v3_connect_with("dev-1", 0, false);
+        let packet = v3_connect_with("dev-1", 0, true);
         let d = evaluate_connect(&packet, 300, peer());
         let ConnectDecision::Accept { idle_timeout, .. } = d else {
             panic!("expected Accept");
@@ -352,7 +378,7 @@ mod tests {
 
     #[test]
     fn v3_keepalive_capped_at_config() {
-        let packet = v3_connect_with("dev-1", 400, false);
+        let packet = v3_connect_with("dev-1", 400, true);
         let d = evaluate_connect(&packet, 300, peer());
         let ConnectDecision::Accept {
             idle_timeout,
@@ -368,7 +394,7 @@ mod tests {
 
     #[test]
     fn v3_zero_config_caps_idle_at_zero() {
-        let packet = v3_connect_with("dev-1", 60, false);
+        let packet = v3_connect_with("dev-1", 60, true);
         let d = evaluate_connect(&packet, 0, peer());
         let ConnectDecision::Accept { idle_timeout, .. } = d else {
             panic!("expected Accept");
@@ -477,7 +503,7 @@ mod tests {
 
     #[test]
     fn huge_config_idle_clamped_to_supported_max() {
-        let packet = v3_connect_with("dev-1", 0, false);
+        let packet = v3_connect_with("dev-1", 0, true);
         let d = evaluate_connect(&packet, u64::MAX, peer());
         let ConnectDecision::Accept { idle_timeout, .. } = d else {
             panic!("expected Accept");
@@ -593,7 +619,7 @@ mod tests {
         };
         assert_eq!(max_packet_size, None);
 
-        let packet = v3_connect_with("dev-1", 60, false);
+        let packet = v3_connect_with("dev-1", 60, true);
         let ConnectDecision::Accept {
             max_packet_size, ..
         } = evaluate_connect(&packet, 300, peer())
@@ -712,7 +738,7 @@ mod tests {
     #[test]
     fn v3_odd_keepalive_keeps_half_second_precision() {
         // 3 × 1.5 = 4.5s — proves the grace factor is not truncated to seconds.
-        let packet = v3_connect_with("dev-1", 3, false);
+        let packet = v3_connect_with("dev-1", 3, true);
         let d = evaluate_connect(&packet, 300, peer());
         let ConnectDecision::Accept { idle_timeout, .. } = d else {
             panic!("expected Accept");
@@ -754,6 +780,7 @@ mod tests {
                 topic: "will/topic".to_string().into(),
                 message: Bytes::from_static(b"goodbye"),
             }),
+            clean_session: true,
             ..Connect::default()
         }
         .client_id("dev-1".to_string());
@@ -952,7 +979,7 @@ mod tests {
     /// at the v5 CONNECT only.
     #[test]
     fn v3_connect_is_never_refused_for_packet_size() {
-        let packet = v3_connect_with("dev-1", 60, false);
+        let packet = v3_connect_with("dev-1", 60, true);
         let d = evaluate_connect(&packet, 300, peer());
         assert!(
             matches!(d, ConnectDecision::Accept { .. }),

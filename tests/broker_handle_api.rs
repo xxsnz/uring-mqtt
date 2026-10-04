@@ -27,7 +27,7 @@ const HARNESS_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// v3 CONNECT: ka=60, client id "test" — same fixture as the in-crate suite.
 const V3_CONNECT: [u8; 18] = [
-    0x10, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x00, 0x00, 0x3C, 0x00, 0x04, b't', b'e',
+    0x10, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x02, 0x00, 0x3C, 0x00, 0x04, b't', b'e',
     b's', b't',
 ];
 /// Successful v3 CONNACK.

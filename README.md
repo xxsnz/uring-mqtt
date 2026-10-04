@@ -8,6 +8,7 @@ High-performance MQTT broker using Monoio's `io_uring` runtime for Linux systems
 - **Thread-per-core architecture** - No work-stealing, better cache locality
 - **`SO_REUSEPORT`** - Kernel-level load balancing across worker threads
 - **MQTT v3.1.1 and v5.0** - Full protocol support via rmqtt-codec
+  - v3.1.1 clients must connect with CleanSession=1: a CleanSession=0 CONNECT carrying a client id is closed without a CONNACK and logged at warn, because this clean-session-only server cannot keep a persistent session
 - **Two-tier buffer pool** - Thread-local cache + global pool for efficient memory reuse
 - **Per-worker events** - Local channels without cross-thread synchronization
 

@@ -827,7 +827,7 @@ mod tests {
         // V3_CONNECT_TEST, and reads with a 500ms timeout. The worker is
         // parked, never entered the accept loop, so no CONNACK arrives.
         let connect_bytes: [u8; 18] = [
-            0x10, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x00, 0x00, 0x3C, 0x00, 0x04,
+            0x10, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x02, 0x00, 0x3C, 0x00, 0x04,
             b't', b'e', b's', b't',
         ];
         let mut last_err: Option<std::io::Error> = None;
@@ -1321,7 +1321,7 @@ mod tests {
     // and not importable). These are the only legal handshake for v3
     // CONNACK `[0x20,0x02,0x00,0x00]`.
     const V3_CONNECT_BYTES: [u8; 18] = [
-        0x10, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x00, 0x00, 0x3C, 0x00, 0x04, b't',
+        0x10, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x02, 0x00, 0x3C, 0x00, 0x04, b't',
         b'e', b's', b't',
     ];
     const V3_CONNACK_BYTES: [u8; 4] = [0x20, 0x02, 0x00, 0x00];

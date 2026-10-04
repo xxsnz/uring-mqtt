@@ -589,10 +589,10 @@ mod tests {
         l.local_addr().expect("local_addr").port()
     }
 
-    /// v3 CONNECT: ka=60, id "test", flags 0x00 (copy of the handler test
+    /// v3 CONNECT: ka=60, id "test", flags 0x02, Clean Session (copy of the handler test
     /// module's fixture — those constants are test-module-local).
     const V3_CONNECT_TEST: [u8; 18] = [
-        0x10, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x00, 0x00, 0x3C, 0x00, 0x04, b't',
+        0x10, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x02, 0x00, 0x3C, 0x00, 0x04, b't',
         b'e', b's', b't',
     ];
     /// v3 CONNECT: empty id, clean_session=false → decoder-level
@@ -750,7 +750,7 @@ mod tests {
             .expect("spawn broker");
 
         let v3_connect: [u8; 18] = [
-            0x10, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x00, 0x00, 0x3C, 0x00, 0x04,
+            0x10, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x02, 0x00, 0x3C, 0x00, 0x04,
             b't', b'e', b's', b't',
         ];
         let publish: [u8; 9] = [0x30, 0x07, 0x00, 0x01, b't', 0x09, 0xC4, 0x03, 0xF5];
@@ -811,7 +811,7 @@ mod tests {
             .expect("spawn broker");
 
         let v3_connect: [u8; 18] = [
-            0x10, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x00, 0x00, 0x3C, 0x00, 0x04,
+            0x10, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x02, 0x00, 0x3C, 0x00, 0x04,
             b't', b'e', b's', b't',
         ];
         let publish_qos2: [u8; 11] = [
@@ -887,17 +887,11 @@ mod tests {
     /// Both CONNECTs set the Clean Session flag, so neither session asks the
     /// broker to retain state the crate has no store for: the second delivery
     /// asserted below is what MQTT 3.1.1 prescribes for this input, not a
-    /// departure from it. The same two sessions at `CleanSession=0` reach this
-    /// same second delivery, because the broker accepts that flag and keys no
-    /// state on client id — but only for a client that re-publishes of its own
-    /// accord, which is a new message either way. A conforming client does not
-    /// re-send the *incomplete* exchange there: the accepted CONNACK reports
-    /// `session_present: false`, and MQTT 3.1.1 §3.2.2.2 makes it discard its
-    /// own session state on that signal. See EPIC-SPEC.md §4, "Accepted
-    /// `CleanSession=0`"; the admission side is pinned by
-    /// `handshake::tests::accepts_v3_connect_requesting_a_persistent_session`.
-    /// This fixture keeps the flag set so that what it pins is the
-    /// per-connection scope alone.
+    /// departure from it. A named v3 CONNECT at `CleanSession=0` never reaches
+    /// this path: it is refused without a CONNACK, because MQTT 3.1.1 §4.4
+    /// would have that client re-send the incomplete exchange into the fresh
+    /// set this test pins (EPIC-SPEC.md §4, "Refused `CleanSession=0`"; pinned by
+    /// `handshake::tests::refuses_named_v3_connect_requesting_a_persistent_session`).
     #[test]
     fn run_starts_each_connection_with_a_fresh_awaiting_release_set() {
         let port = find_free_port();
