@@ -11,7 +11,9 @@
 
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
-use uring_mqtt::{BrokerConfig, Error, MqttBroker, Publish, PublishCallback, QoS};
+use uring_mqtt::{
+    BrokerConfig, Error, MaxInboundPacketSize, MqttBroker, Publish, PublishCallback, QoS,
+};
 
 /// Workers started by the retained-handle test — more than one, so the
 /// signal is not trivially satisfied by a single dying thread.
@@ -386,5 +388,268 @@ fn is_running_goes_false_after_a_callback_panic_without_shutdown() {
     assert!(
         false_after_panic,
         "is_running stayed true for more than 10 s after a callback panic"
+    );
+}
+
+/// AC-8, AC-9 — a configured, non-default bound reaches enforcement through
+/// the worker path: the server hands a PUBLISH exactly at the bound to the
+/// callback and closes the connection for one PUBLISH one byte over it, with
+/// no partial delivery of the over-bound payload.
+#[test]
+fn configured_inbound_bound_delivers_at_the_bound_and_closes_one_byte_over() {
+    /// Non-default bound this test configures the server with.
+    const CONFIGURED_BOUND: u32 = 64;
+    /// Temperature of the baseline reading — any value the panicking
+    /// callback does not key on.
+    const QUIET_TEMPERATURE_FOR_BOUND: i16 = 2500;
+
+    let (tx, rx) = std::sync::mpsc::channel::<(bool, Vec<usize>)>();
+    let _h = std::thread::Builder::new()
+        .name("api-inbound-bound".into())
+        .spawn(move || {
+            let outcome = (|| -> Result<(), Error> {
+                let port = find_free_port();
+                let addr: std::net::SocketAddr = format!("127.0.0.1:{port}")
+                    .parse()
+                    .expect("parse loopback addr");
+                let config = BrokerConfig::new(format!("127.0.0.1:{port}"))
+                    .num_workers(1)
+                    .drain_timeout_secs(DRAIN_TIMEOUT_SECS)
+                    .max_inbound_packet_size(
+                        MaxInboundPacketSize::new(CONFIGURED_BOUND).expect("in range"),
+                    );
+
+                let (seen_tx, seen_rx) = std::sync::mpsc::channel::<usize>();
+                let callback: PublishCallback = std::sync::Arc::new(move |publish: &Publish| {
+                    let _ = seen_tx.send(publish.payload().len());
+                });
+                let handle = MqttBroker::start_with_callback(config, Some(callback))?;
+
+                let mut client =
+                    connect_and_publish(addr, QUIET_TEMPERATURE_FOR_BOUND).map_err(|_| {
+                        Error::Worker("baseline publish did not reach the server".into())
+                    })?;
+                let baseline = seen_rx
+                    .recv_timeout(HARNESS_TIMEOUT)
+                    .map_err(|_| Error::Worker("baseline publish not delivered".into()))?;
+                assert_eq!(
+                    baseline, 4,
+                    "baseline publish must be the 4-byte sensor payload"
+                );
+
+                let mut at_bound = vec![0x30, 0x3E, 0x00, 0x01, b't'];
+                at_bound.extend(std::iter::repeat_n(0u8, 59));
+                client
+                    .write_all(&at_bound)
+                    .map_err(|_| Error::Worker("at-bound publish write failed".into()))?;
+                let at_bound_len = seen_rx
+                    .recv_timeout(HARNESS_TIMEOUT)
+                    .map_err(|_| Error::Worker("at-bound publish not delivered".into()))?;
+                assert_eq!(at_bound_len, 59, "at-bound publish must reach the callback");
+
+                let mut over_bound = vec![0x30, 0x3F, 0x00, 0x01, b't'];
+                over_bound.extend(std::iter::repeat_n(0u8, 60));
+                client
+                    .write_all(&over_bound)
+                    .map_err(|_| Error::Worker("over-bound publish write failed".into()))?;
+
+                let mut probe = [0u8; 1];
+                let closed = match client.read(&mut probe) {
+                    Ok(0) => true,
+                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => true,
+                    Ok(_) | Err(_) => false,
+                };
+
+                drop(client);
+                handle.shutdown();
+                drop(handle);
+                let late: Vec<usize> = seen_rx.try_iter().collect();
+                let _ = tx.send((closed, late));
+                Ok(())
+            })();
+            if outcome.is_err() {
+                let _ = tx.send((false, Vec::new()));
+            }
+        })
+        .expect("spawn harness");
+
+    let Ok((closed, late)) = rx.recv_timeout(HARNESS_TIMEOUT) else {
+        panic!("harness did not report within {HARNESS_TIMEOUT:?}")
+    };
+    assert!(
+        closed,
+        "the over-bound PUBLISH did not close the connection"
+    );
+    assert!(
+        late.is_empty(),
+        "the over-bound payload reached the callback: {late:?}"
+    );
+}
+
+/// AC-19 — a configured, non-default bound reaches the version-detection
+/// phase too: a header-only first packet over the configured bound (but far
+/// under the default) closes within the read bound. This proves
+/// `VersionDecoder` receives the configured bound, not the default.
+#[test]
+fn configured_inbound_bound_closes_a_header_only_first_packet_at_once() {
+    /// Non-default bound this test configures the server with — same value
+    /// as `configured_inbound_bound_delivers_at_the_bound_and_closes_one_byte_over`.
+    const CONFIGURED_BOUND: u32 = 64;
+    /// Handshake budget generous enough that a timeout close cannot pass as
+    /// the bound close.
+    const HEADER_ONLY_HANDSHAKE_SECS: u64 = 10;
+    /// Read-timeout bound on the probe read after the header-only write.
+    const HEADER_ONLY_CLOSE_BOUND: Duration = Duration::from_secs(1);
+
+    let (tx, rx) = std::sync::mpsc::channel::<bool>();
+    let _h = std::thread::Builder::new()
+        .name("api-header-only-bound".into())
+        .spawn(move || {
+            let outcome = (|| -> Result<(), Error> {
+                let port = find_free_port();
+                let addr: std::net::SocketAddr = format!("127.0.0.1:{port}")
+                    .parse()
+                    .expect("parse loopback addr");
+                let config = BrokerConfig::new(format!("127.0.0.1:{port}"))
+                    .num_workers(1)
+                    .drain_timeout_secs(DRAIN_TIMEOUT_SECS)
+                    .connection_timeout_secs(HEADER_ONLY_HANDSHAKE_SECS)
+                    .max_inbound_packet_size(
+                        MaxInboundPacketSize::new(CONFIGURED_BOUND).expect("in range"),
+                    );
+
+                let handle = MqttBroker::start(config)?;
+
+                let mut connected = None;
+                for _ in 0..CONNECT_ATTEMPTS {
+                    match std::net::TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+                        Ok(s) => {
+                            connected = Some(s);
+                            break;
+                        }
+                        Err(_) => std::thread::sleep(CONNECT_RETRY_INTERVAL),
+                    }
+                }
+                let Some(mut client) = connected else {
+                    return Err(Error::Worker(
+                        "no connection within the retry window".into(),
+                    ));
+                };
+                client
+                    .set_read_timeout(Some(HEADER_ONLY_CLOSE_BOUND))
+                    .map_err(Error::Io)?;
+                client.write_all(&[0x10, 0x3F]).map_err(Error::Io)?;
+
+                let mut probe = [0u8; 1];
+                let closed = match client.read(&mut probe) {
+                    Ok(0) => true,
+                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => true,
+                    Ok(_) | Err(_) => false,
+                };
+
+                drop(client);
+                handle.shutdown();
+                drop(handle);
+                let _ = tx.send(closed);
+                Ok(())
+            })();
+            if outcome.is_err() {
+                let _ = tx.send(false);
+            }
+        })
+        .expect("spawn harness");
+
+    let Ok(closed) = rx.recv_timeout(HARNESS_TIMEOUT) else {
+        panic!("harness did not report within {HARNESS_TIMEOUT:?}")
+    };
+    assert!(
+        closed,
+        "the header-only over-the-configured-bound first packet did not close the connection"
+    );
+}
+
+/// AC-14 — a configured, non-default inbound bound reaches the v5 CONNACK's
+/// Maximum Packet Size property through the public API, not just the
+/// in-crate seam.
+#[test]
+fn v5_connack_advertises_the_configured_inbound_bound() {
+    /// Non-default bound this test configures the server with.
+    const ADVERTISED_BOUND: u32 = 4096;
+    /// v5 CONNECT: ka=60, client id "test".
+    const V5_CONNECT: [u8; 19] = [
+        0x10, 0x11, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x05, 0x02, 0x00, 0x3C, 0x00, 0x00, 0x04,
+        b't', b'e', b's', b't',
+    ];
+    /// Accept CONNACK advertising a 4096-byte Maximum Packet Size.
+    const V5_CONNACK_ADVERTISING_4096: [u8; 15] = [
+        0x20, 0x0D, 0x00, 0x00, 0x0A, 0x11, 0x00, 0x00, 0x00, 0x00, 0x27, 0x00, 0x00, 0x10, 0x00,
+    ];
+
+    let (tx, rx) = std::sync::mpsc::channel::<Result<[u8; 15], String>>();
+    let _h = std::thread::Builder::new()
+        .name("api-v5-connack-bound".into())
+        .spawn(move || {
+            let outcome = (|| -> Result<(), Error> {
+                let port = find_free_port();
+                let addr: std::net::SocketAddr = format!("127.0.0.1:{port}")
+                    .parse()
+                    .expect("parse loopback addr");
+                let config = BrokerConfig::new(format!("127.0.0.1:{port}"))
+                    .num_workers(1)
+                    .drain_timeout_secs(DRAIN_TIMEOUT_SECS)
+                    .max_inbound_packet_size(
+                        MaxInboundPacketSize::new(ADVERTISED_BOUND).expect("in range"),
+                    );
+
+                let handle = MqttBroker::start(config)?;
+
+                let mut connected = None;
+                for _ in 0..CONNECT_ATTEMPTS {
+                    match std::net::TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+                        Ok(s) => {
+                            connected = Some(s);
+                            break;
+                        }
+                        Err(_) => std::thread::sleep(CONNECT_RETRY_INTERVAL),
+                    }
+                }
+                let Some(mut client) = connected else {
+                    return Err(Error::Worker(
+                        "no connection within the retry window".into(),
+                    ));
+                };
+                client
+                    .set_read_timeout(Some(IO_TIMEOUT))
+                    .map_err(Error::Io)?;
+                client
+                    .set_write_timeout(Some(IO_TIMEOUT))
+                    .map_err(Error::Io)?;
+                client.write_all(&V5_CONNECT).map_err(Error::Io)?;
+
+                let mut connack = [0u8; 15];
+                let read_result = client
+                    .read_exact(&mut connack)
+                    .map_err(|e| e.to_string())
+                    .map(|()| connack);
+                let _ = tx.send(read_result);
+
+                drop(client);
+                handle.shutdown();
+                drop(handle);
+                Ok(())
+            })();
+            if let Err(e) = outcome {
+                let _ = tx.send(Err(e.to_string()));
+            }
+        })
+        .expect("spawn harness");
+
+    let Ok(read_result) = rx.recv_timeout(HARNESS_TIMEOUT) else {
+        panic!("harness did not report within {HARNESS_TIMEOUT:?}")
+    };
+    let connack = read_result.expect("CONNACK read");
+    assert_eq!(
+        connack, V5_CONNACK_ADVERTISING_4096,
+        "accept CONNACK must advertise the configured 4096-byte inbound bound"
     );
 }

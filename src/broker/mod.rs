@@ -3,6 +3,8 @@ pub(crate) mod handshake;
 mod packet;
 pub(crate) mod worker;
 
+pub use crate::codec::mqtt::MaxInboundPacketSize;
+
 use crate::error::Error;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -30,6 +32,10 @@ pub struct BrokerConfig {
     pub num_workers: Option<usize>,
     /// TCP listen backlog
     pub backlog: i32,
+    /// Largest inbound packet, in total wire bytes. An over-bound first packet
+    /// closes the connection without a reply; after acceptance v5 receives
+    /// DISCONNECT 0x95 and v3 a close. Advertised in every v5 CONNACK.
+    pub max_inbound_packet_size: MaxInboundPacketSize,
     /// Test hook key: selects this broker's `worker::SETUP_OVERFLOW` entry.
     /// A key, not the bind address — two tests may share a port.
     #[cfg(test)]
@@ -46,6 +52,7 @@ impl BrokerConfig {
             drain_timeout_secs: DEFAULT_DRAIN_TIMEOUT_SECS,
             num_workers: None,
             backlog: 1024,
+            max_inbound_packet_size: MaxInboundPacketSize::DEFAULT,
             #[cfg(test)]
             overflow_token: None,
         }
@@ -78,6 +85,11 @@ impl BrokerConfig {
 
     pub fn backlog(mut self, backlog: i32) -> Self {
         self.backlog = backlog;
+        self
+    }
+
+    pub fn max_inbound_packet_size(mut self, bound: MaxInboundPacketSize) -> Self {
+        self.max_inbound_packet_size = bound;
         self
     }
 
@@ -623,6 +635,7 @@ mod tests {
         assert_eq!(config.drain_timeout_secs, 5);
         assert!(config.num_workers.is_none());
         assert_eq!(config.backlog, 1024);
+        assert_eq!(config.max_inbound_packet_size.get(), 131_072);
     }
 
     #[test]
@@ -640,7 +653,8 @@ mod tests {
             .idle_timeout_secs(120)
             .drain_timeout_secs(20)
             .num_workers(4)
-            .backlog(512);
+            .backlog(512)
+            .max_inbound_packet_size(MaxInboundPacketSize::new(4096).expect("in range"));
 
         assert_eq!(config.max_connections_per_worker, 500);
         assert_eq!(config.connection_timeout_secs, 5);
@@ -648,6 +662,7 @@ mod tests {
         assert_eq!(config.drain_timeout_secs, 20);
         assert_eq!(config.num_workers, Some(4));
         assert_eq!(config.backlog, 512);
+        assert_eq!(config.max_inbound_packet_size.get(), 4096);
     }
 
     #[test]

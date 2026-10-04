@@ -2,7 +2,9 @@ use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::time::Duration;
 
-use crate::codec::mqtt::{ConnectAck, ConnectAckReason, MqttPacket, PacketV3, PacketV5};
+use crate::codec::mqtt::{
+    ConnectAck, ConnectAckReason, MaxInboundPacketSize, MqttPacket, PacketV3, PacketV5,
+};
 use crate::codec::version::ProtocolVersion;
 use rmqtt_codec::types::QoS;
 use rmqtt_codec::v5::ConnectAckReason as V5ConnectAckReason;
@@ -50,8 +52,12 @@ pub(crate) enum ConnectDecision {
 /// when it fits the Maximum Packet Size the CONNECT declared. Built from a
 /// clone because `MqttPacket` is not `Clone` and measuring a packet
 /// consumes it.
-fn refuse_v5(reason: V5ConnectAckReason, max_packet_size: Option<NonZeroU32>) -> ConnectDecision {
-    let ack = honest_v5_connack(reason);
+fn refuse_v5(
+    reason: V5ConnectAckReason,
+    max_packet_size: Option<NonZeroU32>,
+    max_inbound_packet_size: MaxInboundPacketSize,
+) -> ConnectDecision {
+    let ack = honest_v5_connack(reason, max_inbound_packet_size);
     let sendable = super::packet::fits_max_packet_size(
         MqttPacket::V5(PacketV5::ConnectAck(Box::new(ack.clone()))),
         ProtocolVersion::MQTT5,
@@ -72,6 +78,7 @@ pub(crate) fn evaluate_connect(
     packet: &MqttPacket,
     config_idle_timeout_secs: u64,
     peer_addr: SocketAddr, // source for v5 assigned_client_id
+    max_inbound_packet_size: MaxInboundPacketSize,
 ) -> ConnectDecision {
     let cfg = config_idle_timeout_secs.min(MAX_TIMEOUT_SECS);
     let cfg_duration = Duration::from_secs(cfg);
@@ -123,6 +130,7 @@ pub(crate) fn evaluate_connect(
                 return refuse_v5(
                     V5ConnectAckReason::BadAuthenticationMethod,
                     c.max_packet_size,
+                    max_inbound_packet_size,
                 );
             }
             let assigned = if c.client_id.is_empty() {
@@ -153,7 +161,8 @@ pub(crate) fn evaluate_connect(
                 }
             };
             let client_id = Some(assigned.clone().unwrap_or_else(|| c.client_id.to_string()));
-            let mut connack = honest_v5_connack(V5ConnectAckReason::Success);
+            let mut connack =
+                honest_v5_connack(V5ConnectAckReason::Success, max_inbound_packet_size);
             connack.assigned_client_id = assigned.map(Into::into);
             connack.server_keepalive_sec = announce;
             // A client whose declared Maximum Packet Size cannot hold the CONNACK it
@@ -169,6 +178,7 @@ pub(crate) fn evaluate_connect(
                 return refuse_v5(
                     V5ConnectAckReason::ImplementationSpecificError,
                     c.max_packet_size,
+                    max_inbound_packet_size,
                 );
             }
             ConnectDecision::Accept {
@@ -204,7 +214,13 @@ pub(crate) const MAX_QOS: QoS = QoS::ExactlyOnce;
 /// deletion. `retain_available` stays `true` as a recorded exception in
 /// EPIC-SPEC.md §4: it promises the flag is accepted, not that a retained
 /// copy survives.
-pub(crate) fn honest_v5_connack(reason: V5ConnectAckReason) -> rmqtt_codec::v5::ConnectAck {
+///
+/// It advertises the inbound packet-size bound in the Maximum Packet Size
+/// property, so the bare CONNACK is 15 bytes.
+pub(crate) fn honest_v5_connack(
+    reason: V5ConnectAckReason,
+    max_inbound_packet_size: MaxInboundPacketSize,
+) -> rmqtt_codec::v5::ConnectAck {
     rmqtt_codec::v5::ConnectAck {
         reason_code: reason,
         max_qos: MAX_QOS,
@@ -213,6 +229,7 @@ pub(crate) fn honest_v5_connack(reason: V5ConnectAckReason) -> rmqtt_codec::v5::
         subscription_identifiers_available: true,
         shared_subscription_available: true,
         session_expiry_interval_secs: Some(0),
+        max_packet_size: Some(max_inbound_packet_size.get()),
         ..Default::default()
     }
 }
@@ -260,7 +277,7 @@ mod tests {
     #[test]
     fn accepts_v3_connect_with_client_id_and_keepalive() {
         let packet = v3_connect_with("dev-1", 60, true);
-        let d = evaluate_connect(&packet, 300, peer());
+        let d = evaluate_connect(&packet, 300, peer(), MaxInboundPacketSize::DEFAULT);
         let ConnectDecision::Accept {
             client_id,
             keep_alive_secs,
@@ -283,7 +300,7 @@ mod tests {
     #[test]
     fn refuses_named_v3_connect_requesting_a_persistent_session() {
         let packet = v3_connect_with("dev-1", 60, false);
-        let d = evaluate_connect(&packet, 300, peer());
+        let d = evaluate_connect(&packet, 300, peer(), MaxInboundPacketSize::DEFAULT);
         assert!(
             matches!(d, ConnectDecision::RefusePersistentSession),
             "expected RefusePersistentSession for a named v3 CONNECT with Clean Session 0"
@@ -297,7 +314,7 @@ mod tests {
     fn refuses_persistent_session_whatever_keep_alive_asks() {
         for keep_alive in [0, 60, 400] {
             let packet = v3_connect_with("dev-1", keep_alive, false);
-            let d = evaluate_connect(&packet, 300, peer());
+            let d = evaluate_connect(&packet, 300, peer(), MaxInboundPacketSize::DEFAULT);
             assert!(
                 matches!(d, ConnectDecision::RefusePersistentSession),
                 "keep_alive {keep_alive}: expected RefusePersistentSession"
@@ -322,7 +339,7 @@ mod tests {
         }
         .client_id("dev-1".to_string());
         let packet = MqttPacket::V3(PacketV3::Connect(Box::new(c)));
-        let d = evaluate_connect(&packet, 300, peer());
+        let d = evaluate_connect(&packet, 300, peer(), MaxInboundPacketSize::DEFAULT);
         assert!(
             matches!(d, ConnectDecision::RefusePersistentSession),
             "expected RefusePersistentSession for a CleanSession=0 CONNECT carrying a will"
@@ -338,7 +355,8 @@ mod tests {
     fn v5_accept_announces_zero_session_expiry_whatever_clean_start_asked() {
         for clean_start in [false, true] {
             let packet = v5_connect_with("dev5", 60, clean_start, None);
-            let ConnectDecision::Accept { connack, .. } = evaluate_connect(&packet, 300, peer())
+            let ConnectDecision::Accept { connack, .. } =
+                evaluate_connect(&packet, 300, peer(), MaxInboundPacketSize::DEFAULT)
             else {
                 panic!("clean_start {clean_start}: expected Accept");
             };
@@ -352,7 +370,7 @@ mod tests {
     #[test]
     fn preserves_supplied_v5_client_id() {
         let packet = v5_connect_with("dev5", 60, false, None);
-        let d = evaluate_connect(&packet, 300, peer());
+        let d = evaluate_connect(&packet, 300, peer(), MaxInboundPacketSize::DEFAULT);
         let ConnectDecision::Accept {
             client_id, connack, ..
         } = d
@@ -369,7 +387,7 @@ mod tests {
     #[test]
     fn keepalive_zero_falls_back_to_config_idle_timeout() {
         let packet = v3_connect_with("dev-1", 0, true);
-        let d = evaluate_connect(&packet, 300, peer());
+        let d = evaluate_connect(&packet, 300, peer(), MaxInboundPacketSize::DEFAULT);
         let ConnectDecision::Accept { idle_timeout, .. } = d else {
             panic!("expected Accept");
         };
@@ -379,7 +397,7 @@ mod tests {
     #[test]
     fn v3_keepalive_capped_at_config() {
         let packet = v3_connect_with("dev-1", 400, true);
-        let d = evaluate_connect(&packet, 300, peer());
+        let d = evaluate_connect(&packet, 300, peer(), MaxInboundPacketSize::DEFAULT);
         let ConnectDecision::Accept {
             idle_timeout,
             keep_alive_secs,
@@ -395,7 +413,7 @@ mod tests {
     #[test]
     fn v3_zero_config_caps_idle_at_zero() {
         let packet = v3_connect_with("dev-1", 60, true);
-        let d = evaluate_connect(&packet, 0, peer());
+        let d = evaluate_connect(&packet, 0, peer(), MaxInboundPacketSize::DEFAULT);
         let ConnectDecision::Accept { idle_timeout, .. } = d else {
             panic!("expected Accept");
         };
@@ -405,7 +423,7 @@ mod tests {
     #[test]
     fn v5_capped_keepalive_announces_consistent_server_keepalive() {
         let packet = v5_connect_with("dev5", 400, true, None);
-        let d = evaluate_connect(&packet, 300, peer());
+        let d = evaluate_connect(&packet, 300, peer(), MaxInboundPacketSize::DEFAULT);
         let ConnectDecision::Accept {
             connack,
             keep_alive_secs,
@@ -426,7 +444,7 @@ mod tests {
     #[test]
     fn v5_cap_non_divisible_by_three_rounds_down() {
         let packet = v5_connect_with("dev5", 200, true, None);
-        let d = evaluate_connect(&packet, 100, peer());
+        let d = evaluate_connect(&packet, 100, peer(), MaxInboundPacketSize::DEFAULT);
         let ConnectDecision::Accept {
             connack,
             idle_timeout,
@@ -445,7 +463,7 @@ mod tests {
     #[test]
     fn v5_degenerate_cap_announces_at_least_one_second() {
         let packet = v5_connect_with("dev5", 60, true, None);
-        let d = evaluate_connect(&packet, 1, peer());
+        let d = evaluate_connect(&packet, 1, peer(), MaxInboundPacketSize::DEFAULT);
         let ConnectDecision::Accept {
             connack,
             idle_timeout,
@@ -464,7 +482,7 @@ mod tests {
     #[test]
     fn v5_zero_config_with_positive_keepalive_announces_one_second() {
         let packet = v5_connect_with("dev5", 60, true, None);
-        let d = evaluate_connect(&packet, 0, peer());
+        let d = evaluate_connect(&packet, 0, peer(), MaxInboundPacketSize::DEFAULT);
         let ConnectDecision::Accept {
             connack,
             idle_timeout,
@@ -483,7 +501,7 @@ mod tests {
     #[test]
     fn v5_uncapped_keepalive_has_no_announcement() {
         let packet = v5_connect_with("dev5", 2, true, None);
-        let d = evaluate_connect(&packet, 30, peer());
+        let d = evaluate_connect(&packet, 30, peer(), MaxInboundPacketSize::DEFAULT);
         let ConnectDecision::Accept {
             connack,
             keep_alive_secs,
@@ -504,7 +522,7 @@ mod tests {
     #[test]
     fn huge_config_idle_clamped_to_supported_max() {
         let packet = v3_connect_with("dev-1", 0, true);
-        let d = evaluate_connect(&packet, u64::MAX, peer());
+        let d = evaluate_connect(&packet, u64::MAX, peer(), MaxInboundPacketSize::DEFAULT);
         let ConnectDecision::Accept { idle_timeout, .. } = d else {
             panic!("expected Accept");
         };
@@ -514,7 +532,7 @@ mod tests {
     #[test]
     fn rejects_v5_connect_with_auth_method() {
         let packet = v5_connect_with("dev5", 60, true, Some("PLAIN"));
-        let d = evaluate_connect(&packet, 300, peer());
+        let d = evaluate_connect(&packet, 300, peer(), MaxInboundPacketSize::DEFAULT);
         let ConnectDecision::Refuse { connack, .. } = d else {
             panic!("expected Refuse");
         };
@@ -530,7 +548,7 @@ mod tests {
     #[test]
     fn refuses_v3_empty_client_id_without_clean_session() {
         let packet = MqttPacket::V3(PacketV3::Connect(Box::<Connect>::default()));
-        let d = evaluate_connect(&packet, 300, peer());
+        let d = evaluate_connect(&packet, 300, peer(), MaxInboundPacketSize::DEFAULT);
         let ConnectDecision::Refuse { connack, .. } = d else {
             panic!("expected Refuse");
         };
@@ -546,7 +564,7 @@ mod tests {
     #[test]
     fn accepts_v3_empty_client_id_with_clean_session_as_anonymous() {
         let packet = v3_connect_with("", 60, true);
-        let d = evaluate_connect(&packet, 300, peer());
+        let d = evaluate_connect(&packet, 300, peer(), MaxInboundPacketSize::DEFAULT);
         let ConnectDecision::Accept { client_id, .. } = d else {
             panic!("expected Accept");
         };
@@ -556,7 +574,7 @@ mod tests {
     #[test]
     fn assigns_client_id_to_v5_empty_client_id() {
         let packet = v5_connect_with("", 0, true, None);
-        let d = evaluate_connect(&packet, 60, peer());
+        let d = evaluate_connect(&packet, 60, peer(), MaxInboundPacketSize::DEFAULT);
         let ConnectDecision::Accept {
             client_id, connack, ..
         } = d
@@ -574,7 +592,7 @@ mod tests {
     #[test]
     fn v5_accept_connack_is_honest_about_capabilities() {
         let packet = v5_connect_with("dev5", 60, true, None);
-        let d = evaluate_connect(&packet, 60, peer());
+        let d = evaluate_connect(&packet, 60, peer(), MaxInboundPacketSize::DEFAULT);
         let ConnectDecision::Accept { connack, .. } = d else {
             panic!("expected Accept");
         };
@@ -604,7 +622,7 @@ mod tests {
         let packet = MqttPacket::V5(PacketV5::Connect(Box::new(c)));
         let ConnectDecision::Accept {
             max_packet_size, ..
-        } = evaluate_connect(&packet, 300, peer())
+        } = evaluate_connect(&packet, 300, peer(), MaxInboundPacketSize::DEFAULT)
         else {
             panic!("expected Accept");
         };
@@ -613,7 +631,7 @@ mod tests {
         let packet = v5_connect_with("dev5", 60, true, None);
         let ConnectDecision::Accept {
             max_packet_size, ..
-        } = evaluate_connect(&packet, 300, peer())
+        } = evaluate_connect(&packet, 300, peer(), MaxInboundPacketSize::DEFAULT)
         else {
             panic!("expected Accept");
         };
@@ -622,7 +640,7 @@ mod tests {
         let packet = v3_connect_with("dev-1", 60, true);
         let ConnectDecision::Accept {
             max_packet_size, ..
-        } = evaluate_connect(&packet, 300, peer())
+        } = evaluate_connect(&packet, 300, peer(), MaxInboundPacketSize::DEFAULT)
         else {
             panic!("expected Accept");
         };
@@ -632,7 +650,7 @@ mod tests {
     #[test]
     fn v5_keepalive_zero_falls_back_to_config_without_announcement() {
         let packet = v5_connect_with("dev5", 0, true, None);
-        let d = evaluate_connect(&packet, 300, peer());
+        let d = evaluate_connect(&packet, 300, peer(), MaxInboundPacketSize::DEFAULT);
         let ConnectDecision::Accept {
             connack,
             keep_alive_secs,
@@ -654,7 +672,7 @@ mod tests {
     fn v5_keepalive_exactly_at_config_is_not_capped() {
         // 2 × 1.5 = 3s, config 3s — the cap comparison is `<=`, so no cap fires.
         let packet = v5_connect_with("dev5", 2, true, None);
-        let d = evaluate_connect(&packet, 3, peer());
+        let d = evaluate_connect(&packet, 3, peer(), MaxInboundPacketSize::DEFAULT);
         let ConnectDecision::Accept {
             connack,
             keep_alive_secs,
@@ -676,7 +694,7 @@ mod tests {
     fn v5_keepalive_one_second_over_config_is_capped() {
         // 2 × 1.5 = 3s against config 2s — one second past the boundary above.
         let packet = v5_connect_with("dev5", 2, true, None);
-        let d = evaluate_connect(&packet, 2, peer());
+        let d = evaluate_connect(&packet, 2, peer(), MaxInboundPacketSize::DEFAULT);
         let ConnectDecision::Accept {
             connack,
             keep_alive_secs,
@@ -697,7 +715,7 @@ mod tests {
     #[test]
     fn v5_huge_config_idle_clamped_to_supported_max() {
         let packet = v5_connect_with("dev5", 0, true, None);
-        let d = evaluate_connect(&packet, u64::MAX, peer());
+        let d = evaluate_connect(&packet, u64::MAX, peer(), MaxInboundPacketSize::DEFAULT);
         let ConnectDecision::Accept {
             connack,
             idle_timeout,
@@ -717,7 +735,7 @@ mod tests {
     fn v5_maximum_keepalive_under_generous_config_is_not_capped() {
         // 65535 × 1.5 = 98302.5s — the largest keep-alive a client can request.
         let packet = v5_connect_with("dev5", u16::MAX, true, None);
-        let d = evaluate_connect(&packet, 200_000, peer());
+        let d = evaluate_connect(&packet, 200_000, peer(), MaxInboundPacketSize::DEFAULT);
         let ConnectDecision::Accept {
             connack,
             keep_alive_secs,
@@ -739,7 +757,7 @@ mod tests {
     fn v3_odd_keepalive_keeps_half_second_precision() {
         // 3 × 1.5 = 4.5s — proves the grace factor is not truncated to seconds.
         let packet = v3_connect_with("dev-1", 3, true);
-        let d = evaluate_connect(&packet, 300, peer());
+        let d = evaluate_connect(&packet, 300, peer(), MaxInboundPacketSize::DEFAULT);
         let ConnectDecision::Accept { idle_timeout, .. } = d else {
             panic!("expected Accept");
         };
@@ -750,7 +768,7 @@ mod tests {
     fn refuses_v5_auth_method_even_with_empty_client_id() {
         // The auth_method refusal outranks client-id assignment.
         let packet = v5_connect_with("", 60, true, Some("PLAIN"));
-        let d = evaluate_connect(&packet, 300, peer());
+        let d = evaluate_connect(&packet, 300, peer(), MaxInboundPacketSize::DEFAULT);
         let ConnectDecision::Refuse { connack, .. } = d else {
             panic!("expected Refuse");
         };
@@ -767,7 +785,7 @@ mod tests {
     #[test]
     fn non_connect_v5_packet_yields_not_connect() {
         let packet = MqttPacket::V5(PacketV5::PingRequest);
-        let d = evaluate_connect(&packet, 300, peer());
+        let d = evaluate_connect(&packet, 300, peer(), MaxInboundPacketSize::DEFAULT);
         assert!(matches!(d, ConnectDecision::NotConnect));
     }
 
@@ -785,14 +803,14 @@ mod tests {
         }
         .client_id("dev-1".to_string());
         let packet = MqttPacket::V3(PacketV3::Connect(Box::new(c)));
-        let d = evaluate_connect(&packet, 300, peer());
+        let d = evaluate_connect(&packet, 300, peer(), MaxInboundPacketSize::DEFAULT);
         assert!(matches!(d, ConnectDecision::Accept { .. }));
     }
 
     #[test]
     fn non_connect_packet_yields_not_connect() {
         let packet = MqttPacket::V3(PacketV3::PingRequest);
-        let d = evaluate_connect(&packet, 300, peer());
+        let d = evaluate_connect(&packet, 300, peer(), MaxInboundPacketSize::DEFAULT);
         assert!(matches!(d, ConnectDecision::NotConnect));
     }
 
@@ -808,11 +826,11 @@ mod tests {
         let c = rmqtt_codec::v5::Connect {
             client_id: "dev5".to_string().into(),
             keep_alive: 60,
-            max_packet_size: NonZeroU32::new(9),
+            max_packet_size: NonZeroU32::new(14),
             ..rmqtt_codec::v5::Connect::default()
         };
         let packet = MqttPacket::V5(PacketV5::Connect(Box::new(c)));
-        let d = evaluate_connect(&packet, 300, peer());
+        let d = evaluate_connect(&packet, 300, peer(), MaxInboundPacketSize::DEFAULT);
         let ConnectDecision::Refuse { connack, sendable } = d else {
             panic!("expected Refuse; today evaluate_connect returns Accept for v5 CONNECTs that fit the CONNACK");
         };
@@ -829,7 +847,7 @@ mod tests {
         );
         assert!(
             !sendable,
-            "refusal CONNACK is 10 bytes over a declared 9 — must be withheld"
+            "refusal CONNACK is 15 bytes over a declared 14 — must be withheld"
         );
     }
 
@@ -840,7 +858,7 @@ mod tests {
     /// the inclusive accept side, `len - 1` is the refuse side. A
     /// hardcoded threshold constant cannot satisfy all three because the
     /// three lengths are pairwise distinct, and the bare-CONNACK length is
-    /// pinned to 10 so a constant that only happens to line up with one
+    /// pinned to 15 so a constant that only happens to line up with one
     /// shape fails the other two.
     #[test]
     #[allow(clippy::too_many_lines)] // three CONNACK shapes each measured end-to-end, splitting buys nothing
@@ -849,7 +867,7 @@ mod tests {
         let pkt_a = v5_connect_with("dev5", 60, false, None);
         let ConnectDecision::Accept {
             connack: a_connack, ..
-        } = evaluate_connect(&pkt_a, 300, peer())
+        } = evaluate_connect(&pkt_a, 300, peer(), MaxInboundPacketSize::DEFAULT)
         else {
             panic!("shape (a) expected Accept at max_packet_size = None");
         };
@@ -860,13 +878,13 @@ mod tests {
                 .expect("encode a");
             buf.len()
         };
-        assert_eq!(a_len, 10, "bare CONNACK length pins the lower threshold");
+        assert_eq!(a_len, 15, "bare CONNACK length pins the lower threshold");
 
         // (b) capped keep-alive — id "dev5", keep_alive 30 under config 30.
         let pkt_b = v5_connect_with("dev5", 30, false, None);
         let ConnectDecision::Accept {
             connack: b_connack, ..
-        } = evaluate_connect(&pkt_b, 30, peer())
+        } = evaluate_connect(&pkt_b, 30, peer(), MaxInboundPacketSize::DEFAULT)
         else {
             panic!("shape (b) expected Accept at max_packet_size = None");
         };
@@ -882,7 +900,7 @@ mod tests {
         let pkt_c = v5_connect_with("", 60, true, None);
         let ConnectDecision::Accept {
             connack: c_connack, ..
-        } = evaluate_connect(&pkt_c, 300, peer())
+        } = evaluate_connect(&pkt_c, 300, peer(), MaxInboundPacketSize::DEFAULT)
         else {
             panic!("shape (c) expected Accept at max_packet_size = None");
         };
@@ -918,7 +936,7 @@ mod tests {
         let packet = MqttPacket::V5(PacketV5::Connect(Box::new(c_a)));
         assert!(
             matches!(
-                evaluate_connect(&packet, 300, peer()),
+                evaluate_connect(&packet, 300, peer(), MaxInboundPacketSize::DEFAULT),
                 ConnectDecision::Accept { .. }
             ),
             "shape (a) at max_packet_size = a_len ({a_len}) must accept",
@@ -933,7 +951,7 @@ mod tests {
         let packet = MqttPacket::V5(PacketV5::Connect(Box::new(c_b)));
         assert!(
             matches!(
-                evaluate_connect(&packet, 30, peer()),
+                evaluate_connect(&packet, 30, peer(), MaxInboundPacketSize::DEFAULT),
                 ConnectDecision::Accept { .. }
             ),
             "shape (b) at max_packet_size = b_len ({b_len}) must accept",
@@ -949,7 +967,7 @@ mod tests {
         let packet = MqttPacket::V5(PacketV5::Connect(Box::new(c_c)));
         assert!(
             matches!(
-                evaluate_connect(&packet, 300, peer()),
+                evaluate_connect(&packet, 300, peer(), MaxInboundPacketSize::DEFAULT),
                 ConnectDecision::Accept { .. }
             ),
             "shape (c) at max_packet_size = c_len ({c_len}) must accept",
@@ -966,7 +984,7 @@ mod tests {
         let packet = MqttPacket::V5(PacketV5::Connect(Box::new(c_a)));
         assert!(
             matches!(
-                evaluate_connect(&packet, 300, peer()),
+                evaluate_connect(&packet, 300, peer(), MaxInboundPacketSize::DEFAULT),
                 ConnectDecision::Refuse { .. }
             ),
             "shape (a) at max_packet_size = {a_under} must refuse",
@@ -980,7 +998,7 @@ mod tests {
     #[test]
     fn v3_connect_is_never_refused_for_packet_size() {
         let packet = v3_connect_with("dev-1", 60, true);
-        let d = evaluate_connect(&packet, 300, peer());
+        let d = evaluate_connect(&packet, 300, peer(), MaxInboundPacketSize::DEFAULT);
         assert!(
             matches!(d, ConnectDecision::Accept { .. }),
             "v3 CONNECT cannot be refused for packet size"
@@ -993,13 +1011,13 @@ mod tests {
     /// implementation that places the size check before the auth check (or
     /// that overwrites the auth reason with `ImplementationSpecificError`).
     /// The v5 CONNECT carries both `auth_method = Some("PLAIN")` AND a
-    /// `max_packet_size` set to each of 9, 10, and `None`; all three must
+    /// `max_packet_size` set to each of 14, 15, and `None`; all three must
     /// refuse with `BadAuthenticationMethod`, not `ImplementationSpecificError`.
     #[test]
     fn authentication_refusal_outranks_the_packet_size_refusal() {
         for (label, max_packet_size, expected_sendable) in [
-            ("max=9", NonZeroU32::new(9), false),
-            ("max=10", NonZeroU32::new(10), true),
+            ("max=14", NonZeroU32::new(14), false),
+            ("max=15", NonZeroU32::new(15), true),
             ("max=None", None, true),
         ] {
             let mut c = rmqtt_codec::v5::Connect {
@@ -1011,7 +1029,7 @@ mod tests {
                 ..rmqtt_codec::v5::Connect::default()
             };
             let packet = MqttPacket::V5(PacketV5::Connect(Box::new(c.clone())));
-            let d = evaluate_connect(&packet, 300, peer());
+            let d = evaluate_connect(&packet, 300, peer(), MaxInboundPacketSize::DEFAULT);
             let ConnectDecision::Refuse { connack, sendable } = d else {
                 panic!("{label}: expected Refuse (auth_method outranks size)");
             };
@@ -1025,7 +1043,7 @@ mod tests {
             );
             assert_eq!(
                 sendable, expected_sendable,
-                "{label}: auth-refusal sendable must follow the size rule (false at 9, true at 10/None)",
+                "{label}: auth-refusal sendable must follow the size rule (false at 14, true at 15/None)",
             );
             // Shape under test: see brief.
             let _ = &mut c;
@@ -1035,15 +1053,16 @@ mod tests {
     /// AC-1, AC-2 — the below-limit half of the boundary for the two CONNACK
     /// shapes that `accepts_at_exactly_the_connack_length_for_every_connack_shape`
     /// only proves the accept side of. That test refuses at `len - 1` for the
-    /// bare 10-byte CONNACK alone, so a gate hardcoded to 10 still passes it:
-    /// the server-announced keep-alive (13) and assigned-client-id (~34)
-    /// shapes both clear a constant 10 at their own `len - 1`. Refusing there
+    /// bare 15-byte CONNACK alone, so a gate hardcoded to 15 still passes it:
+    /// the server-announced keep-alive (18) and assigned-client-id (~34)
+    /// shapes both clear a constant 15 at their own `len - 1`. Refusing there
     /// is what a constant cannot do. Both cases also assert the refusal is
-    /// sendable, because both thresholds sit above the 10-byte refusal CONNACK.
+    /// sendable, because both thresholds sit above the 15-byte refusal CONNACK.
     #[test]
     fn refuses_one_byte_below_the_keepalive_and_assigned_id_connack_lengths() {
         let measure = |packet: &MqttPacket, cfg: u64| -> usize {
-            let ConnectDecision::Accept { connack, .. } = evaluate_connect(packet, cfg, peer())
+            let ConnectDecision::Accept { connack, .. } =
+                evaluate_connect(packet, cfg, peer(), MaxInboundPacketSize::DEFAULT)
             else {
                 panic!("expected Accept at max_packet_size = None");
             };
@@ -1068,7 +1087,7 @@ mod tests {
             ("assigned client id", "", 60, true, 300, c_len),
         ] {
             assert!(
-                len > 10,
+                len > 15,
                 "{label}: this shape must be larger than the bare CONNACK or it proves nothing; got {len}",
             );
             let under = u32::try_from(len - 1).expect("len - 1 fits in u32");
@@ -1081,7 +1100,7 @@ mod tests {
             };
             let packet = MqttPacket::V5(PacketV5::Connect(Box::new(c)));
             let ConnectDecision::Refuse { connack, sendable } =
-                evaluate_connect(&packet, cfg, peer())
+                evaluate_connect(&packet, cfg, peer(), MaxInboundPacketSize::DEFAULT)
             else {
                 panic!("{label}: max_packet_size {under}, one below its {len}-byte CONNACK, must refuse");
             };
@@ -1098,7 +1117,7 @@ mod tests {
             );
             assert!(
                 sendable,
-                "{label}: the 10-byte refusal CONNACK fits {under} and must be sent",
+                "{label}: the 15-byte refusal CONNACK fits {under} and must be sent",
             );
         }
     }
@@ -1112,7 +1131,8 @@ mod tests {
     #[test]
     fn v3_refusal_connack_is_always_sendable() {
         let packet = MqttPacket::V3(PacketV3::Connect(Box::<Connect>::default()));
-        let ConnectDecision::Refuse { connack, sendable } = evaluate_connect(&packet, 300, peer())
+        let ConnectDecision::Refuse { connack, sendable } =
+            evaluate_connect(&packet, 300, peer(), MaxInboundPacketSize::DEFAULT)
         else {
             panic!("expected Refuse");
         };

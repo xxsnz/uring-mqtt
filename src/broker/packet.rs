@@ -154,6 +154,8 @@ pub(crate) enum Violation {
     /// The reply the request obliges the server to send is larger than the
     /// Maximum Packet Size the client declared it can receive.
     ReplyOverMaxPacketSize,
+    /// A fixed header declared a packet larger than the inbound packet-size bound.
+    InboundOverMaxPacketSize,
     /// CONNACK / SUBACK / UNSUBACK / PINGRESP arriving from a client.
     ServerOnlyPacket,
     /// PUBACK, PUBREC or PUBCOMP from a client — this server never publishes.
@@ -185,6 +187,9 @@ impl Violation {
             Violation::EmptyTopicFilterList => "protocol violation: empty topic filter list",
             Violation::ReplyOverMaxPacketSize => {
                 "protocol violation: reply exceeds the client's maximum packet size"
+            }
+            Violation::InboundOverMaxPacketSize => {
+                "protocol violation: packet exceeds the inbound packet-size bound"
             }
             Violation::ServerOnlyPacket => {
                 "protocol violation: server-to-client packet from a client"
@@ -230,7 +235,8 @@ impl Violation {
                 | Violation::MalformedPacket
                 | Violation::VersionProbe
                 | Violation::InvalidTopicName
-                | Violation::TopicAliasInvalid,
+                | Violation::TopicAliasInvalid
+                | Violation::InboundOverMaxPacketSize,
                 ProtocolVersion::MQTT3,
             ) => None,
             (
@@ -247,9 +253,10 @@ impl Violation {
             (Violation::MalformedPacket, ProtocolVersion::MQTT5) => {
                 Some(rmqtt_codec::v5::DisconnectReasonCode::MalformedPacket)
             }
-            (Violation::ReplyOverMaxPacketSize, ProtocolVersion::MQTT5) => {
-                Some(rmqtt_codec::v5::DisconnectReasonCode::PacketTooLarge)
-            }
+            (
+                Violation::ReplyOverMaxPacketSize | Violation::InboundOverMaxPacketSize,
+                ProtocolVersion::MQTT5,
+            ) => Some(rmqtt_codec::v5::DisconnectReasonCode::PacketTooLarge),
             (Violation::PublishQosAboveMaximum, ProtocolVersion::MQTT5) => {
                 Some(rmqtt_codec::v5::DisconnectReasonCode::QosNotSupported)
             }
@@ -351,11 +358,16 @@ pub(crate) fn reply_over_max_packet_size(
 /// closes the session under the violation policy. Branches on the typed
 /// source rather than the IO `ErrorKind`, because `MqttDecoder::decode`
 /// wraps every decoder rejection in `InvalidData`, a kind any other IO error
-/// may also carry — only the preserved source distinguishes them.
+/// may also carry — only the preserved source distinguishes them. An
+/// over-bound fixed header closes as `InboundOverMaxPacketSize` (v5 0x95),
+/// every other decoder rejection as `MalformedPacket`.
 pub(crate) fn classify_read_error(err: &std::io::Error) -> Option<Violation> {
     err.get_ref()
         .and_then(|s| s.downcast_ref::<crate::codec::mqtt::DecodeError>())
-        .map(|_| Violation::MalformedPacket)
+        .map(|e| match e {
+            crate::codec::mqtt::DecodeError::MaxSizeExceeded => Violation::InboundOverMaxPacketSize,
+            _ => Violation::MalformedPacket,
+        })
 }
 
 /// Packet ids tracked per bitset word.
@@ -552,7 +564,7 @@ fn topic_name_violation(topic: &str) -> Option<Violation> {
 mod tests {
     use super::*;
     use crate::broker::handshake;
-    use crate::codec::mqtt::{MqttEncoder, PacketV3, PacketV5};
+    use crate::codec::mqtt::{MaxInboundPacketSize, MqttEncoder, PacketV3, PacketV5};
     use crate::codec::version::ProtocolVersion;
     use bytes::BytesMut;
     use rmqtt_codec::types::{Publish as TypesPublish, QoS};
@@ -2036,14 +2048,17 @@ mod tests {
     /// AC-6 — a CONNACK `honest_v5_connack` produces must hold every fixed-size
     /// reply and the v5 violation DISCONNECT. The plan's whole policy rests on
     /// a fitting CONNACK also guaranteeing every fixed reply fits, so this
-    /// passes today (10 against a 6-byte maximum) and fails the moment
+    /// passes today (15 against a 6-byte maximum) and fails the moment
     /// `honest_v5_connack` shrinks below any fixed reply — the moment the
     /// CONNACK-only threshold this plan reasons about becomes a lie.
     #[test]
     fn smallest_honest_connack_holds_every_fixed_size_reply() {
         let id = NonZeroU16::new(1).expect("non-zero");
         let one = NonZeroUsize::new(1).expect("non-zero");
-        let connack = handshake::honest_v5_connack(V5ConnectAckReason::Success);
+        let connack = handshake::honest_v5_connack(
+            V5ConnectAckReason::Success,
+            MaxInboundPacketSize::DEFAULT,
+        );
         let connack_len = {
             let mut buf = BytesMut::new();
             MqttEncoder::v5()
@@ -2092,15 +2107,19 @@ mod tests {
     /// to connect at all, in a release that touched neither CONNECT nor packet
     /// size. `assigned_client_id` is excluded because its length is the
     /// client's own peer address, not a capability choice the server made.
+    /// F2.4 raised the floor from 13 to 18 on purpose by advertising the inbound packet-size bound.
     #[test]
     fn largest_capability_connack_stays_within_the_admission_floor() {
-        let mut ack = handshake::honest_v5_connack(V5ConnectAckReason::Success);
+        let mut ack = handshake::honest_v5_connack(
+            V5ConnectAckReason::Success,
+            MaxInboundPacketSize::DEFAULT,
+        );
         ack.server_keepalive_sec = Some(u16::MAX);
         let ack = MqttPacket::V5(PacketV5::ConnectAck(Box::new(ack)));
         let len = encoded_len(ack, ProtocolVersion::MQTT5).expect("encode capability CONNACK");
         assert!(
-            len <= 13,
-            "capability CONNACK with server_keepalive_sec must encode to <= 13 bytes; got {len}"
+            len <= 18,
+            "capability CONNACK with server_keepalive_sec must encode to <= 18 bytes; got {len}"
         );
     }
 
@@ -2117,7 +2136,10 @@ mod tests {
         // cross-version pair, so `encoded_len` is `None`.
         let unmeasurable = || {
             MqttPacket::V5(PacketV5::ConnectAck(Box::new(
-                handshake::honest_v5_connack(V5ConnectAckReason::Success),
+                handshake::honest_v5_connack(
+                    V5ConnectAckReason::Success,
+                    MaxInboundPacketSize::DEFAULT,
+                ),
             )))
         };
         assert!(
@@ -2266,6 +2288,7 @@ mod tests {
             Violation::VersionProbe,
             Violation::InvalidTopicName,
             Violation::TopicAliasInvalid,
+            Violation::InboundOverMaxPacketSize,
         ];
         let e0 = encodes();
         for violation in violations {

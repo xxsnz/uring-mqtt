@@ -55,6 +55,7 @@ fn main() -> Result<(), uring_mqtt::Error> {
 | `connection_timeout_secs` | 10 | CONNECT handshake timeout |
 | `idle_timeout_secs` | 300 | Idle connection timeout |
 | `backlog` | 1024 | TCP listen backlog |
+| `max_inbound_packet_size` | 131072 | Largest inbound packet in total wire bytes (`MaxInboundPacketSize`). An over-bound first packet closes the connection without a reply; after acceptance v5 receives DISCONNECT 0x95 and v3 a close. Advertised in every v5 CONNACK |
 
 ## Architecture
 

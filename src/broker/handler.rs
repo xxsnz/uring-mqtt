@@ -11,7 +11,8 @@ use super::Publish;
 use crate::broker::handshake::{self, ConnectDecision};
 use crate::broker::packet::Disposition;
 use crate::codec::mqtt::{
-    ConnectAck, ConnectAckReason, DecodeError, MqttEncoder, MqttPacket, PacketV3, PacketV5,
+    ConnectAck, ConnectAckReason, DecodeError, MaxInboundPacketSize, MqttEncoder, MqttPacket,
+    PacketV3, PacketV5,
 };
 use crate::codec::version::{ProtocolVersion, VersionDecoder};
 use crate::connection::ConnectionState;
@@ -37,11 +38,16 @@ pub(super) const TIMEOUT_CTX_PUBCOMP_FLUSH: &str = "idle timeout during PUBCOMP 
 const TIMEOUT_CTX_DISCONNECT_FLUSH: &str = "idle timeout during DISCONNECT flush";
 
 /// Handle a single MQTT client connection.
+///
+/// `max_inbound_packet_size` bounds every packet this connection reads: an
+/// over-bound fixed header closes the connection before the body-sized
+/// allocation the dependency would otherwise reserve.
 pub async fn handle_client(
     stream: TcpStream,
     event_tx: EventSender,
     connection_timeout_secs: u64,
     idle_timeout_secs: u64,
+    max_inbound_packet_size: MaxInboundPacketSize,
 ) -> Result<SessionOutcome, Error> {
     let peer_addr = stream.peer_addr().map_err(Error::Io)?;
     handle_client_io(
@@ -50,6 +56,7 @@ pub async fn handle_client(
         event_tx,
         connection_timeout_secs,
         idle_timeout_secs,
+        max_inbound_packet_size,
     )
     .await
 }
@@ -74,6 +81,7 @@ async fn handle_client_io<IO>(
     event_tx: EventSender,
     connection_timeout_secs: u64,
     idle_timeout_secs: u64,
+    max_inbound_packet_size: MaxInboundPacketSize,
 ) -> Result<SessionOutcome, Error>
 where
     IO: AsyncReadRent + AsyncWriteRent,
@@ -90,11 +98,20 @@ where
     let remaining = || budget.saturating_sub(handshake_start.elapsed());
 
     // Phase 1: Detect protocol version.
-    let mut framed = Framed::new(stream, VersionDecoder::new());
+    let mut framed = Framed::new(stream, VersionDecoder::new(max_inbound_packet_size));
 
     let version = match monoio::time::timeout(remaining(), framed.next()).await {
         Ok(Some(Ok(v))) => v,
         Ok(Some(Err(e))) => {
+            if let Some(DecodeError::MaxSizeExceeded) =
+                e.get_ref().and_then(|s| s.downcast_ref::<DecodeError>())
+            {
+                tracing::warn!(
+                    "handshake violation: first packet exceeds the inbound packet-size bound of {} bytes ({peer_addr})",
+                    max_inbound_packet_size.get()
+                );
+                return Err(Error::Io(e));
+            }
             if e.get_ref()
                 .and_then(|s| s.downcast_ref::<DecodeError>())
                 .is_some()
@@ -120,7 +137,7 @@ where
     tracing::debug!("Detected protocol version: {:?}", version);
 
     // Phase 2: Switch to versioned codec (preserves buffered bytes — pipelined packets survive).
-    let mut framed = framed.map_codec(|_| CodecPair::new(version));
+    let mut framed = framed.map_codec(|_| CodecPair::new(version, max_inbound_packet_size));
 
     // Phase 3: Read CONNECT under the shared handshake budget.
     let packet = match monoio::time::timeout(remaining(), framed.next()).await {
@@ -137,7 +154,10 @@ where
                         session_present: false,
                     })),
                     ProtocolVersion::MQTT5 => MqttPacket::V5(PacketV5::ConnectAck(Box::new(
-                        handshake::honest_v5_connack(V5ConnectAckReason::ClientIdentifierNotValid),
+                        handshake::honest_v5_connack(
+                            V5ConnectAckReason::ClientIdentifierNotValid,
+                            max_inbound_packet_size,
+                        ),
                     ))),
                 };
                 bounded_send(
@@ -175,7 +195,12 @@ where
 
     // Phase 4: Evaluate CONNECT, then release the packet — its will payload,
     // credentials, and properties must not stay allocated for the whole connection.
-    let decision = handshake::evaluate_connect(&packet, idle_timeout_secs, peer_addr);
+    let decision = handshake::evaluate_connect(
+        &packet,
+        idle_timeout_secs,
+        peer_addr,
+        max_inbound_packet_size,
+    );
     drop(packet);
 
     let outcome = match decision {
@@ -428,10 +453,13 @@ struct CodecPair {
 }
 
 impl CodecPair {
-    fn new(version: ProtocolVersion) -> Self {
+    fn new(
+        version: ProtocolVersion,
+        max_inbound_packet_size: crate::codec::mqtt::MaxInboundPacketSize,
+    ) -> Self {
         Self {
             version,
-            decoder: crate::codec::mqtt::MqttDecoder::new(version),
+            decoder: crate::codec::mqtt::MqttDecoder::new(version, max_inbound_packet_size),
             encoder: MqttEncoder::new(version),
         }
     }
@@ -595,7 +623,14 @@ pub(crate) mod tests {
         let (tx, rx) = event_channel(0, std::sync::Arc::default());
         let handle = monoio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
-            handle_client(stream, tx, connection_timeout_secs, idle_timeout_secs).await
+            handle_client(
+                stream,
+                tx,
+                connection_timeout_secs,
+                idle_timeout_secs,
+                MaxInboundPacketSize::DEFAULT,
+            )
+            .await
         });
         let client = TcpStream::connect(addr).await.expect("connect");
         (client, rx, handle)
@@ -626,7 +661,14 @@ pub(crate) mod tests {
         }
         let handle = monoio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
-            handle_client(stream, tx, connection_timeout_secs, idle_timeout_secs).await
+            handle_client(
+                stream,
+                tx,
+                connection_timeout_secs,
+                idle_timeout_secs,
+                MaxInboundPacketSize::DEFAULT,
+            )
+            .await
         });
         let client = TcpStream::connect(addr).await.expect("connect");
         (client, rx, handle)
@@ -741,6 +783,7 @@ pub(crate) mod tests {
                 tx,
                 connection_timeout_secs,
                 idle_timeout_secs,
+                MaxInboundPacketSize::DEFAULT,
             )
             .await
         });
@@ -2586,6 +2629,47 @@ pub(crate) mod tests {
         });
     }
 
+    /// AC-7 — a CONNECT whose fixed header declares more than the bound
+    /// closes without a CONNACK on MQTT 3.1.1 and MQTT 5.
+    #[test]
+    fn over_bound_connect_closes_without_a_connack_on_both_versions() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            for level in [0x04_u8, 0x05] {
+                let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+                tcp_write_all(
+                    &mut client,
+                    &[
+                        0x10, 0xFD, 0xFF, 0x07, 0x00, 0x04, b'M', b'Q', b'T', b'T', level,
+                    ],
+                )
+                .await
+                .expect("write over-bound CONNECT");
+                let got = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(2))
+                    .await
+                    .expect("read to eof");
+                assert!(got.is_empty(), "expected zero response bytes, got {got:?}");
+                let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                    .await
+                    .expect("join timeout");
+                match join_res {
+                    Err(Error::Io(e)) => {
+                        assert!(
+                            matches!(
+                                e.get_ref().and_then(|s| s.downcast_ref::<DecodeError>()),
+                                Some(DecodeError::MaxSizeExceeded)
+                            ),
+                            "expected MaxSizeExceeded source, got {e:?}"
+                        );
+                    }
+                    other => panic!(
+                        "expected Err(Error::Io(_)) with a MaxSizeExceeded source, got {other:?}"
+                    ),
+                }
+            }
+        });
+    }
+
     #[test]
     fn warns_at_default_level_when_connect_is_malformed() {
         let sink = capture_logs();
@@ -3500,12 +3584,12 @@ pub(crate) mod tests {
     }
 
     /// AC-8 — a v5 CONNECT whose declared Maximum Packet Size (3) cannot hold
-    /// even the bare refusal CONNACK (10 bytes) is refused at handshake time
+    /// even the bare refusal CONNACK (15 bytes) is refused at handshake time
     /// and zero bytes are written: the client declared the limit, the limit
     /// is honoured, the connection closes with `SessionOutcome::Refused`.
     /// **Replaces** the prior `v5_oversize_close_under_four_byte_limit_sends_no_disconnect`,
     /// whose premise — a 3-byte client reaching the packet loop — this task
-    /// removes: a CONNECT declaring less than 10 is no longer accepted, so no
+    /// removes: a CONNECT declaring less than 15 is no longer accepted, so no
     /// 3-byte client can reach the violation DISCONNECT. The behaviour the
     /// deleted test proved (a violation close obeying its own limit) remains
     /// covered at the pure seam by
@@ -3530,7 +3614,7 @@ pub(crate) mod tests {
                 .expect("read to eof");
             assert!(
                 got.is_empty(),
-                "expected zero bytes — the 10-byte refusal CONNACK over a declared 3 must be withheld — got {got:?}"
+                "expected zero bytes — the 15-byte refusal CONNACK over a declared 3 must be withheld — got {got:?}"
             );
             let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
                 .await
@@ -3543,8 +3627,8 @@ pub(crate) mod tests {
     }
 
     /// AC-9 — keep-alive 30 against a 30s config is capped, so the accept
-    /// CONNACK carries `server_keepalive_sec` and is 13 bytes — over a
-    /// declared 10. The bare refusal CONNACK is 10 bytes and fits, so the
+    /// CONNACK carries `server_keepalive_sec` and is 18 bytes — over a
+    /// declared 15. The bare refusal CONNACK is 15 bytes and fits, so the
     /// client receives exactly one CONNACK with `ImplementationSpecificError`.
     /// The byte count is this feature's contract (asserted directly rather
     /// than via `V5Reader::next`, which returns `None` at EOF even after a
@@ -3557,7 +3641,7 @@ pub(crate) mod tests {
             let connect = encode_v5_connect_with_max_packet_size(
                 30,
                 "test",
-                Some(NonZeroU32::new(10).expect("non-zero")),
+                Some(NonZeroU32::new(15).expect("non-zero")),
             );
             tcp_write_all(&mut client, &connect)
                 .await
@@ -3568,8 +3652,8 @@ pub(crate) mod tests {
                 .expect("read to eof");
             assert_eq!(
                 got.len(),
-                10,
-                "expected exactly the 10-byte refusal CONNACK — got {got:?}"
+                15,
+                "expected exactly the 15-byte refusal CONNACK — got {got:?}"
             );
 
             let mut reader = V5Reader::new();
@@ -3619,7 +3703,7 @@ pub(crate) mod tests {
             let connect = encode_v5_connect_with_max_packet_size(
                 30,
                 "test",
-                Some(NonZeroU32::new(10).expect("non-zero")),
+                Some(NonZeroU32::new(15).expect("non-zero")),
             );
             tcp_write_all(&mut client, &connect)
                 .await
@@ -3658,8 +3742,8 @@ pub(crate) mod tests {
     /// had its Maximum Packet Size parsed by `rmqtt-codec`, but the codec's
     /// error variant is fieldless and the body has already been split out of
     /// the input buffer, so the limit is lost before the refusal is chosen.
-    /// The 10-byte `ClientIdentifierNotValid` CONNACK is therefore written
-    /// ungated — a reachable case where 10 bytes go to a connection that
+    /// The 15-byte `ClientIdentifierNotValid` CONNACK is therefore written
+    /// ungated — a reachable case where 15 bytes go to a connection that
     /// declared 3. **This test documents a departure rather than a
     /// guarantee**; see EPIC-SPEC.md §4, "Recorded exception — Maximum
     /// Packet Size" for the rationale.
@@ -3687,8 +3771,8 @@ pub(crate) mod tests {
                 .expect("read to eof");
             assert_eq!(
                 got.len(),
-                10,
-                "expected the 10-byte ClientIdentifierNotValid CONNACK despite declared 3 — got {got:?}"
+                15,
+                "expected the 15-byte ClientIdentifierNotValid CONNACK despite declared 3 — got {got:?}"
             );
 
             let mut reader = V5Reader::new();
@@ -3747,7 +3831,7 @@ pub(crate) mod tests {
                 .expect("read to eof");
             assert!(
                 got.is_empty(),
-                "premise: the 10-byte refusal CONNACK over a declared 3 is withheld — got {got:?}"
+                "premise: the 15-byte refusal CONNACK over a declared 3 is withheld — got {got:?}"
             );
             let peer = client.local_addr().expect("local_addr").to_string();
 
@@ -3785,12 +3869,12 @@ pub(crate) mod tests {
     /// The admission threshold is the CONNACK *this* connection would receive,
     /// not a constant. A v5 CONNECT carrying no client id is owed a CONNACK
     /// with `assigned_client_id` built from its own peer address, so its
-    /// threshold is over 30 bytes where a named client's is 10 or 13. A client
+    /// threshold is over 30 bytes where a named client's is 15 or 18. A client
     /// declaring 20 therefore clears the bare CONNACK's length and is still
-    /// refused — which no fixed 10- or 13-byte threshold would do, and which
+    /// refused — which no fixed 15- or 18-byte threshold would do, and which
     /// only a real socket can prove, because the assigned id's length is the
     /// ephemeral peer address the unit seam cannot produce. The refusal
-    /// CONNACK is 10 bytes, fits the declared 20, and is written.
+    /// CONNACK is 15 bytes, fits the declared 20, and is written.
     #[test]
     fn v5_connect_needing_an_assigned_id_is_refused_when_its_connack_does_not_fit() {
         let mut rt = build_runtime();
@@ -3818,8 +3902,8 @@ pub(crate) mod tests {
                 .expect("read to eof");
             assert_eq!(
                 got.len(),
-                10,
-                "expected exactly the 10-byte refusal CONNACK — got {got:?}"
+                15,
+                "expected exactly the 15-byte refusal CONNACK — got {got:?}"
             );
 
             let mut reader = V5Reader::new();
@@ -3851,6 +3935,80 @@ pub(crate) mod tests {
             match join_res {
                 Ok(super::SessionOutcome::Refused) => {}
                 other => panic!("expected SessionOutcome::Refused, got {other:?}"),
+            }
+        });
+    }
+
+    /// The accept CONNACK must advertise the server's inbound packet-size
+    /// bound in the Maximum Packet Size property, not just stay small enough
+    /// to fit under it.
+    #[test]
+    fn v5_accept_connack_advertises_the_inbound_bound() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, _handle) = spawn_handler(2, 30).await;
+            tcp_write_all(&mut client, &encode_v5_connect(30, "test"))
+                .await
+                .expect("v5 CONNECT write");
+
+            let mut reader = V5Reader::new();
+            match reader.next(&mut client).await {
+                Some(MqttPacket::V5(PacketV5::ConnectAck(ack))) => {
+                    assert!(
+                        matches!(ack.reason_code, V5ConnectAckReason::Success),
+                        "expected Success, got {:?}",
+                        ack.reason_code
+                    );
+                    assert_eq!(
+                        ack.max_packet_size,
+                        Some(131_072),
+                        "accept CONNACK must advertise the configured inbound bound"
+                    );
+                }
+                other => panic!("expected v5 CONNACK, got {other:?}"),
+            }
+        });
+    }
+
+    /// A refusal CONNACK must advertise the same inbound packet-size bound as
+    /// the accept CONNACK — the property is not accept-only.
+    #[test]
+    fn v5_refusal_connack_advertises_the_inbound_bound() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, _handle) = spawn_handler(2, 30).await;
+            let mut enc = MqttEncoder::v5();
+            let connect = rmqtt_codec::v5::Connect {
+                client_id: "test".to_string().into(),
+                keep_alive: 30,
+                auth_method: Some("PLAIN".to_string().into()),
+                ..Default::default()
+            };
+            let mut buf = BytesMut::new();
+            enc.encode(
+                MqttPacket::V5(PacketV5::Connect(Box::new(connect))),
+                &mut buf,
+            )
+            .expect("encode v5 CONNECT");
+            tcp_write_all(&mut client, &buf)
+                .await
+                .expect("v5 CONNECT write");
+
+            let mut reader = V5Reader::new();
+            match reader.next(&mut client).await {
+                Some(MqttPacket::V5(PacketV5::ConnectAck(ack))) => {
+                    assert!(
+                        matches!(ack.reason_code, V5ConnectAckReason::BadAuthenticationMethod),
+                        "expected BadAuthenticationMethod, got {:?}",
+                        ack.reason_code
+                    );
+                    assert_eq!(
+                        ack.max_packet_size,
+                        Some(131_072),
+                        "refusal CONNACK must advertise the configured inbound bound"
+                    );
+                }
+                other => panic!("expected v5 CONNACK, got {other:?}"),
             }
         });
     }
@@ -5227,6 +5385,199 @@ pub(crate) mod tests {
                     ],
                 ),
                 "expected one WARN line with the invalid-topic reason and peer {peer}; logs:\n{logs}"
+            );
+        });
+    }
+
+    /// Over-bound session header: fixed header `30 FD FF 07` declares
+    /// Remaining Length 131 069, one byte over `MaxInboundPacketSize::DEFAULT`
+    /// (131 072). The decoder rejects it from the header alone, so no body
+    /// bytes are needed on the wire.
+    const OVER_BOUND_PUBLISH_HEADER: [u8; 4] = [0x30, 0xFD, 0xFF, 0x07];
+
+    /// AC-10 — a mid-session packet whose fixed header declares more than the
+    /// inbound bound closes as `Violation::InboundOverMaxPacketSize`, which on
+    /// MQTT 5 is encoded as a `PacketTooLarge` (0x95) DISCONNECT.
+    #[test]
+    fn v5_packet_over_the_inbound_bound_mid_session_disconnects_with_95() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            tcp_write_all(&mut client, &encode_v5_connect(30, "test"))
+                .await
+                .expect("v5 CONNECT write");
+            let mut reader = V5Reader::new();
+            let connack = monoio::time::timeout(Duration::from_secs(2), reader.next(&mut client))
+                .await
+                .expect("v5 CONNACK read timeout")
+                .expect("v5 CONNACK decoded");
+            let MqttPacket::V5(PacketV5::ConnectAck(_)) = connack else {
+                panic!("expected v5 CONNACK, got {connack:?}")
+            };
+            tcp_write_all(&mut client, &OVER_BOUND_PUBLISH_HEADER)
+                .await
+                .expect("over-bound header write");
+            let disconnect_bytes =
+                monoio::time::timeout(Duration::from_secs(2), reader.raw(&mut client, 4))
+                    .await
+                    .expect("v5 DISCONNECT read timeout");
+            assert_eq!(
+                disconnect_bytes,
+                vec![0xE0, 0x02, 0x95, 0x00],
+                "expected v5 DISCONNECT carrying PacketTooLarge (0x95)"
+            );
+            let rest = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(2))
+                .await
+                .expect("EOF after the v5 DISCONNECT");
+            assert!(
+                rest.is_empty(),
+                "expected EOF after the DISCONNECT, got {rest:02X?}"
+            );
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            match join_res {
+                Ok(super::SessionOutcome::Violation) => {}
+                other => panic!("expected SessionOutcome::Violation, got {other:?}"),
+            }
+        });
+    }
+
+    /// AC-11 — the same over-bound mid-session header on MQTT 3.1.1 closes
+    /// under the violation policy with no DISCONNECT bytes.
+    #[test]
+    fn v3_packet_over_the_inbound_bound_mid_session_closes_without_extra_bytes() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            tcp_write_all(&mut client, &V3_CONNECT_TEST)
+                .await
+                .expect("CONNECT write");
+            let connack = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                .await
+                .expect("read CONNACK");
+            assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+
+            tcp_write_all(&mut client, &OVER_BOUND_PUBLISH_HEADER)
+                .await
+                .expect("over-bound header write");
+            let post = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(2))
+                .await
+                .expect("read to eof (bounded)");
+            assert!(
+                post.is_empty(),
+                "a v3 close on an over-bound packet must emit no extra bytes, got {post:?}"
+            );
+
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            match join_res {
+                Ok(super::SessionOutcome::Violation) => {}
+                other => panic!("expected SessionOutcome::Violation, got {other:?}"),
+            }
+        });
+    }
+
+    /// AC-12 — the over-bound mid-session close logs a WARN line naming the
+    /// bound-violation reason and the complete peer address.
+    #[test]
+    fn over_bound_packet_close_warns_with_the_bound_reason_and_peer() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            let peer = client.local_addr().expect("local_addr").to_string();
+            tcp_write_all(&mut client, &V3_CONNECT_TEST)
+                .await
+                .expect("CONNECT write");
+            let connack = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                .await
+                .expect("read CONNACK");
+            assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+
+            tcp_write_all(&mut client, &OVER_BOUND_PUBLISH_HEADER)
+                .await
+                .expect("over-bound header write");
+            let post = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(2))
+                .await
+                .expect("read to eof (bounded)");
+            assert!(post.is_empty(), "expected no extra bytes, got {post:?}");
+
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            match join_res {
+                Ok(super::SessionOutcome::Violation) => {}
+                other => panic!("expected SessionOutcome::Violation, got {other:?}"),
+            }
+
+            let logs =
+                String::from_utf8(sink.lock().expect("log lock").clone()).expect("log UTF-8");
+            assert!(
+                has_line_at(
+                    &logs,
+                    "WARN",
+                    &[
+                        "protocol violation: packet exceeds the inbound packet-size bound",
+                        &peer
+                    ],
+                ),
+                "expected one WARN line with the bound-violation reason and peer {peer}; logs:\n{logs}"
+            );
+        });
+    }
+
+    /// AC-13, AC-19 — a header-only first packet over the inbound bound
+    /// closes at once, from the fixed header alone, before any CONNECT
+    /// parsing is attempted. `spawn_handler(10, 30)` gives a 10 s handshake
+    /// budget so a timeout close cannot pass as the bound close.
+    #[test]
+    fn header_only_first_packet_over_the_bound_closes_at_once_and_warns() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(10, 30).await;
+            let peer = client.local_addr().expect("local_addr").to_string();
+            tcp_write_all(&mut client, &[0x10, 0xFD, 0xFF, 0x07])
+                .await
+                .expect("write over-bound header-only first packet");
+
+            let got = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(1))
+                .await
+                .expect("read to eof (bounded)");
+            assert!(got.is_empty(), "expected zero response bytes, got {got:?}");
+
+            let join_res = monoio::time::timeout(Duration::from_secs(1), handle)
+                .await
+                .expect("join timeout");
+            match join_res {
+                Err(Error::Io(e)) => {
+                    assert!(
+                        matches!(
+                            e.get_ref().and_then(|s| s.downcast_ref::<DecodeError>()),
+                            Some(DecodeError::MaxSizeExceeded)
+                        ),
+                        "expected MaxSizeExceeded source, got {e:?}"
+                    );
+                }
+                other => panic!(
+                    "expected Err(Error::Io(_)) with a MaxSizeExceeded source, got {other:?}"
+                ),
+            }
+
+            let logs =
+                String::from_utf8(sink.lock().expect("log lock").clone()).expect("log UTF-8");
+            assert!(
+                has_line_at(
+                    &logs,
+                    "WARN",
+                    &[
+                        "handshake violation: first packet exceeds the inbound packet-size bound of 131072 bytes",
+                        &peer
+                    ],
+                ),
+                "expected one WARN line with the bound-violation reason and peer {peer}; logs:\n{logs}"
             );
         });
     }

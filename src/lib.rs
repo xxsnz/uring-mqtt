@@ -5,7 +5,8 @@ mod error;
 mod pool;
 
 pub use broker::{
-    BrokerConfig, BrokerHandle, MqttBroker, Publish, PublishCallback, QoS, ShutdownHandle,
+    BrokerConfig, BrokerHandle, MaxInboundPacketSize, MqttBroker, Publish, PublishCallback, QoS,
+    ShutdownHandle,
 };
 pub use connection::ConnectionState;
 pub use error::Error;

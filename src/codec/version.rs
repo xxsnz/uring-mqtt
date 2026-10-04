@@ -6,24 +6,25 @@ use tokio_util::codec::Decoder as TokioDecoder;
 pub use rmqtt_codec::version::ProtocolVersion;
 use rmqtt_codec::version::VersionCodec;
 
+use crate::codec::mqtt::{DecodeError, MaxInboundPacketSize};
+
 /// Wrapper around rmqtt-codec's VersionCodec for monoio-codec compatibility.
 ///
-/// Detects MQTT protocol version from the initial CONNECT packet.
+/// Detects MQTT protocol version from the initial CONNECT packet, refusing
+/// any header that already declares a packet larger than the inbound
+/// packet-size bound. The bound lives here, not in a default, so a default
+/// value cannot hide the configured bound.
 pub struct VersionDecoder {
     inner: VersionCodec,
+    max_inbound_packet_size: MaxInboundPacketSize,
 }
 
 impl VersionDecoder {
-    pub fn new() -> Self {
+    pub fn new(max_inbound_packet_size: MaxInboundPacketSize) -> Self {
         Self {
             inner: VersionCodec,
+            max_inbound_packet_size,
         }
-    }
-}
-
-impl Default for VersionDecoder {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -32,6 +33,12 @@ impl Decoder for VersionDecoder {
     type Error = io::Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Decoded<Self::Item>, Self::Error> {
+        if self.max_inbound_packet_size.rejects_fixed_header(src) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                DecodeError::MaxSizeExceeded,
+            ));
+        }
         match TokioDecoder::decode(&mut self.inner, src) {
             Ok(Some(version)) => Ok(Decoded::Some(version)),
             Ok(None) => Ok(Decoded::Insufficient),
@@ -47,18 +54,13 @@ mod tests {
 
     #[test]
     fn test_version_decoder_new() {
-        let _decoder = VersionDecoder::new();
+        let _decoder = VersionDecoder::new(MaxInboundPacketSize::DEFAULT);
         // Just verify it creates without panicking
     }
 
     #[test]
-    fn test_version_decoder_default() {
-        let _decoder = VersionDecoder::default();
-    }
-
-    #[test]
     fn test_decode_empty_buffer_returns_insufficient() {
-        let mut decoder = VersionDecoder::new();
+        let mut decoder = VersionDecoder::new(MaxInboundPacketSize::DEFAULT);
         let mut buf = BytesMut::new();
 
         let result = MonoioDecoder::decode(&mut decoder, &mut buf).unwrap();
@@ -67,7 +69,7 @@ mod tests {
 
     #[test]
     fn test_decode_mqtt311_connect() {
-        let mut decoder = VersionDecoder::new();
+        let mut decoder = VersionDecoder::new(MaxInboundPacketSize::DEFAULT);
         let mut buf = BytesMut::new();
 
         // MQTT 3.1.1 CONNECT packet (minimal)
@@ -96,7 +98,7 @@ mod tests {
 
     #[test]
     fn test_decode_mqtt5_connect() {
-        let mut decoder = VersionDecoder::new();
+        let mut decoder = VersionDecoder::new(MaxInboundPacketSize::DEFAULT);
         let mut buf = BytesMut::new();
 
         // MQTT 5.0 CONNECT packet (minimal)
@@ -124,7 +126,7 @@ mod tests {
 
     #[test]
     fn test_decode_partial_connect_returns_insufficient() {
-        let mut decoder = VersionDecoder::new();
+        let mut decoder = VersionDecoder::new(MaxInboundPacketSize::DEFAULT);
         let mut buf = BytesMut::new();
 
         // Only partial CONNECT header
@@ -148,7 +150,7 @@ mod tests {
 
     #[test]
     fn rejected_first_byte_error_carries_typed_decode_error_source() {
-        let mut decoder = VersionDecoder::new();
+        let mut decoder = VersionDecoder::new(MaxInboundPacketSize::DEFAULT);
         let mut buf = BytesMut::from(&[0xC0_u8, 0x00][..]);
 
         let err = MonoioDecoder::decode(&mut decoder, &mut buf).unwrap_err();
@@ -167,7 +169,7 @@ mod tests {
 
     #[test]
     fn invalid_protocol_name_error_carries_invalid_protocol_source() {
-        let mut decoder = VersionDecoder::new();
+        let mut decoder = VersionDecoder::new(MaxInboundPacketSize::DEFAULT);
         let mut buf = BytesMut::from(
             &[
                 0x10_u8, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'X', 0x04, 0x00, 0x00, 0x3C, 0x00,

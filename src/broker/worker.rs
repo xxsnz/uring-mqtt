@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use super::handler::handle_client;
 use super::{BrokerConfig, Publish, PublishCallback};
+use crate::codec::mqtt::MaxInboundPacketSize;
 use crate::error::Error;
 use crate::pool::BufferPool;
 
@@ -391,6 +392,7 @@ pub async fn run_worker(
                 let event_tx_clone = event_tx.clone();
                 let connection_timeout = config.connection_timeout_secs;
                 let idle_timeout = config.idle_timeout_secs;
+                let max_inbound_packet_size: MaxInboundPacketSize = config.max_inbound_packet_size;
                 let done_tx_clone = done_tx.clone();
                 let abort_clone = abort.clone();
 
@@ -401,7 +403,7 @@ pub async fn run_worker(
                 monoio::spawn(async move {
                     monoio::select! {
                         biased;
-                        res = handle_client(stream, event_tx_clone, connection_timeout, idle_timeout) => {
+                        res = handle_client(stream, event_tx_clone, connection_timeout, idle_timeout, max_inbound_packet_size) => {
                             match res {
                                 Ok(super::handler::SessionOutcome::Refused) => state_clone.note_refused(),
                                 Ok(super::handler::SessionOutcome::Served) => {}
