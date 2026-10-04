@@ -9,7 +9,6 @@ use super::handler::handle_client;
 use super::{BrokerConfig, Publish, PublishCallback};
 use crate::codec::mqtt::MaxInboundPacketSize;
 use crate::error::Error;
-use crate::pool::BufferPool;
 
 /// Per-worker state (thread-local, no Send/Sync required)
 struct WorkerState {
@@ -18,8 +17,6 @@ struct WorkerState {
     max_connections: usize,
     refused_connects: Cell<u64>,
     violations: Cell<u64>,
-    #[allow(dead_code)] // Reserved for future buffer reuse optimization
-    buffer_pool: BufferPool,
 }
 
 impl WorkerState {
@@ -30,7 +27,6 @@ impl WorkerState {
             max_connections,
             refused_connects: Cell::new(0),
             violations: Cell::new(0),
-            buffer_pool: BufferPool::new(2048, max_connections / 4),
         }
     }
 
@@ -86,6 +82,14 @@ pub(crate) const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
 /// Cadence of warn-level logs driven by lifetime counters (drops, refusals).
 const COUNT_LOG_EVERY: u64 = 100;
+
+/// Cadence of the info-level accepted-connection progress line (every Nth
+/// accept, no first-occurrence line — unlike `should_log_count`).
+const ACCEPTED_LOG_EVERY: u64 = 100;
+
+/// Pause after a failed `accept` before retrying, so a persistent error
+/// (for example EMFILE) does not spin the worker.
+const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// True when `total` is the first occurrence or a positive multiple of `COUNT_LOG_EVERY`.
 fn should_log_count(total: u64) -> bool {
@@ -304,6 +308,12 @@ pub async fn run_worker(
         config.max_connections_per_worker,
     ));
 
+    #[cfg(test)]
+    assert!(
+        !config.panic_in_setup,
+        "test hook: worker {worker_id} setup panic before the ready report"
+    );
+
     // Thread-local event channel
     let (event_tx, event_rx) = event_channel(worker_id, dropped);
 
@@ -376,7 +386,7 @@ pub async fn run_worker(
                 }
 
                 connection_counter += 1;
-                if connection_counter.is_multiple_of(100) {
+                if connection_counter.is_multiple_of(ACCEPTED_LOG_EVERY) {
                     tracing::info!(
                         "Worker {}: {} active connections (total accepted: {})",
                         state.id(),
@@ -426,7 +436,7 @@ pub async fn run_worker(
                     break;
                 }
                 tracing::error!("Worker {}: accept error: {}", worker_id, e);
-                monoio::time::sleep(std::time::Duration::from_millis(100)).await;
+                monoio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
             }
         }
     }
@@ -1199,7 +1209,7 @@ mod tests {
     }
 
     /// AC-17 ordering discriminator — with setup BEFORE report, a worker's
-    /// setup panic (BufferPool overflow) drops its sender unreported. With
+    /// setup panic (the panic_in_setup hook) drops its sender unreported. With
     /// setup AFTER report, the panic would happen after a successful report
     /// and the survivor would enter its endless accept loop, hanging the
     /// test on the bounded wait.
@@ -1224,9 +1234,9 @@ mod tests {
 
         // Worker A: sane config.
         let cfg_a = BrokerConfig::new(p1.to_string());
-        // Worker B: triggers BufferPool::new → VecDeque::with_capacity(usize::MAX/4)
-        // panic during WorkerState construction (pre-report).
-        let cfg_b = BrokerConfig::new(p2.to_string()).max_connections_per_worker(usize::MAX);
+        // Worker B: the panic_in_setup hook panics right after WorkerState
+        // construction (pre-report).
+        let cfg_b = BrokerConfig::new(p2.to_string()).panic_in_setup();
 
         let (sig_a_main, sig_a_worker) =
             std::os::unix::net::UnixStream::pair().expect("socketpair a");

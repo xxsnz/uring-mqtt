@@ -14,7 +14,23 @@ use std::sync::Arc;
 /// teardown window.
 pub(crate) const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 5;
 
-/// Configuration for the MQTT broker.
+/// Default `max_connections_per_worker` for `BrokerConfig::new`.
+const DEFAULT_MAX_CONNECTIONS_PER_WORKER: usize = 1000;
+
+/// Default `connection_timeout_secs` (CONNECT handshake budget) for `BrokerConfig::new`.
+const DEFAULT_CONNECTION_TIMEOUT_SECS: u64 = 10;
+
+/// Default `idle_timeout_secs` for `BrokerConfig::new`.
+const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
+
+/// Default TCP listen `backlog` for `BrokerConfig::new`.
+const DEFAULT_BACKLOG: i32 = 1024;
+
+/// Worker count `start_with_callback` uses when `num_workers` is unset and
+/// `std::thread::available_parallelism` fails.
+const FALLBACK_NUM_WORKERS: usize = 4;
+
+/// Configuration for the MQTT ingest server.
 #[derive(Clone)]
 pub struct BrokerConfig {
     /// Address to bind to (e.g., "0.0.0.0:1883")
@@ -40,21 +56,27 @@ pub struct BrokerConfig {
     /// A key, not the bind address — two tests may share a port.
     #[cfg(test)]
     pub(crate) overflow_token: Option<u64>,
+    /// Test hook: `run_worker` panics right after building its `WorkerState`,
+    /// before the ready report — the AC-17 setup-panic trigger.
+    #[cfg(test)]
+    pub(crate) panic_in_setup: bool,
 }
 
 impl BrokerConfig {
     pub fn new(bind_addr: impl Into<String>) -> Self {
         Self {
             bind_addr: bind_addr.into(),
-            max_connections_per_worker: 1000,
-            connection_timeout_secs: 10,
-            idle_timeout_secs: 300,
+            max_connections_per_worker: DEFAULT_MAX_CONNECTIONS_PER_WORKER,
+            connection_timeout_secs: DEFAULT_CONNECTION_TIMEOUT_SECS,
+            idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
             drain_timeout_secs: DEFAULT_DRAIN_TIMEOUT_SECS,
             num_workers: None,
-            backlog: 1024,
+            backlog: DEFAULT_BACKLOG,
             max_inbound_packet_size: MaxInboundPacketSize::DEFAULT,
             #[cfg(test)]
             overflow_token: None,
+            #[cfg(test)]
+            panic_in_setup: false,
         }
     }
 
@@ -97,6 +119,13 @@ impl BrokerConfig {
     #[cfg(test)]
     pub(crate) fn overflow_token(mut self, token: u64) -> Self {
         self.overflow_token = Some(token);
+        self
+    }
+
+    /// Test hook: see `panic_in_setup`.
+    #[cfg(test)]
+    pub(crate) fn panic_in_setup(mut self) -> Self {
+        self.panic_in_setup = true;
         self
     }
 }
@@ -360,7 +389,7 @@ impl Drop for WorkerExitGuard {
     }
 }
 
-/// High-performance MQTT broker using Monoio io_uring runtime.
+/// `io_uring`-native MQTT telemetry ingest server.
 pub struct MqttBroker;
 
 impl MqttBroker {
@@ -398,7 +427,8 @@ impl MqttBroker {
         callback: Option<PublishCallback>,
     ) -> Result<BrokerHandle, Error> {
         let num_workers = config.num_workers.unwrap_or_else(|| {
-            std::thread::available_parallelism().map_or(4, std::num::NonZero::get)
+            std::thread::available_parallelism()
+                .map_or(FALLBACK_NUM_WORKERS, std::num::NonZero::get)
         });
 
         if num_workers == 0 {
@@ -406,7 +436,7 @@ impl MqttBroker {
         }
 
         tracing::info!(
-            "Starting MQTT broker on {} with {} workers",
+            "Starting MQTT ingest server on {} with {} workers",
             config.bind_addr,
             num_workers
         );
@@ -519,7 +549,7 @@ impl MqttBroker {
         })
     }
 
-    /// Run the MQTT broker with the given configuration. Equivalent to
+    /// Run the MQTT ingest server with the given configuration. Equivalent to
     /// `start(config)?.join()` — blocks until every worker exits.
     ///
     /// # Arguments
@@ -531,7 +561,7 @@ impl MqttBroker {
         Self::run_with_callback(config, None)
     }
 
-    /// Run the MQTT broker with an event callback. Equivalent to
+    /// Run the MQTT ingest server with an event callback. Equivalent to
     /// `start_with_callback(config, callback)?.join()`.
     ///
     /// # Arguments
@@ -706,16 +736,14 @@ mod tests {
         drop(occupier);
     }
 
-    /// AC-17 public contract — `.max_connections_per_worker(usize::MAX)`
-    /// panics in `BufferPool::new` during worker setup, before any report.
-    /// `run` must surface that as `Err(Error::Worker(_))`.
+    /// AC-17 public contract — a worker whose setup panics before its ready
+    /// report (the `panic_in_setup` test hook) makes `run` return
+    /// `Err(Error::Worker(_))`.
     #[test]
     fn run_returns_err_when_worker_setup_panics() {
         let port = find_free_port();
         let addr = format!("127.0.0.1:{port}");
-        let config = BrokerConfig::new(addr)
-            .num_workers(1)
-            .max_connections_per_worker(usize::MAX);
+        let config = BrokerConfig::new(addr).num_workers(1).panic_in_setup();
         let (tx, rx) = std::sync::mpsc::channel();
         let _h = std::thread::spawn(move || {
             let _ = tx.send(MqttBroker::run(config));
@@ -723,6 +751,167 @@ mod tests {
         match rx.recv_timeout(Duration::from_secs(10)) {
             Ok(Err(Error::Worker(_))) => {}
             other => panic!("expected Err(Worker), got {other:?}"),
+        }
+    }
+
+    /// F3.2 AC-1 — with the buffer pool gone an unbounded per-worker
+    /// connection limit is an ordinary configuration: `start` returns
+    /// `Ok` and the worker answers a CONNECT.
+    #[test]
+    fn start_serves_clients_with_an_unbounded_connection_limit() {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), Error>>();
+        let _h = std::thread::Builder::new()
+            .name("f32-unbounded-connection-limit".into())
+            .spawn(move || {
+                let outcome = (|| -> Result<(), Error> {
+                    let port = find_free_port();
+                    let addr_str = format!("127.0.0.1:{port}");
+                    let addr: std::net::SocketAddr = addr_str.parse().expect("parse addr");
+                    let config = BrokerConfig::new(addr_str)
+                        .num_workers(1)
+                        .max_connections_per_worker(usize::MAX);
+
+                    let handle = MqttBroker::start(config)?;
+                    let mut client =
+                        std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+                            .map_err(Error::Io)?;
+                    client
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .map_err(Error::Io)?;
+                    client.write_all(&V3_CONNECT_TEST).map_err(Error::Io)?;
+                    let mut connack = [0u8; 4];
+                    client.read_exact(&mut connack).map_err(Error::Io)?;
+                    assert_eq!(connack, [0x20, 0x02, 0x00, 0x00]);
+                    drop(client);
+
+                    handle.shutdown();
+                    handle.join()
+                })();
+                let _ = tx.send(outcome);
+            })
+            .expect("spawn harness");
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Ok(())) => {}
+            other => panic!("expected Ok(()) from harness, got {other:?}"),
+        }
+    }
+
+    /// F3.2 AC-1 — the unbounded limit is not merely startable: the worker
+    /// admits concurrent sessions on it. The deleted buffer pool sized a
+    /// per-worker cache from this value, so this pins that the surviving
+    /// `WorkerState` slot counter serves more than one client at a time.
+    #[test]
+    fn unbounded_connection_limit_serves_concurrent_clients() {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), Error>>();
+        let _h = std::thread::Builder::new()
+            .name("f32-unbounded-concurrent".into())
+            .spawn(move || {
+                let outcome = (|| -> Result<(), Error> {
+                    let port = find_free_port();
+                    let addr_str = format!("127.0.0.1:{port}");
+                    let addr: std::net::SocketAddr = addr_str.parse().expect("parse addr");
+                    let config = BrokerConfig::new(addr_str)
+                        .num_workers(1)
+                        .max_connections_per_worker(usize::MAX);
+
+                    let handle = MqttBroker::start(config)?;
+
+                    let mut first = connect_with_retry(addr);
+                    first
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .map_err(Error::Io)?;
+                    first.write_all(&V3_CONNECT_TEST).map_err(Error::Io)?;
+                    let mut connack = [0u8; 4];
+                    first.read_exact(&mut connack).map_err(Error::Io)?;
+                    assert_eq!(connack, [0x20, 0x02, 0x00, 0x00]);
+
+                    // `first` stays open, so the second session needs a second
+                    // slot from the unbounded limit.
+                    let mut second =
+                        std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+                            .map_err(Error::Io)?;
+                    second
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .map_err(Error::Io)?;
+                    second.write_all(&V3_CONNECT_TEST).map_err(Error::Io)?;
+                    let mut connack = [0u8; 4];
+                    second.read_exact(&mut connack).map_err(Error::Io)?;
+                    assert_eq!(connack, [0x20, 0x02, 0x00, 0x00]);
+
+                    drop(first);
+                    drop(second);
+                    handle.shutdown();
+                    handle.join()
+                })();
+                let _ = tx.send(outcome);
+            })
+            .expect("spawn harness");
+        match rx.recv_timeout(Duration::from_secs(20)) {
+            Ok(Ok(())) => {}
+            other => panic!("expected Ok(()) from harness, got {other:?}"),
+        }
+    }
+
+    /// F3.2 AC-1 counterpart — deleting the buffer pool must not weaken the
+    /// per-worker limit `WorkerState` still holds. With
+    /// `max_connections_per_worker(1)` and the only slot held by a live
+    /// session, the accept loop drops the overflow client, which therefore
+    /// reads EOF instead of a CONNACK.
+    #[test]
+    fn connection_limit_drops_the_overflow_client_without_a_connack() {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), Error>>();
+        let _h = std::thread::Builder::new()
+            .name("f32-limit-overflow".into())
+            .spawn(move || {
+                let outcome = (|| -> Result<(), Error> {
+                    let port = find_free_port();
+                    let addr_str = format!("127.0.0.1:{port}");
+                    let addr: std::net::SocketAddr = addr_str.parse().expect("parse addr");
+                    let config = BrokerConfig::new(addr_str)
+                        .num_workers(1)
+                        .max_connections_per_worker(1);
+
+                    let handle = MqttBroker::start(config)?;
+
+                    // The holder takes the only slot. Its CONNACK proves the
+                    // slot is acquired before the overflow client connects.
+                    let mut holder = connect_with_retry(addr);
+                    holder
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .map_err(Error::Io)?;
+                    holder.write_all(&V3_CONNECT_TEST).map_err(Error::Io)?;
+                    let mut connack = [0u8; 4];
+                    holder.read_exact(&mut connack).map_err(Error::Io)?;
+                    assert_eq!(connack, [0x20, 0x02, 0x00, 0x00]);
+
+                    // The kernel accepts the overflow client; the worker then
+                    // drops it without any MQTT reply. Nothing is written on
+                    // this socket — a write into the worker's close would draw
+                    // an RST and mask the EOF this assertion is about.
+                    let mut overflow =
+                        std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+                            .map_err(Error::Io)?;
+                    overflow
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .map_err(Error::Io)?;
+                    let mut tail = [0u8; 1];
+                    assert_eq!(
+                        overflow.read(&mut tail).map_err(Error::Io)?,
+                        0,
+                        "overflow client must read EOF, not a CONNACK"
+                    );
+                    drop(overflow);
+
+                    drop(holder);
+                    handle.shutdown();
+                    handle.join()
+                })();
+                let _ = tx.send(outcome);
+            })
+            .expect("spawn harness");
+        match rx.recv_timeout(Duration::from_secs(20)) {
+            Ok(Ok(())) => {}
+            other => panic!("expected Ok(()) from harness, got {other:?}"),
         }
     }
 

@@ -2,7 +2,6 @@ mod broker;
 mod codec;
 mod connection;
 mod error;
-mod pool;
 
 pub use broker::{
     BrokerConfig, BrokerHandle, MaxInboundPacketSize, MqttBroker, Publish, PublishCallback, QoS,
@@ -10,4 +9,3 @@ pub use broker::{
 };
 pub use connection::ConnectionState;
 pub use error::Error;
-pub use pool::BufferPool;

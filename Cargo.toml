@@ -25,9 +25,6 @@ tokio-util = { version = "0.7", features = ["codec"] }
 # Buffer and byte handling
 bytes = "1.5"
 
-# Synchronization primitives
-parking_lot = "0.12"
-
 # Logging
 tracing = "0.1"
 
@@ -61,6 +58,5 @@ missing_panics_doc = "allow"
 similar_names = "allow"
 return_self_not_must_use = "allow"
 needless_pass_by_value = "allow"   # EventCallback needs ownership
-cast_precision_loss = "allow"      # Acceptable for memory stats
 inline_always = "allow"            # Hot path optimization
 doc_markdown = "allow"             # Too noisy for technical terms

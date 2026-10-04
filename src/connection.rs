@@ -41,50 +41,6 @@ impl Default for ConnectionState {
     }
 }
 
-/// Memory statistics for monitoring.
-///
-/// Provides estimated memory usage based on connection count and buffer pool size.
-/// Useful for monitoring and capacity planning.
-#[allow(dead_code)] // Public API for user monitoring
-pub struct MemoryStats {
-    /// Number of currently active connections.
-    pub active_connections: usize,
-    /// Number of buffers in the pool.
-    pub buffer_pool_size: usize,
-    /// Estimated total memory usage in megabytes.
-    pub estimated_memory_mb: f32,
-}
-
-#[allow(dead_code)] // Public API for user monitoring
-impl MemoryStats {
-    /// Calculate memory statistics from connection and pool counts.
-    pub fn calculate(connections: usize, pool_size: usize) -> Self {
-        let per_connection_kb = 2.0;
-        let buffer_pool_kb = pool_size as f32;
-        let channel_overhead_kb = connections as f32 * 0.1;
-
-        let total_mb =
-            (connections as f32 * per_connection_kb + buffer_pool_kb + channel_overhead_kb)
-                / 1024.0;
-
-        Self {
-            active_connections: connections,
-            buffer_pool_size: pool_size,
-            estimated_memory_mb: total_mb,
-        }
-    }
-
-    /// Log the statistics using tracing.
-    pub fn log_stats(&self) {
-        tracing::info!(
-            "Memory stats - Connections: {}, Pool: {}, Est. Memory: {:.1}MB",
-            self.active_connections,
-            self.buffer_pool_size,
-            self.estimated_memory_mb
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,26 +86,5 @@ mod tests {
         // Manually set last_packet_time to the past
         state.last_packet_time = Instant::now().checked_sub(Duration::from_secs(10)).unwrap();
         assert!(state.is_idle(5));
-    }
-
-    #[test]
-    fn test_memory_stats_calculate() {
-        let stats = MemoryStats::calculate(1000, 250);
-
-        assert_eq!(stats.active_connections, 1000);
-        assert_eq!(stats.buffer_pool_size, 250);
-
-        // 1000 * 2KB + 250KB + 1000 * 0.1KB = 2000 + 250 + 100 = 2350KB = ~2.3MB
-        assert!(stats.estimated_memory_mb > 2.0);
-        assert!(stats.estimated_memory_mb < 3.0);
-    }
-
-    #[test]
-    fn test_memory_stats_zero_connections() {
-        let stats = MemoryStats::calculate(0, 0);
-
-        assert_eq!(stats.active_connections, 0);
-        assert_eq!(stats.buffer_pool_size, 0);
-        assert!(stats.estimated_memory_mb.abs() < f32::EPSILON);
     }
 }

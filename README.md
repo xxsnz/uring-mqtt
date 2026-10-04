@@ -1,15 +1,14 @@
 # uring-mqtt
 
-High-performance MQTT broker using Monoio's `io_uring` runtime for Linux systems.
+`io_uring`-native MQTT telemetry ingest server for Linux, built on Monoio.
 
 ## Features
 
-- **`io_uring`-based I/O** - Modern Linux async I/O with fewer syscalls than epoll
-- **Thread-per-core architecture** - No work-stealing, better cache locality
+- **`io_uring`-based I/O** - Monoio's io_uring driver; on a kernel without io_uring, Monoio falls back to its epoll-based legacy driver
+- **Thread-per-core architecture** - No work-stealing
 - **`SO_REUSEPORT`** - Kernel-level load balancing across worker threads
-- **MQTT v3.1.1 and v5.0** - Full protocol support via rmqtt-codec
+- **MQTT v3.1.1 and v5.0 clients** - Via rmqtt-codec, ingest profile only: the server accepts inbound PUBLISH at QoS 0, 1 and 2, refuses every SUBSCRIBE, and never delivers a message to a client
   - v3.1.1 clients must connect with CleanSession=1: a CleanSession=0 CONNECT carrying a client id is closed without a CONNACK and logged at warn, because this clean-session-only server cannot keep a persistent session
-- **Two-tier buffer pool** - Thread-local cache + global pool for efficient memory reuse
 - **Per-worker events** - Local channels without cross-thread synchronization
 
 ## Quick Start
@@ -71,7 +70,6 @@ Main Thread
 ```
 
 Each worker:
-1. Creates its own monoio runtime with `io_uring`
+1. Creates its own monoio runtime (io_uring driver, or the epoll-based legacy driver on a kernel without io_uring)
 2. Binds to the same address with `SO_REUSEPORT` (kernel distributes connections)
-3. Runs completely independently (no shared state except buffer pool)
 

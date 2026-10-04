@@ -109,7 +109,7 @@ fn main() -> Result<(), uring_mqtt::Error> {
         .connection_timeout_secs(10)
         .idle_timeout_secs(300);
 
-    tracing::info!("Starting MQTT broker on 0.0.0.0:1883");
+    tracing::info!("Starting MQTT ingest server on 0.0.0.0:1883");
 
     // Create the publish callback
     let callback = Arc::new(move |publish: &Publish| {
