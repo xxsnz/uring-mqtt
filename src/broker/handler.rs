@@ -6,7 +6,7 @@ use monoio_codec::Framed;
 use std::num::NonZeroU32;
 use std::time::Duration;
 
-use super::worker::EventSender;
+use super::worker::{Admission, EventSender};
 use super::Publish;
 use crate::broker::handshake::{self, ConnectDecision};
 use crate::broker::packet::Disposition;
@@ -37,17 +37,34 @@ pub(super) const TIMEOUT_CTX_PUBREC_FLUSH: &str = "idle timeout during PUBREC fl
 pub(super) const TIMEOUT_CTX_PUBCOMP_FLUSH: &str = "idle timeout during PUBCOMP flush";
 const TIMEOUT_CTX_DISCONNECT_FLUSH: &str = "idle timeout during DISCONNECT flush";
 
+/// Idle budget kept back from an ingest wait so a held PUBLISH that finally
+/// gets room can still have its acknowledgement written (spec §5.1).
+const INGEST_REPLY_RESERVE: Duration = Duration::from_secs(1);
+
+/// What the packet loop does after offering a PUBLISH to the event channel.
+enum IngestStep {
+    /// Keep serving the connection; `held` is true when this publish waited
+    /// for room. `held` reports whether this publish waited, which the
+    /// caller's idle anchor depends on.
+    Continue { held: bool },
+    /// The idle budget bounded the wait and ran out: close as an idle timeout.
+    IdleTimeout,
+}
+
 /// Handle a single MQTT client connection.
 ///
 /// `max_inbound_packet_size` bounds every packet this connection reads: an
 /// over-bound fixed header closes the connection before the body-sized
 /// allocation the dependency would otherwise reserve.
+/// `ingest_deadline` bounds how long a decoded PUBLISH waits for room in a
+/// full event channel (see `BrokerConfig::ingest_deadline_secs`).
 pub async fn handle_client(
     stream: TcpStream,
     event_tx: EventSender,
     connection_timeout_secs: u64,
     idle_timeout_secs: u64,
     max_inbound_packet_size: MaxInboundPacketSize,
+    ingest_deadline: Duration,
 ) -> Result<SessionOutcome, Error> {
     let peer_addr = stream.peer_addr().map_err(Error::Io)?;
     handle_client_io(
@@ -57,6 +74,7 @@ pub async fn handle_client(
         connection_timeout_secs,
         idle_timeout_secs,
         max_inbound_packet_size,
+        ingest_deadline,
     )
     .await
 }
@@ -82,6 +100,7 @@ pub(super) async fn handle_client_io<IO>(
     connection_timeout_secs: u64,
     idle_timeout_secs: u64,
     max_inbound_packet_size: MaxInboundPacketSize,
+    ingest_deadline: Duration,
 ) -> Result<SessionOutcome, Error>
 where
     IO: AsyncReadRent + AsyncWriteRent,
@@ -269,6 +288,7 @@ where
                 idle_timeout,
                 peer_addr,
                 max_packet_size,
+                ingest_deadline,
             )
             .await?
         }
@@ -282,6 +302,7 @@ where
 /// `max_packet_size` is the client's declared receive limit from CONNECT: every
 /// reply is gated against it, because a SUBACK's size follows the request's
 /// filter count and MQTT 5 forbids sending past the declared limit.
+#[allow(clippy::too_many_lines)] // reply-budget guard after the ingest wait, disposition-specific closes push past the pedantic 100-line boundary
 async fn run_packet_loop<IO>(
     framed: &mut Framed<IO, CodecPair>,
     state: &mut ConnectionState,
@@ -289,28 +310,56 @@ async fn run_packet_loop<IO>(
     idle_timeout: Duration,
     peer_addr: std::net::SocketAddr,
     max_packet_size: Option<NonZeroU32>,
+    ingest_deadline: Duration,
 ) -> Result<SessionOutcome, Error>
 where
     IO: AsyncReadRent + AsyncWriteRent,
 {
     let mut awaiting = super::packet::AwaitingRelease::default();
+    // Set once a PUBLISH waited for event-channel room. Until a read starts
+    // from an empty read buffer, every packet decoded was already buffered
+    // during that wait, so it keeps the first held packet's idle anchor
+    // instead of refreshing it (spec §5.1). Bytes still in the kernel
+    // socket buffer cannot be told apart and get a fresh anchor.
+    let mut hold_debt = false;
     loop {
+        let read_starts_fresh = framed.read_buffer().is_empty();
         let remaining_idle = idle_timeout.saturating_sub(state.last_packet_time.elapsed());
         let packet_result = monoio::time::timeout(remaining_idle, framed.next()).await;
         match packet_result {
             Ok(Some(Ok((packet, _id)))) => {
-                state.update_activity();
-                let reply_deadline = idle_timeout.saturating_sub(state.last_packet_time.elapsed());
+                if !hold_debt || read_starts_fresh {
+                    state.update_activity();
+                    hold_debt = false;
+                }
                 let disposition = super::packet::dispatch(&packet, &mut awaiting);
                 // The ingest effect happens per arm; the reply every arm owes,
                 // if any, leaves through the single gated send below.
                 let owed_reply = match disposition {
                     Disposition::Deliver(publish) => {
-                        deliver_publish(&event_tx, publish);
+                        let idle_left =
+                            idle_timeout.saturating_sub(state.last_packet_time.elapsed());
+                        match deliver_publish(&event_tx, publish, idle_left, ingest_deadline).await
+                        {
+                            IngestStep::Continue { held } => hold_debt |= held,
+                            IngestStep::IdleTimeout => {
+                                tracing::debug!("client idle timeout ({peer_addr})");
+                                break Ok(SessionOutcome::Served);
+                            }
+                        }
                         None
                     }
                     Disposition::DeliverThenReply(publish, reply) => {
-                        deliver_publish(&event_tx, publish);
+                        let idle_left =
+                            idle_timeout.saturating_sub(state.last_packet_time.elapsed());
+                        match deliver_publish(&event_tx, publish, idle_left, ingest_deadline).await
+                        {
+                            IngestStep::Continue { held } => hold_debt |= held,
+                            IngestStep::IdleTimeout => {
+                                tracing::debug!("client idle timeout ({peer_addr})");
+                                break Ok(SessionOutcome::Served);
+                            }
+                        }
                         Some(reply)
                     }
                     Disposition::Reply(reply) => Some(reply),
@@ -319,6 +368,14 @@ where
                         break Ok(SessionOutcome::Served);
                     }
                     Disposition::Violation(violation) => {
+                        let reply_deadline =
+                            idle_timeout.saturating_sub(state.last_packet_time.elapsed());
+                        // Idle expiry wins: a packet read after the budget ran out
+                        // gets no reply (spec §5.1).
+                        if reply_deadline.is_zero() {
+                            tracing::debug!("client idle timeout ({peer_addr})");
+                            break Ok(SessionOutcome::Served);
+                        }
                         break Ok(close_with_violation(
                             framed,
                             violation,
@@ -329,6 +386,15 @@ where
                         .await);
                     }
                 };
+                // Computed after any ingest wait: a held PUBLISH's acknowledgement,
+                // and every packet behind it, gets only the idle budget still left.
+                // With none left, close as an idle timeout and write nothing — a
+                // zero-deadline `bounded_send` would still try the write (spec §5.1).
+                let reply_deadline = idle_timeout.saturating_sub(state.last_packet_time.elapsed());
+                if reply_deadline.is_zero() {
+                    tracing::debug!("client idle timeout ({peer_addr})");
+                    break Ok(SessionOutcome::Served);
+                }
                 if let Some(reply) = owed_reply {
                     let version = framed.codec().version();
                     if let Some(violation) =
@@ -357,6 +423,12 @@ where
                 if let Some(violation) = super::packet::classify_read_error(&e) {
                     let reply_deadline =
                         idle_timeout.saturating_sub(state.last_packet_time.elapsed());
+                    // Idle expiry wins: a packet read after the budget ran out
+                    // gets no reply (spec §5.1).
+                    if reply_deadline.is_zero() {
+                        tracing::debug!("client idle timeout ({peer_addr})");
+                        break Ok(SessionOutcome::Served);
+                    }
                     break Ok(close_with_violation(
                         framed,
                         violation,
@@ -381,14 +453,37 @@ where
     }
 }
 
-/// Hands the PUBLISH to the worker's ingest seam unparsed; a reading the
-/// event channel cannot take is discarded inside `EventSender::send`, which
-/// counts and warns when the channel is full and only debug-logs a closed
-/// receiver. Neither reaches the caller, because the PUBACK or PUBREC is
-/// sent either way, and QoS 0 has no ack to send at all.
-fn deliver_publish(event_tx: &EventSender, publish: &rmqtt_codec::types::Publish) {
+/// Offers the PUBLISH to the worker's event channel unparsed, waiting
+/// while it is full for at most the ingest deadline or the idle budget
+/// left after `INGEST_REPLY_RESERVE`, whichever is shorter (spec §5.1).
+/// A publish the wait cannot place is dropped, counted and warned
+/// inside `EventSender::admit`. When the ingest deadline bounded the
+/// wait the caller still acknowledges it; when the idle budget did, or
+/// no idle budget was left to acknowledge it, the connection closes as
+/// an idle timeout. A closed receiver only debug-logs, and QoS 0 has no
+/// ack to send at all.
+async fn deliver_publish(
+    event_tx: &EventSender,
+    publish: &rmqtt_codec::types::Publish,
+    idle_left: Duration,
+    ingest_deadline: Duration,
+) -> IngestStep {
     tracing::debug!("PUBLISH {} len: {}", publish.topic, publish.payload.len());
-    event_tx.send(Publish::from_codec(publish));
+    let reply_by = std::time::Instant::now() + idle_left;
+    let idle_wait = idle_left.saturating_sub(INGEST_REPLY_RESERVE);
+    let wait = ingest_deadline.min(idle_wait);
+    match event_tx
+        .admit(Publish::from_codec(publish), wait, reply_by)
+        .await
+    {
+        Admission::NoReplyTime => IngestStep::IdleTimeout,
+        Admission::Dropped if idle_wait < ingest_deadline => IngestStep::IdleTimeout,
+        Admission::Dropped => IngestStep::Continue {
+            held: !wait.is_zero(),
+        },
+        Admission::EnqueuedAfterHold => IngestStep::Continue { held: true },
+        Admission::Enqueued | Admission::ReceiverClosed => IngestStep::Continue { held: false },
+    }
 }
 
 /// Emit the one warn line, send the v5 DISCONNECT best-effort, and report
@@ -599,6 +694,56 @@ pub(crate) mod tests {
     };
     /// Topics used to verify arrival order of multiple PUBLISHes from one connection.
     const ORDER_KEYS: [&[u8]; 3] = [b"order/a", b"order/b", b"order/c"];
+    /// v3 CONNECT: ka=3, id "test", flags 0x02 (Clean Session) — 4.5 s idle budget.
+    /// Byte index 11 is the only difference from `V3_CONNECT_TEST`.
+    const V3_CONNECT_TEST_KA3: [u8; 18] = [
+        0x10, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x02, 0x00, 0x03, 0x00, 0x04, b't',
+        b'e', b's', b't',
+    ];
+    /// `V3_CONNECT_TEST_KA3`'s idle budget: 1.5x its 3-second keep-alive.
+    const KA3_IDLE_BUDGET: Duration = Duration::from_millis(4500);
+    /// An ingest deadline the test itself frees room before, so it never
+    /// bounds a wait.
+    const LONG_INGEST_DEADLINE: Duration = Duration::from_secs(5);
+    /// An ingest deadline nothing ever frees room before.
+    const SHORT_INGEST_DEADLINE: Duration = Duration::from_secs(1);
+    /// Time given for a held publish's effect on the channel to settle
+    /// before the test observes it.
+    const HOLD_SETTLE: Duration = Duration::from_millis(200);
+    /// Bound for a read expected to return no bytes.
+    const NO_ACK_WINDOW: Duration = Duration::from_millis(300);
+    /// Shorter than a ka=1 connection's 0.5 s idle wait, so the ingest
+    /// deadline bounds it.
+    const STALL_INGEST_DEADLINE: Duration = Duration::from_millis(300);
+    /// Longer than a ka=1 connection's whole 1.5 s idle budget.
+    const RUNTIME_STALL: Duration = Duration::from_secs(2);
+    /// Delays every write after the CONNACK so a test can stall the thread
+    /// inside the PUBACK write.
+    const WRITE_STALL_DELAY: Duration = Duration::from_millis(400);
+    /// Ingest deadline of the room test. With 3.5 s of waitable budget (4.5 s
+    /// less the reserve), the two hold-debt rules differ when room frees
+    /// between 0.2 s (3.5 s mod 1.1 s) and 1.1 s after the anchor.
+    const ROOM_TEST_INGEST_DEADLINE: Duration = Duration::from_millis(1100);
+    /// When the room test frees two slots: mid-way in that 0.2 s-1.1 s
+    /// window, leaving 0.45 s of scheduling margin on each side.
+    const FREE_ROOM_AT: Duration = Duration::from_millis(650);
+
+    /// v3 QoS 1 PUBLISH of `topic` with `packet_id` and the one payload byte 0xAA.
+    #[allow(clippy::vec_init_then_push)] // len is computed at runtime from a test fixture, so vec![..] cannot size the buffer
+    fn v3_qos1_publish(topic: &[u8], packet_id: u16) -> Vec<u8> {
+        #[allow(clippy::cast_possible_truncation)] // test topics are short literals
+        let len = topic.len() as u8;
+        let mut out = Vec::new();
+        out.push(0x32);
+        out.push(2 + len + 2 + 1);
+        out.push(0x00);
+        out.push(len);
+        out.extend_from_slice(topic);
+        out.push((packet_id >> 8) as u8);
+        out.push((packet_id & 0xFF) as u8);
+        out.push(0xAA);
+        out
+    }
 
     fn build_runtime() -> monoio::FusionRuntime<
         monoio::time::TimeDriver<monoio::IoUringDriver>,
@@ -608,6 +753,16 @@ pub(crate) mod tests {
             .enable_timer()
             .build()
             .expect("monoio runtime")
+    }
+
+    /// Legacy-driver runtime with a timer: IO completes inside the poll that
+    /// starts it, so a test can stall the thread mid-write deterministically.
+    pub(crate) fn legacy_timer_runtime(
+    ) -> monoio::Runtime<monoio::time::TimeDriver<monoio::LegacyDriver>> {
+        monoio::RuntimeBuilder::<monoio::LegacyDriver>::new()
+            .enable_timer()
+            .build()
+            .expect("monoio legacy runtime")
     }
 
     async fn spawn_handler(
@@ -629,11 +784,42 @@ pub(crate) mod tests {
                 connection_timeout_secs,
                 idle_timeout_secs,
                 MaxInboundPacketSize::DEFAULT,
+                Duration::from_secs(crate::broker::DEFAULT_INGEST_DEADLINE_SECS),
             )
             .await
         });
         let client = TcpStream::connect(addr).await.expect("connect");
         (client, rx, handle)
+    }
+
+    /// Spawn `handle_client` on a fresh loopback connection that offers its
+    /// publishes to `tx` — share one channel between connections to model
+    /// one worker. Returns the client end and the handler's join handle.
+    async fn spawn_handler_on_sender(
+        tx: EventSender,
+        connection_timeout_secs: u64,
+        idle_timeout_secs: u64,
+        ingest_deadline: Duration,
+    ) -> (
+        TcpStream,
+        monoio::task::JoinHandle<Result<SessionOutcome, Error>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let handle = monoio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            handle_client(
+                stream,
+                tx,
+                connection_timeout_secs,
+                idle_timeout_secs,
+                MaxInboundPacketSize::DEFAULT,
+                ingest_deadline,
+            )
+            .await
+        });
+        let client = TcpStream::connect(addr).await.expect("connect");
+        (client, handle)
     }
 
     /// Identical to `spawn_handler` but pre-fills the event channel to capacity
@@ -644,10 +830,13 @@ pub(crate) mod tests {
     ///
     /// `dropped` is the per-worker drop counter `BrokerHandle::dropped_publishes`
     /// sums; a caller that only needs the full branch passes `Arc::default()`.
+    /// With a zero `ingest_deadline` every publish is dropped at once, the
+    /// pre-backpressure behaviour those tests pin.
     async fn spawn_handler_full_ingest(
         connection_timeout_secs: u64,
         idle_timeout_secs: u64,
         dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        ingest_deadline: Duration,
     ) -> (
         TcpStream,
         EventReceiver,
@@ -667,6 +856,7 @@ pub(crate) mod tests {
                 connection_timeout_secs,
                 idle_timeout_secs,
                 MaxInboundPacketSize::DEFAULT,
+                ingest_deadline,
             )
             .await
         });
@@ -784,11 +974,55 @@ pub(crate) mod tests {
                 connection_timeout_secs,
                 idle_timeout_secs,
                 MaxInboundPacketSize::DEFAULT,
+                Duration::from_secs(crate::broker::DEFAULT_INGEST_DEADLINE_SECS),
             )
             .await
         });
         let client = TcpStream::connect(addr).await.expect("connect");
         (client, rx, handle)
+    }
+
+    /// `spawn_handler_on_sender` over the `handle_client_io` seam: the
+    /// handler's first reads serve `first_read` (a `TestIo` prefix; every
+    /// write after the CONNACK waits `write_delay`), so which packets one
+    /// read returns is set by the test
+    /// rather than by TCP segmentation. Later reads come from the socket.
+    async fn spawn_handler_scripted(
+        tx: EventSender,
+        idle_timeout_secs: u64,
+        ingest_deadline: Duration,
+        first_read: Vec<u8>,
+        write_delay: Duration,
+    ) -> (
+        TcpStream,
+        monoio::task::JoinHandle<Result<SessionOutcome, Error>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let handle = monoio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let peer_addr = stream.peer_addr().map_err(Error::Io)?;
+            let io = TestIo {
+                first_read: Some(first_read),
+                consumed: 0,
+                write_delay,
+                undelayed_writes: 1,
+                read_error: None,
+                inner: stream,
+            };
+            handle_client_io(
+                io,
+                peer_addr,
+                tx,
+                2,
+                idle_timeout_secs,
+                MaxInboundPacketSize::DEFAULT,
+                ingest_deadline,
+            )
+            .await
+        });
+        let client = TcpStream::connect(addr).await.expect("connect");
+        (client, handle)
     }
 
     async fn tcp_write_all(client: &mut TcpStream, data: &[u8]) -> std::io::Result<()> {
@@ -1304,7 +1538,7 @@ pub(crate) mod tests {
         let mut rt = build_runtime();
         rt.block_on(async {
             let (mut client, _rx, handle) =
-                spawn_handler_full_ingest(2, 30, std::sync::Arc::default()).await;
+                spawn_handler_full_ingest(2, 30, std::sync::Arc::default(), Duration::ZERO).await;
 
             tcp_write_all(&mut client, &V3_CONNECT_TEST)
                 .await
@@ -1359,7 +1593,8 @@ pub(crate) mod tests {
         let mut rt = build_runtime();
         rt.block_on(async {
             let dropped: std::sync::Arc<std::sync::atomic::AtomicU64> = std::sync::Arc::default();
-            let (mut client, _rx, handle) = spawn_handler_full_ingest(2, 30, dropped.clone()).await;
+            let (mut client, _rx, handle) =
+                spawn_handler_full_ingest(2, 30, dropped.clone(), Duration::ZERO).await;
 
             tcp_write_all(&mut client, &V3_CONNECT_TEST)
                 .await
@@ -1715,7 +1950,7 @@ pub(crate) mod tests {
         let mut rt = build_runtime();
         rt.block_on(async {
             let (mut client, mut rx, handle) =
-                spawn_handler_full_ingest(2, 30, std::sync::Arc::default()).await;
+                spawn_handler_full_ingest(2, 30, std::sync::Arc::default(), Duration::ZERO).await;
 
             tcp_write_all(&mut client, &V3_CONNECT_TEST)
                 .await
@@ -1788,6 +2023,790 @@ pub(crate) mod tests {
                 .await
                 .expect("join timeout");
             assert!(matches!(join_res, Ok(SessionOutcome::Served)));
+        });
+    }
+
+    /// AC-6 — a held PUBLISH's PUBACK is written only after the publish was
+    /// enqueued, never before. `rx` drains three times, once per freed slot,
+    /// so each held PUBLISH is acknowledged in turn.
+    #[test]
+    fn ingest_hold_acks_each_held_publish_only_after_its_enqueue() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let dropped: std::sync::Arc<std::sync::atomic::AtomicU64> = std::sync::Arc::default();
+            let (mut client, mut rx, handle) =
+                spawn_handler_full_ingest(2, 30, dropped.clone(), LONG_INGEST_DEADLINE).await;
+
+            tcp_write_all(&mut client, &V3_CONNECT_TEST)
+                .await
+                .expect("CONNECT write");
+            let connack = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                .await
+                .expect("read CONNACK");
+            assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+
+            let mut script = Vec::new();
+            for (i, key) in ORDER_KEYS.iter().enumerate() {
+                #[allow(clippy::cast_possible_truncation)] // i < 3
+                script.extend_from_slice(&v3_qos1_publish(key, i as u16 + 1));
+            }
+            tcp_write_all(&mut client, &script)
+                .await
+                .expect("PUBLISH write");
+
+            let held = tcp_read_n_bounded(&mut client, 4, NO_ACK_WINDOW)
+                .await
+                .expect("bounded read");
+            assert!(
+                held.is_empty(),
+                "no PUBACK must arrive before any slot frees, got {held:?}"
+            );
+
+            for i in 0..3u8 {
+                let evt = monoio::time::timeout(Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("drain timeout")
+                    .expect("drain Some");
+                assert_eq!(evt.topic(), "t");
+
+                let puback = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                    .await
+                    .expect("read PUBACK");
+                assert_eq!(puback, vec![0x40, 0x02, 0x00, i + 1]);
+
+                let still_held = tcp_read_n_bounded(&mut client, 4, NO_ACK_WINDOW)
+                    .await
+                    .expect("bounded read");
+                assert!(
+                    still_held.is_empty(),
+                    "no further PUBACK must arrive before the next slot frees, got {still_held:?}"
+                );
+            }
+
+            for _ in 0..EVENT_CHANNEL_CAPACITY - 3 {
+                let evt = monoio::time::timeout(Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("drain timeout")
+                    .expect("drain Some");
+                assert_eq!(evt.topic(), "t");
+            }
+            for key in &ORDER_KEYS {
+                let evt = monoio::time::timeout(Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("drain timeout")
+                    .expect("drain Some");
+                let key_str = std::str::from_utf8(key).expect("utf8 topic");
+                assert_eq!(evt.topic(), key_str);
+            }
+
+            assert_eq!(dropped.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+            tcp_write_all(&mut client, &DISCONNECT)
+                .await
+                .expect("disconnect write");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(matches!(join_res, Ok(SessionOutcome::Served)));
+        });
+    }
+
+    /// AC-6 — a QoS 0 PUBLISH takes the `Disposition::Deliver` arm, which
+    /// owes no acknowledgement: a hold on it writes nothing at all, and once
+    /// a slot frees the publish is enqueued and the loop reads again (the
+    /// PINGREQ is answered). The channel therefore yields capacity + 1
+    /// publishes; a hold that dropped the publish instead yields capacity.
+    #[test]
+    fn ingest_hold_enqueues_a_held_qos0_publish_without_writing_any_ack() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let dropped: std::sync::Arc<std::sync::atomic::AtomicU64> = std::sync::Arc::default();
+            let (mut client, mut rx, handle) =
+                spawn_handler_full_ingest(2, 30, dropped.clone(), LONG_INGEST_DEADLINE).await;
+
+            tcp_write_all(&mut client, &V3_CONNECT_TEST)
+                .await
+                .expect("CONNECT write");
+            let connack = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                .await
+                .expect("read CONNACK");
+            assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+
+            tcp_write_all(&mut client, &PUBLISH_QOS0_T)
+                .await
+                .expect("PUBLISH write");
+            let held = tcp_read_n_bounded(&mut client, 1, NO_ACK_WINDOW)
+                .await
+                .expect("bounded read");
+            assert!(
+                held.is_empty(),
+                "a held QoS 0 PUBLISH must write nothing, got {held:?}"
+            );
+
+            // One slot frees; it is granted to the waiting publish.
+            let evt = monoio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("drain timeout")
+                .expect("drain Some");
+            assert_eq!(evt.topic(), "t");
+
+            // The loop reads again only after the hold ended.
+            tcp_write_all(&mut client, &PINGREQ)
+                .await
+                .expect("PINGREQ write");
+            let pingresp = tcp_read_n_bounded(&mut client, 2, Duration::from_secs(2))
+                .await
+                .expect("read PINGRESP");
+            assert_eq!(pingresp, vec![0xD0, 0x00]);
+
+            // The prefill minus the drained one, plus the held publish.
+            for _ in 0..EVENT_CHANNEL_CAPACITY {
+                let evt = monoio::time::timeout(Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("drain timeout")
+                    .expect("drain Some");
+                assert_eq!(evt.topic(), "t");
+                assert_eq!(evt.payload(), &FIXTURE_PAYLOAD[..]);
+            }
+            assert_eq!(dropped.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+            tcp_write_all(&mut client, &DISCONNECT)
+                .await
+                .expect("disconnect write");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(matches!(join_res, Ok(SessionOutcome::Served)));
+        });
+    }
+
+    /// AC-7 — a held PUBLISH dropped because the ingest deadline bounded its
+    /// wait is still acknowledged, only after the deadline elapsed. `rx` is
+    /// never drained, so no slot ever frees.
+    #[test]
+    fn ingest_hold_past_the_deadline_counts_the_publish_dropped_and_still_acks() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let dropped: std::sync::Arc<std::sync::atomic::AtomicU64> = std::sync::Arc::default();
+            let (mut client, _rx, handle) =
+                spawn_handler_full_ingest(2, 30, dropped.clone(), SHORT_INGEST_DEADLINE).await;
+
+            tcp_write_all(&mut client, &V3_CONNECT_TEST)
+                .await
+                .expect("CONNECT write");
+            let connack = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                .await
+                .expect("read CONNACK");
+            assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+
+            let start = std::time::Instant::now();
+            tcp_write_all(&mut client, &PUBLISH_QOS1_T)
+                .await
+                .expect("PUBLISH write");
+
+            let puback = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(3))
+                .await
+                .expect("read PUBACK");
+            assert_eq!(puback, vec![0x40, 0x02, 0x00, 0x01]);
+            assert!(
+                start.elapsed() >= SHORT_INGEST_DEADLINE,
+                "PUBACK arrived before the ingest deadline elapsed"
+            );
+
+            assert_eq!(dropped.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+            tcp_write_all(&mut client, &PINGREQ)
+                .await
+                .expect("PINGREQ write");
+            let pingresp = tcp_read_n_bounded(&mut client, 2, Duration::from_secs(2))
+                .await
+                .expect("read PINGRESP");
+            assert_eq!(pingresp, vec![0xD0, 0x00]);
+
+            tcp_write_all(&mut client, &DISCONNECT)
+                .await
+                .expect("disconnect write");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(matches!(join_res, Ok(SessionOutcome::Served)));
+        });
+    }
+
+    /// AC-8 — a held PUBLISH dropped because the idle budget bounded its
+    /// wait closes the connection as an idle timeout without an
+    /// acknowledgement.
+    #[test]
+    fn ingest_hold_bounded_by_the_idle_budget_drops_the_publish_and_closes_without_an_ack() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let dropped: std::sync::Arc<std::sync::atomic::AtomicU64> = std::sync::Arc::default();
+            let (mut client, _rx, handle) =
+                spawn_handler_full_ingest(2, 30, dropped.clone(), LONG_INGEST_DEADLINE).await;
+
+            tcp_write_all(&mut client, &V3_CONNECT_TEST_KA1)
+                .await
+                .expect("CONNECT write");
+            let connack = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                .await
+                .expect("read CONNACK");
+            assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+
+            tcp_write_all(&mut client, &PUBLISH_QOS1_T)
+                .await
+                .expect("PUBLISH write");
+
+            let tail = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(3))
+                .await
+                .expect("read to eof");
+            assert!(
+                tail.is_empty(),
+                "expected no PUBACK before the idle-timeout close, got {tail:?}"
+            );
+
+            assert_eq!(dropped.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(matches!(join_res, Ok(SessionOutcome::Served)));
+        });
+    }
+
+    /// AC-9 — while one connection waits for event-channel room, a sibling
+    /// connection on the same worker completes its own QoS 1 round trip once
+    /// its publish is granted a slot.
+    #[test]
+    #[allow(clippy::too_many_lines)] // sibling round trips for both connections push the body past the pedantic 100-line boundary
+    fn ingest_hold_lets_a_sibling_connection_complete_a_qos1_round_trip() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let dropped: std::sync::Arc<std::sync::atomic::AtomicU64> = std::sync::Arc::default();
+            let (tx, mut rx) = event_channel(0, dropped.clone());
+            for _ in 0..EVENT_CHANNEL_CAPACITY {
+                tx.send(Publish::fixture("t", &FIXTURE_PAYLOAD));
+            }
+
+            let (mut client_a, handle_a) =
+                spawn_handler_on_sender(tx.clone(), 2, 30, LONG_INGEST_DEADLINE).await;
+            let (mut client_b, handle_b) =
+                spawn_handler_on_sender(tx, 2, 30, LONG_INGEST_DEADLINE).await;
+
+            tcp_write_all(&mut client_a, &V3_CONNECT_TEST)
+                .await
+                .expect("A CONNECT write");
+            let connack_a = tcp_read_n_bounded(&mut client_a, 4, Duration::from_secs(2))
+                .await
+                .expect("A read CONNACK");
+            assert_eq!(connack_a, vec![0x20, 0x02, 0x00, 0x00]);
+
+            tcp_write_all(&mut client_b, &V3_CONNECT_TEST)
+                .await
+                .expect("B CONNECT write");
+            let connack_b = tcp_read_n_bounded(&mut client_b, 4, Duration::from_secs(2))
+                .await
+                .expect("B read CONNACK");
+            assert_eq!(connack_b, vec![0x20, 0x02, 0x00, 0x00]);
+
+            let mut a_publishes = Vec::new();
+            a_publishes.extend_from_slice(&v3_qos1_publish(b"a", 1));
+            a_publishes.extend_from_slice(&v3_qos1_publish(b"a", 2));
+            tcp_write_all(&mut client_a, &a_publishes)
+                .await
+                .expect("A PUBLISH write");
+
+            monoio::time::sleep(HOLD_SETTLE).await;
+
+            tcp_write_all(&mut client_b, &v3_qos1_publish(b"b", 1))
+                .await
+                .expect("B PUBLISH write");
+
+            monoio::time::sleep(HOLD_SETTLE).await;
+
+            let evt = monoio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("drain timeout")
+                .expect("drain Some");
+            assert_eq!(evt.topic(), "t");
+            let puback_a1 = tcp_read_n_bounded(&mut client_a, 4, Duration::from_secs(2))
+                .await
+                .expect("A read PUBACK 1");
+            assert_eq!(puback_a1, vec![0x40, 0x02, 0x00, 0x01]);
+
+            let evt = monoio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("drain timeout")
+                .expect("drain Some");
+            assert_eq!(evt.topic(), "t");
+            let puback_b1 = tcp_read_n_bounded(&mut client_b, 4, Duration::from_secs(2))
+                .await
+                .expect("B read PUBACK 1");
+            assert_eq!(puback_b1, vec![0x40, 0x02, 0x00, 0x01]);
+
+            let still_held = tcp_read_n_bounded(&mut client_a, 4, NO_ACK_WINDOW)
+                .await
+                .expect("A bounded read");
+            assert!(
+                still_held.is_empty(),
+                "A's second publish must still be held, got {still_held:?}"
+            );
+
+            for _ in 0..EVENT_CHANNEL_CAPACITY - 2 {
+                let evt = monoio::time::timeout(Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("drain timeout")
+                    .expect("drain Some");
+                assert_eq!(evt.topic(), "t");
+            }
+            let evt = monoio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("drain timeout")
+                .expect("drain Some");
+            assert_eq!(evt.topic(), "a");
+            let evt = monoio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("drain timeout")
+                .expect("drain Some");
+            assert_eq!(evt.topic(), "b");
+
+            let puback_a2 = tcp_read_n_bounded(&mut client_a, 4, Duration::from_secs(2))
+                .await
+                .expect("A read PUBACK 2");
+            assert_eq!(puback_a2, vec![0x40, 0x02, 0x00, 0x02]);
+            let evt = monoio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("drain timeout")
+                .expect("drain Some");
+            assert_eq!(evt.topic(), "a");
+
+            assert_eq!(dropped.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+            tcp_write_all(&mut client_a, &DISCONNECT)
+                .await
+                .expect("A disconnect write");
+            tcp_write_all(&mut client_b, &DISCONNECT)
+                .await
+                .expect("B disconnect write");
+            let join_res_a = monoio::time::timeout(Duration::from_secs(2), handle_a)
+                .await
+                .expect("A join timeout");
+            assert!(matches!(join_res_a, Ok(SessionOutcome::Served)));
+            let join_res_b = monoio::time::timeout(Duration::from_secs(2), handle_b)
+                .await
+                .expect("B join timeout");
+            assert!(matches!(join_res_b, Ok(SessionOutcome::Served)));
+        });
+    }
+
+    /// AC-6 — a PINGREQ queued behind held PUBLISHes is still answered
+    /// inside the connection's idle budget, after each held publish's wait
+    /// ran out its own ingest deadline.
+    #[test]
+    fn ingest_hold_answers_a_pingreq_queued_behind_held_publishes_within_the_idle_budget() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let dropped: std::sync::Arc<std::sync::atomic::AtomicU64> = std::sync::Arc::default();
+            let (mut client, _rx, handle) =
+                spawn_handler_full_ingest(2, 30, dropped.clone(), SHORT_INGEST_DEADLINE).await;
+
+            tcp_write_all(&mut client, &V3_CONNECT_TEST_KA3)
+                .await
+                .expect("CONNECT write");
+            let connack = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                .await
+                .expect("read CONNACK");
+            assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+
+            let start = std::time::Instant::now();
+            let mut script = Vec::new();
+            for _ in 0..3 {
+                script.extend_from_slice(&PUBLISH_QOS1_T);
+            }
+            script.extend_from_slice(&PINGREQ);
+            tcp_write_all(&mut client, &script)
+                .await
+                .expect("PUBLISH + PINGREQ write");
+
+            let got = tcp_read_n_bounded(&mut client, 14, KA3_IDLE_BUDGET)
+                .await
+                .expect("read PUBACKs + PINGRESP");
+            let elapsed = start.elapsed();
+            let mut expected = Vec::new();
+            for _ in 0..3 {
+                expected.extend_from_slice(&[0x40, 0x02, 0x00, 0x01]);
+            }
+            expected.extend_from_slice(&[0xD0, 0x00]);
+            assert_eq!(got, expected);
+            assert!(
+                elapsed >= SHORT_INGEST_DEADLINE * 3,
+                "PINGRESP arrived before three ingest-deadline waits elapsed"
+            );
+            assert!(
+                elapsed < KA3_IDLE_BUDGET,
+                "PINGRESP arrived at or after the idle budget"
+            );
+
+            assert_eq!(dropped.load(std::sync::atomic::Ordering::Relaxed), 3);
+
+            tcp_write_all(&mut client, &DISCONNECT)
+                .await
+                .expect("disconnect write");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(matches!(join_res, Ok(SessionOutcome::Served)));
+        });
+    }
+
+    /// AC-18 — a wait that a stalled worker thread lets overrun the whole
+    /// idle budget drops the held publish and closes the connection as an
+    /// idle timeout, without writing its acknowledgement.
+    #[test]
+    fn ingest_hold_that_outlasts_the_idle_budget_drops_the_publish_and_closes_without_an_ack() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let dropped: std::sync::Arc<std::sync::atomic::AtomicU64> = std::sync::Arc::default();
+            let (tx, _rx) = event_channel(0, dropped.clone());
+            for _ in 0..EVENT_CHANNEL_CAPACITY {
+                tx.send(Publish::fixture("t", &[]));
+            }
+
+            let mut script = Vec::new();
+            script.extend_from_slice(&V3_CONNECT_TEST_KA1);
+            script.extend_from_slice(&PUBLISH_QOS1_T);
+
+            let (mut client, handle) =
+                spawn_handler_scripted(tx, 30, STALL_INGEST_DEADLINE, script, Duration::ZERO).await;
+
+            let connack = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                .await
+                .expect("read CONNACK");
+            assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+
+            monoio::time::sleep(HOLD_SETTLE).await;
+            std::thread::sleep(RUNTIME_STALL);
+
+            let tail = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(3))
+                .await
+                .expect("read to eof");
+            assert!(
+                tail.is_empty(),
+                "expected no PUBACK before the idle-timeout close, got {tail:?}"
+            );
+
+            assert_eq!(dropped.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(matches!(join_res, Ok(SessionOutcome::Served)));
+
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert_eq!(count_lines_at(&logs, "DEBUG", "client idle timeout"), 1);
+        });
+    }
+
+    /// AC-19, AC-20 — a slot granted to a waiting publish after the idle
+    /// budget already ran out is given back: the publish is dropped and the
+    /// connection closes as an idle timeout, without an acknowledgement.
+    #[test]
+    fn ingest_hold_granted_a_slot_after_the_idle_budget_ran_out_drops_the_publish_and_closes_without_an_ack(
+    ) {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let dropped: std::sync::Arc<std::sync::atomic::AtomicU64> = std::sync::Arc::default();
+            let (tx, mut rx) = event_channel(0, dropped.clone());
+            for _ in 0..EVENT_CHANNEL_CAPACITY {
+                tx.send(Publish::fixture("fill", &[]));
+            }
+
+            let mut script = Vec::new();
+            script.extend_from_slice(&V3_CONNECT_TEST_KA1);
+            script.extend_from_slice(&PUBLISH_QOS1_T);
+
+            let (mut client, handle) =
+                spawn_handler_scripted(tx, 30, LONG_INGEST_DEADLINE, script, Duration::ZERO).await;
+
+            let connack = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                .await
+                .expect("read CONNACK");
+            assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+
+            monoio::time::sleep(HOLD_SETTLE).await;
+
+            let evt = monoio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("recv timeout")
+                .expect("recv Some");
+            assert_eq!(evt.topic(), "fill");
+
+            std::thread::sleep(RUNTIME_STALL);
+
+            let tail = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(3))
+                .await
+                .expect("read to eof");
+            assert!(
+                tail.is_empty(),
+                "expected no PUBACK before the idle-timeout close, got {tail:?}"
+            );
+
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(matches!(join_res, Ok(SessionOutcome::Served)));
+
+            assert_eq!(dropped.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+            for _ in 0..EVENT_CHANNEL_CAPACITY - 1 {
+                let evt = monoio::time::timeout(Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("drain timeout")
+                    .expect("drain Some");
+                assert_eq!(evt.topic(), "fill");
+            }
+            let exhausted = monoio::time::timeout(Duration::from_millis(300), rx.recv())
+                .await
+                .expect("drain timeout");
+            assert!(exhausted.is_none(), "topic \"t\" must never arrive");
+
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert_eq!(count_lines_at(&logs, "DEBUG", "client idle timeout"), 1);
+        });
+    }
+
+    /// AC-10 — a run of held publishes shares one idle budget: the anchor set
+    /// by the first held publish survives every packet decoded from bytes
+    /// already in the read buffer, and the connection closes as an idle
+    /// timeout when that shared budget runs out.
+    #[test]
+    fn ingest_holds_in_a_row_share_one_idle_budget_and_close_when_it_runs_out() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let dropped: std::sync::Arc<std::sync::atomic::AtomicU64> = std::sync::Arc::default();
+            let (tx, _rx) = event_channel(0, dropped.clone());
+            for _ in 0..EVENT_CHANNEL_CAPACITY {
+                tx.send(Publish::fixture("t", &[]));
+            }
+
+            let mut prefix = Vec::new();
+            prefix.extend_from_slice(&V3_CONNECT_TEST_KA3);
+            for _ in 0..3 {
+                prefix.extend_from_slice(&PUBLISH_QOS1_T);
+            }
+            prefix.extend_from_slice(&PUBLISH_QOS1_T[..3]);
+
+            let start = std::time::Instant::now();
+            let (mut client, handle) =
+                spawn_handler_scripted(tx, 30, SHORT_INGEST_DEADLINE, prefix, Duration::ZERO).await;
+
+            let connack = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                .await
+                .expect("read CONNACK");
+            assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+
+            let mut tail = Vec::new();
+            tail.extend_from_slice(&PUBLISH_QOS1_T[3..]);
+            tail.extend_from_slice(&PUBLISH_QOS1_T);
+            tail.extend_from_slice(&PINGREQ);
+            tcp_write_all(&mut client, &tail).await.expect("tail write");
+
+            let got = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(6))
+                .await
+                .expect("read to eof");
+            let elapsed = start.elapsed();
+            let mut expected = Vec::new();
+            for _ in 0..3 {
+                expected.extend_from_slice(&[0x40, 0x02, 0x00, 0x01]);
+            }
+            assert_eq!(got, expected, "expected exactly 3 PUBACKs, no PINGRESP");
+            assert!(
+                elapsed >= KA3_IDLE_BUDGET.saturating_sub(INGEST_REPLY_RESERVE),
+                "connection closed before the shared idle budget ran out, elapsed {elapsed:?}"
+            );
+
+            assert_eq!(dropped.load(std::sync::atomic::Ordering::Relaxed), 4);
+
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(matches!(join_res, Ok(SessionOutcome::Served)));
+        });
+    }
+
+    /// AC-10 — hold debt accumulated by a held publish survives a sibling
+    /// publish that is admitted at once: every following wait is still
+    /// measured from the first held publish's anchor, not re-anchored at the
+    /// publish admitted without waiting.
+    #[test]
+    fn ingest_holds_keep_one_idle_budget_across_a_publish_admitted_at_once() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let dropped: std::sync::Arc<std::sync::atomic::AtomicU64> = std::sync::Arc::default();
+            let (tx, mut rx) = event_channel(0, dropped.clone());
+            for _ in 0..EVENT_CHANNEL_CAPACITY {
+                tx.send(Publish::fixture("t", &[]));
+            }
+
+            let mut prefix = Vec::new();
+            prefix.extend_from_slice(&V3_CONNECT_TEST_KA3);
+            for _ in 0..6 {
+                prefix.extend_from_slice(&PUBLISH_QOS1_T);
+            }
+
+            let start = std::time::Instant::now();
+            let (mut client, handle) =
+                spawn_handler_scripted(tx, 30, ROOM_TEST_INGEST_DEADLINE, prefix, Duration::ZERO)
+                    .await;
+
+            let connack = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                .await
+                .expect("read CONNACK");
+            assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+
+            monoio::time::sleep(FREE_ROOM_AT).await;
+            let evt = monoio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("drain timeout")
+                .expect("drain Some");
+            assert_eq!(evt.topic(), "t");
+            let evt = monoio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("drain timeout")
+                .expect("drain Some");
+            assert_eq!(evt.topic(), "t");
+
+            let got = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(6))
+                .await
+                .expect("read to eof");
+            let elapsed = start.elapsed();
+            let mut expected = Vec::new();
+            for _ in 0..4 {
+                expected.extend_from_slice(&[0x40, 0x02, 0x00, 0x01]);
+            }
+            assert_eq!(got, expected, "expected exactly 4 PUBACKs");
+            assert!(
+                elapsed >= KA3_IDLE_BUDGET.saturating_sub(INGEST_REPLY_RESERVE),
+                "connection closed before the shared idle budget ran out, elapsed {elapsed:?}"
+            );
+
+            assert_eq!(dropped.load(std::sync::atomic::Ordering::Relaxed), 3);
+
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(matches!(join_res, Ok(SessionOutcome::Served)));
+        });
+    }
+
+    /// AC-10 — a read that starts from an empty read buffer refreshes the
+    /// idle anchor: hold debt only survives packets decoded from bytes
+    /// already buffered, not a packet whose bytes arrive after the read
+    /// buffer drained.
+    #[test]
+    fn ingest_holds_end_when_a_read_starts_from_an_empty_buffer() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let dropped: std::sync::Arc<std::sync::atomic::AtomicU64> = std::sync::Arc::default();
+            let (tx, _rx) = event_channel(0, dropped.clone());
+            for _ in 0..EVENT_CHANNEL_CAPACITY {
+                tx.send(Publish::fixture("t", &[]));
+            }
+
+            let mut prefix = Vec::new();
+            prefix.extend_from_slice(&V3_CONNECT_TEST_KA3);
+            for _ in 0..3 {
+                prefix.extend_from_slice(&PUBLISH_QOS1_T);
+            }
+
+            let (mut client, handle) =
+                spawn_handler_scripted(tx, 30, SHORT_INGEST_DEADLINE, prefix, Duration::ZERO).await;
+
+            let connack = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                .await
+                .expect("read CONNACK");
+            assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+
+            let got = tcp_read_n_bounded(&mut client, 12, Duration::from_secs(5))
+                .await
+                .expect("read 3 PUBACKs");
+            let mut expected = Vec::new();
+            for _ in 0..3 {
+                expected.extend_from_slice(&[0x40, 0x02, 0x00, 0x01]);
+            }
+            assert_eq!(got, expected);
+
+            tcp_write_all(&mut client, &PUBLISH_QOS1_T)
+                .await
+                .expect("PUBLISH write");
+            let puback = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(3))
+                .await
+                .expect("read PUBACK");
+            assert_eq!(puback, vec![0x40, 0x02, 0x00, 0x01]);
+
+            tcp_write_all(&mut client, &DISCONNECT)
+                .await
+                .expect("disconnect write");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(matches!(join_res, Ok(SessionOutcome::Served)));
+
+            assert_eq!(dropped.load(std::sync::atomic::Ordering::Relaxed), 4);
+        });
+    }
+
+    /// AC-18 — idle expiry wins over a protocol violation decoded from the
+    /// held backlog: once hold debt keeps an old anchor, a buffered duplicate
+    /// CONNECT found with no idle budget left closes as an idle timeout, not
+    /// a violation.
+    #[test]
+    fn ingest_holds_idle_expiry_wins_over_a_buffered_violation() {
+        let sink = capture_logs();
+        let mut rt = legacy_timer_runtime();
+        rt.block_on(async {
+            let dropped: std::sync::Arc<std::sync::atomic::AtomicU64> = std::sync::Arc::default();
+            let (tx, _rx) = event_channel(0, dropped.clone());
+            for _ in 0..EVENT_CHANNEL_CAPACITY {
+                tx.send(Publish::fixture("t", &[]));
+            }
+
+            let mut prefix = Vec::new();
+            prefix.extend_from_slice(&V3_CONNECT_TEST_KA1);
+            prefix.extend_from_slice(&PUBLISH_QOS1_T);
+            prefix.extend_from_slice(&V3_CONNECT_TEST_KA1);
+
+            let (mut client, handle) =
+                spawn_handler_scripted(tx, 30, STALL_INGEST_DEADLINE, prefix, WRITE_STALL_DELAY)
+                    .await;
+
+            let connack = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                .await
+                .expect("read CONNACK");
+            assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+
+            monoio::time::sleep(STALL_INGEST_DEADLINE + WRITE_STALL_DELAY / 2).await;
+            std::thread::sleep(RUNTIME_STALL);
+
+            let got = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(3))
+                .await
+                .expect("read to eof");
+            assert_eq!(got, vec![0x40, 0x02, 0x00, 0x01]);
+
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(matches!(join_res, Ok(SessionOutcome::Served)));
+
+            assert_eq!(dropped.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert_eq!(count_lines_at(&logs, "WARN", "duplicate CONNECT"), 0);
+            assert_eq!(count_lines_at(&logs, "DEBUG", "client idle timeout"), 1);
         });
     }
 

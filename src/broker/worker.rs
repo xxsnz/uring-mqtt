@@ -98,8 +98,28 @@ fn should_log_count(total: u64) -> bool {
 
 /// Shared bookkeeping between sender clones and the receiver.
 struct EventChannelState {
-    depth: Cell<usize>,      // events currently queued
+    depth: Cell<usize>,                     // events currently queued
     dropped: Arc<AtomicU64>, // lifetime overflow drops (never reset); read by BrokerHandle
+    room: local_sync::semaphore::Semaphore, // one permit per free slot
+}
+
+/// Outcome of offering one publish to the worker's event channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Admission {
+    /// Queued for the callback at once: the channel had room.
+    Enqueued,
+    /// Queued for the callback after the connection waited for room.
+    EnqueuedAfterHold,
+    /// The channel stayed full for the whole wait (at once for a zero
+    /// wait); counted in the drop total and warned on the shared cadence.
+    Dropped,
+    /// The receiver is gone (runtime teardown only); debug-logged, not counted.
+    ReceiverClosed,
+    /// The connection's idle budget ran out before the publish could be
+    /// enqueued (a stalled worker, or a held backlog that outlasted it): any
+    /// granted slot went back, and the publish is counted in the drop total.
+    /// The caller closes as an idle timeout without an acknowledgement.
+    NoReplyTime,
 }
 
 #[derive(Clone)]
@@ -110,33 +130,113 @@ pub(crate) struct EventSender {
 }
 
 impl EventSender {
-    /// Offers `publish` to the worker's callback. A full channel increments the
-    /// drop counter and warns on the `should_log_count` cadence; a receiver
-    /// that has gone away is debug-logged only, and is not counted. Either way
-    /// the event is discarded and the caller is not told: a QoS 1 PUBACK and a
-    /// QoS 2 PUBREC are both sent for every well-formed PUBLISH regardless, so
-    /// a publisher is never left holding an inflight slot for a publish this
-    /// broker has dropped.
-    pub(crate) fn send(&self, publish: Publish) {
+    /// Offers `publish` to the worker's callback, waiting up to `wait` for a
+    /// slot while the channel is full. A publish the wait cannot place, or
+    /// that only gets a slot after `reply_by` (the end of its connection's
+    /// idle budget), is counted in the drop total and warned on the
+    /// `should_log_count` cadence, also when this future is dropped
+    /// mid-wait (a shutdown force-close). A receiver that has gone away is debug-logged only and
+    /// not counted. The caller acknowledges the publish in every case except
+    /// the one it decides itself (an idle-budget close).
+    pub(crate) async fn admit(
+        &self,
+        publish: Publish,
+        wait: std::time::Duration,
+        reply_by: std::time::Instant,
+    ) -> Admission {
+        if std::time::Instant::now() >= reply_by && !self.tx.is_closed() {
+            self.note_dropped();
+            return Admission::NoReplyTime;
+        }
+        let publish = match self.offer_now(publish) {
+            Ok(admission) => return admission,
+            Err(publish) => publish,
+        };
+        if wait.is_zero() {
+            self.note_dropped();
+            return Admission::Dropped;
+        }
+        let mut slot = SlotWait {
+            sender: self,
+            acquire: Box::pin(self.state.room.acquire()),
+            completed: false,
+            settled: false,
+        };
+        if let Ok(granted) = monoio::time::timeout(wait, slot.acquire.as_mut()).await {
+            slot.completed = true;
+            // A slot granted before a delayed wakeup is used: it is
+            // reserved for this publish — unless the idle budget is gone,
+            // then the permit drops (the slot goes back) and `slot` counts
+            // the publish.
+            if let Ok(permit) = granted {
+                if std::time::Instant::now() >= reply_by {
+                    return Admission::NoReplyTime;
+                }
+                permit.forget();
+                slot.settled = true;
+                return self.enqueue(publish, Admission::EnqueuedAfterHold);
+            }
+            // `EventReceiver::drop` is the only thing that closes `room`,
+            // and it closes the channel first: the receiver went away
+            // during the hold, so this is an uncounted discard, not an
+            // overflow drop.
+            slot.settled = true;
+            self.note_closed();
+            return Admission::ReceiverClosed;
+        }
+        // No slot in time: `slot` counts the publish as it drops here.
+        Admission::Dropped
+    }
+
+    /// Enqueue at once if a slot is free; `Err` hands the publish back
+    /// when the channel is full. A closed receiver is reported, not counted.
+    #[allow(clippy::result_large_err)] // PLAN.md ## Interface Contracts: Err is Publish
+    fn offer_now(&self, publish: Publish) -> Result<Admission, Publish> {
         if self.tx.is_closed() {
             self.note_closed();
-            return;
+            return Ok(Admission::ReceiverClosed);
         }
-        if self.state.depth.get() >= EVENT_CHANNEL_CAPACITY {
-            let total = self.state.dropped.fetch_add(1, Ordering::Relaxed) + 1;
-            if should_log_count(total) {
-                tracing::warn!(
-                    "worker {}: event channel full, dropped event ({} dropped total)",
-                    self.worker_id,
-                    total
-                );
+        match self.state.room.try_acquire() {
+            Ok(permit) => {
+                permit.forget();
+                Ok(self.enqueue(publish, Admission::Enqueued))
             }
-            return;
+            Err(_) => Err(publish),
         }
+    }
+
+    /// Put `publish` into the channel under a slot already taken; returns
+    /// `admitted`, or gives the slot back if the receiver is gone.
+    fn enqueue(&self, publish: Publish, admitted: Admission) -> Admission {
         if let Ok(()) = self.tx.send(publish) {
             self.state.depth.set(self.state.depth.get() + 1);
+            admitted
         } else {
+            self.state.room.add_permits(1);
             self.note_closed();
+            Admission::ReceiverClosed
+        }
+    }
+
+    /// Count one dropped publish and warn on the shared cadence.
+    fn note_dropped(&self) {
+        let total = self.state.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+        if should_log_count(total) {
+            tracing::warn!(
+                "worker {}: event channel full, dropped event ({} dropped total)",
+                self.worker_id,
+                total
+            );
+        }
+    }
+
+    /// Test helper: offer without waiting — enqueue if a slot is free,
+    /// otherwise count a drop. Drives channel tests that run outside a
+    /// runtime and fill the channel during setup.
+    #[cfg(test)]
+    pub(crate) fn send(&self, publish: Publish) {
+        if self.offer_now(publish).is_err() {
+            self.note_dropped();
         }
     }
 
@@ -158,6 +258,38 @@ impl EventSender {
     }
 }
 
+/// One publish's wait for a slot, safe to abandon. local-sync 0.1.1's
+/// `Acquire::drop` panics when it must hand back a slot that was granted but
+/// not yet observed (it re-borrows the wait list it holds,
+/// `semaphore.rs:397-418`), so dropping this first polls an incomplete wait
+/// once with a no-op waker and releases a granted slot through the permit's
+/// own drop. Unless the publish's outcome is already settled, dropping it
+/// counts the publish dropped — a shutdown force-close drops the whole
+/// connection future.
+struct SlotWait<'a> {
+    sender: &'a EventSender,
+    acquire: std::pin::Pin<Box<local_sync::semaphore::AcquireResult<'a>>>,
+    /// The wait has returned; it must not be polled again.
+    completed: bool,
+    /// The publish was enqueued, or discarded because the receiver is gone;
+    /// there is nothing to count.
+    settled: bool,
+}
+
+impl Drop for SlotWait<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            // Take a slot granted since the last poll so the permit's
+            // drop returns it; `Acquire::drop` would panic doing so.
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            let _ = std::future::Future::poll(self.acquire.as_mut(), &mut cx);
+        }
+        if !self.settled {
+            self.sender.note_dropped();
+        }
+    }
+}
+
 pub(crate) struct EventReceiver {
     rx: local_sync::mpsc::unbounded::Rx<Publish>,
     state: Rc<EventChannelState>,
@@ -168,8 +300,21 @@ impl EventReceiver {
         let item = self.rx.recv().await;
         if item.is_some() {
             self.state.depth.set(self.state.depth.get() - 1);
+            self.state.room.add_permits(1);
         }
         item
+    }
+}
+
+impl Drop for EventReceiver {
+    fn drop(&mut self) {
+        // Close the channel first, then the slot semaphore: `room` never
+        // frees a slot again, so a connection holding a publish would
+        // otherwise wait out its whole ingest deadline and count an
+        // overflow drop that never happened. Closing wakes every pending
+        // `admit`, which reports the uncounted `ReceiverClosed` discard.
+        self.rx.close();
+        self.state.room.close();
     }
 }
 
@@ -181,6 +326,7 @@ pub(crate) fn event_channel(
     let state = Rc::new(EventChannelState {
         depth: Cell::new(0),
         dropped,
+        room: local_sync::semaphore::Semaphore::new(EVENT_CHANNEL_CAPACITY),
     });
     let (tx, rx) = local_sync::mpsc::unbounded::channel::<Publish>();
     (
@@ -322,7 +468,7 @@ pub async fn run_worker(
 
     // Spawn event processor task
     let callback_clone = callback.clone();
-    monoio::spawn(async move {
+    let processor = monoio::spawn(async move {
         process_events(event_rx, callback_clone).await;
     });
 
@@ -364,6 +510,12 @@ pub async fn run_worker(
             let _ = canceller.cancel();
         });
     }
+
+    let ingest_deadline = std::time::Duration::from_secs(
+        config
+            .ingest_deadline_secs
+            .min(crate::broker::handshake::MAX_TIMEOUT_SECS),
+    );
 
     // Accept loop
     let mut connection_counter: u64 = 0;
@@ -413,7 +565,7 @@ pub async fn run_worker(
                 monoio::spawn(async move {
                     monoio::select! {
                         biased;
-                        res = handle_client(stream, event_tx_clone, connection_timeout, idle_timeout, max_inbound_packet_size) => {
+                        res = handle_client(stream, event_tx_clone, connection_timeout, idle_timeout, max_inbound_packet_size, ingest_deadline) => {
                             match res {
                                 Ok(super::handler::SessionOutcome::Refused) => state_clone.note_refused(),
                                 Ok(super::handler::SessionOutcome::Served) => {}
@@ -465,6 +617,13 @@ pub async fn run_worker(
         abort.close();
         while done_rx.recv().await.is_some() {}
     }
+    // Every session is gone, so the master sender is the last one: dropping
+    // it lets the processor deliver what is still queued and then see the
+    // end of the channel. Awaiting it makes every admitted publish reach the
+    // callback before the runtime ends, by construction rather than by
+    // run-queue order.
+    drop(event_tx);
+    processor.await;
     Ok(())
 }
 
@@ -482,6 +641,9 @@ async fn process_events(mut rx: EventReceiver, callback: Option<PublishCallback>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::broker::handler::tests::{
+        capture_logs, count_lines_at, has_line_at, legacy_timer_runtime,
+    };
     use crate::broker::supervise_startup;
     use std::future::Future;
     use std::io::{Read, Write};
@@ -542,6 +704,19 @@ mod tests {
         let mut fut = pin!(rx.recv());
         poll_once(&mut fut, waker)
     }
+
+    /// `reply_by` for tests where the idle budget never runs out.
+    fn no_idle_limit() -> std::time::Instant {
+        std::time::Instant::now() + NO_IDLE_LIMIT
+    }
+
+    const NO_IDLE_LIMIT: Duration = Duration::from_secs(3600);
+    /// Wait long enough that only a freed slot ends it.
+    const ADMIT_WAIT: Duration = Duration::from_secs(5);
+    /// Wait a test lets run out.
+    const SHORT_ADMIT_WAIT: Duration = Duration::from_millis(50);
+    /// Lets spawned tasks reach their wait before the test acts.
+    const REGISTER_PAUSE: Duration = Duration::from_millis(50);
 
     #[test]
     fn event_yielded_when_channel_not_full() {
@@ -1874,5 +2049,483 @@ mod tests {
         }
 
         worker_thread.join().expect("worker join");
+    }
+
+    // -- channel admission with a bounded wait (task 1) -------------------
+
+    /// AC-1 — an empty channel enqueues at once, no wait spent.
+    #[test]
+    fn channel_admission_enqueues_without_holding_when_room_exists() {
+        let mut rt = legacy_timer_runtime();
+        rt.block_on(async {
+            let (tx, mut rx) = event_channel(0, Arc::default());
+            let admission = tx
+                .admit(
+                    Publish::fixture("t", &[0x01]),
+                    Duration::ZERO,
+                    no_idle_limit(),
+                )
+                .await;
+            assert_eq!(admission, Admission::Enqueued);
+            assert_eq!(tx.queued_depth(), 1);
+            assert_eq!(tx.dropped_total(), 0);
+            let evt = rx.recv().await.expect("publish Some");
+            assert_eq!(evt.payload(), &[0x01][..]);
+        });
+    }
+
+    /// AC-2 — a hold on a full channel is granted once the receiver drains
+    /// one slot.
+    #[test]
+    fn channel_admission_holds_until_the_receiver_makes_room() {
+        let mut rt = legacy_timer_runtime();
+        rt.block_on(async {
+            let (tx, mut rx) = event_channel(0, Arc::default());
+            for _ in 0..EVENT_CHANNEL_CAPACITY {
+                tx.send(Publish::fixture("t", &[]));
+            }
+            let tx2 = tx.clone();
+            let held = monoio::spawn(async move {
+                tx2.admit(Publish::fixture("held", &[]), ADMIT_WAIT, no_idle_limit())
+                    .await
+            });
+            monoio::time::sleep(REGISTER_PAUSE).await;
+            assert_eq!(tx.queued_depth(), EVENT_CHANNEL_CAPACITY);
+            rx.recv().await.expect("publish Some");
+            let admission = held.await;
+            assert_eq!(admission, Admission::EnqueuedAfterHold);
+            assert_eq!(tx.queued_depth(), EVENT_CHANNEL_CAPACITY);
+            assert_eq!(tx.dropped_total(), 0);
+            for _ in 0..EVENT_CHANNEL_CAPACITY - 1 {
+                let evt = rx.recv().await.expect("publish Some");
+                assert_eq!(evt.topic(), "t");
+            }
+            let evt = rx.recv().await.expect("publish Some");
+            assert_eq!(evt.topic(), "held");
+        });
+    }
+
+    /// AC-3 — a hold that outlasts its wait is dropped and counted.
+    #[test]
+    fn channel_admission_drops_and_counts_when_the_wait_runs_out() {
+        let mut rt = legacy_timer_runtime();
+        rt.block_on(async {
+            let (tx, mut rx) = event_channel(0, Arc::default());
+            for _ in 0..EVENT_CHANNEL_CAPACITY {
+                tx.send(Publish::fixture("t", &[]));
+            }
+            let start = std::time::Instant::now();
+            let admission = tx
+                .admit(
+                    Publish::fixture("late", &[]),
+                    SHORT_ADMIT_WAIT,
+                    no_idle_limit(),
+                )
+                .await;
+            let elapsed = start.elapsed();
+            assert_eq!(admission, Admission::Dropped);
+            assert!(
+                elapsed >= SHORT_ADMIT_WAIT,
+                "elapsed {elapsed:?} < wait {SHORT_ADMIT_WAIT:?}"
+            );
+            assert_eq!(tx.dropped_total(), 1);
+            assert_eq!(tx.queued_depth(), EVENT_CHANNEL_CAPACITY);
+            for _ in 0..EVENT_CHANNEL_CAPACITY {
+                let evt = rx.recv().await.expect("publish Some");
+                assert_eq!(evt.topic(), "t");
+            }
+        });
+    }
+
+    /// AC-3 — a zero wait on a full channel drops at once, same as the
+    /// production packet loop's call shape; the next admit after a drain
+    /// enqueues with no slot leaked or lost.
+    #[test]
+    fn channel_admission_with_zero_wait_drops_a_full_channel_publish_at_once() {
+        let mut rt = legacy_timer_runtime();
+        rt.block_on(async {
+            let (tx, mut rx) = event_channel(0, Arc::default());
+            for _ in 0..EVENT_CHANNEL_CAPACITY {
+                tx.send(Publish::fixture("t", &[]));
+            }
+            let admission = tx
+                .admit(
+                    Publish::fixture("over", &[]),
+                    Duration::ZERO,
+                    no_idle_limit(),
+                )
+                .await;
+            assert_eq!(admission, Admission::Dropped);
+            assert_eq!(tx.dropped_total(), 1);
+            rx.recv().await.expect("publish Some");
+            let admission = tx
+                .admit(
+                    Publish::fixture("next", &[]),
+                    Duration::ZERO,
+                    no_idle_limit(),
+                )
+                .await;
+            assert_eq!(admission, Admission::Enqueued);
+        });
+    }
+
+    /// AC-4 — cancelling a hold mid-wait (a dropped future) counts the
+    /// publish exactly once, and does not leak the slot the cancellation
+    /// could have taken.
+    #[test]
+    fn channel_admission_cancelled_mid_hold_counts_its_publish_once() {
+        let mut rt = legacy_timer_runtime();
+        rt.block_on(async {
+            let (tx, mut rx) = event_channel(0, Arc::default());
+            for _ in 0..EVENT_CHANNEL_CAPACITY {
+                tx.send(Publish::fixture("t", &[]));
+            }
+            monoio::select! {
+                _ = tx.admit(Publish::fixture("cancelled", &[]), ADMIT_WAIT, no_idle_limit()) => {
+                    panic!("admit returned while the channel was full")
+                }
+                () = monoio::time::sleep(REGISTER_PAUSE) => {}
+            }
+            assert_eq!(tx.dropped_total(), 1);
+            rx.recv().await.expect("publish Some");
+            let admission = tx
+                .admit(
+                    Publish::fixture("after", &[]),
+                    Duration::ZERO,
+                    no_idle_limit(),
+                )
+                .await;
+            assert_eq!(admission, Admission::Enqueued);
+            assert_eq!(tx.dropped_total(), 1);
+            for _ in 0..EVENT_CHANNEL_CAPACITY - 1 {
+                let evt = rx.recv().await.expect("publish Some");
+                assert_eq!(evt.topic(), "t");
+            }
+            let evt = rx.recv().await.expect("publish Some");
+            assert_eq!(evt.topic(), "after");
+        });
+    }
+
+    /// AC-5 — two holds on the same full channel are granted in the order
+    /// they arrived.
+    #[test]
+    fn channel_admissions_get_room_in_arrival_order() {
+        let mut rt = legacy_timer_runtime();
+        rt.block_on(async {
+            let (tx, mut rx) = event_channel(0, Arc::default());
+            for _ in 0..EVENT_CHANNEL_CAPACITY {
+                tx.send(Publish::fixture("t", &[]));
+            }
+            let tx_a = tx.clone();
+            let task_a = monoio::spawn(async move {
+                tx_a.admit(Publish::fixture("a", &[]), ADMIT_WAIT, no_idle_limit())
+                    .await
+            });
+            monoio::time::sleep(REGISTER_PAUSE).await;
+            let tx_b = tx.clone();
+            let task_b = monoio::spawn(async move {
+                tx_b.admit(Publish::fixture("b", &[]), ADMIT_WAIT, no_idle_limit())
+                    .await
+            });
+            monoio::time::sleep(REGISTER_PAUSE).await;
+            rx.recv().await.expect("publish Some");
+            monoio::time::sleep(REGISTER_PAUSE).await;
+            rx.recv().await.expect("publish Some");
+            assert_eq!(task_a.await, Admission::EnqueuedAfterHold);
+            assert_eq!(task_b.await, Admission::EnqueuedAfterHold);
+            for _ in 0..EVENT_CHANNEL_CAPACITY - 2 {
+                let evt = rx.recv().await.expect("publish Some");
+                assert_eq!(evt.topic(), "t");
+            }
+            let evt = rx.recv().await.expect("publish Some");
+            assert_eq!(evt.topic(), "a");
+            let evt = rx.recv().await.expect("publish Some");
+            assert_eq!(evt.topic(), "b");
+        });
+    }
+
+    /// AC-4, AC-16 — a hold abandoned after its slot was already granted
+    /// (dropped without a final poll) must not panic, must return the slot,
+    /// and must count the publish exactly once.
+    #[test]
+    fn channel_admission_abandoned_after_its_slot_was_granted_returns_the_slot_and_counts_once() {
+        let mut rt = legacy_timer_runtime();
+        rt.block_on(async {
+            let (tx, mut rx) = event_channel(0, Arc::default());
+            for _ in 0..EVENT_CHANNEL_CAPACITY {
+                tx.send(Publish::fixture("t", &[]));
+            }
+            let (_waker_arc, waker) = flag_waker();
+            {
+                let mut held = std::pin::pin!(tx.admit(
+                    Publish::fixture("abandoned", &[]),
+                    ADMIT_WAIT,
+                    no_idle_limit()
+                ));
+                assert!(matches!(poll_once(&mut held, &waker), Poll::Pending));
+                rx.recv().await.expect("publish Some");
+                // `held` drops here without being polled again.
+            }
+            assert_eq!(tx.dropped_total(), 1);
+            assert_eq!(tx.queued_depth(), EVENT_CHANNEL_CAPACITY - 1);
+            let admission = tx
+                .admit(
+                    Publish::fixture("next", &[]),
+                    Duration::ZERO,
+                    no_idle_limit(),
+                )
+                .await;
+            assert_eq!(admission, Admission::Enqueued);
+            for _ in 0..EVENT_CHANNEL_CAPACITY - 1 {
+                let evt = rx.recv().await.expect("publish Some");
+                assert_eq!(evt.topic(), "t");
+            }
+            let evt = rx.recv().await.expect("publish Some");
+            assert_eq!(evt.topic(), "next");
+        });
+    }
+
+    /// AC-17 — a slot granted before a delayed wakeup is still taken by the
+    /// parked wait, even though its timer already expired by the time the
+    /// wakeup runs.
+    #[test]
+    fn channel_admission_takes_a_slot_granted_before_a_late_wakeup() {
+        let mut rt = legacy_timer_runtime();
+        rt.block_on(async {
+            let (tx, mut rx) = event_channel(0, Arc::default());
+            for _ in 0..EVENT_CHANNEL_CAPACITY {
+                tx.send(Publish::fixture("t", &[]));
+            }
+            let (_waker_arc, waker) = flag_waker();
+            let mut late = std::pin::pin!(tx.admit(
+                Publish::fixture("late", &[]),
+                SHORT_ADMIT_WAIT,
+                no_idle_limit()
+            ));
+            assert!(matches!(poll_once(&mut late, &waker), Poll::Pending));
+            rx.recv().await.expect("publish Some");
+            std::thread::sleep(SHORT_ADMIT_WAIT * 2);
+            let admission = late.await;
+            assert_eq!(admission, Admission::EnqueuedAfterHold);
+            assert_eq!(tx.dropped_total(), 0);
+            assert_eq!(tx.queued_depth(), EVENT_CHANNEL_CAPACITY);
+            for _ in 0..EVENT_CHANNEL_CAPACITY - 1 {
+                let evt = rx.recv().await.expect("publish Some");
+                assert_eq!(evt.topic(), "t");
+            }
+            let evt = rx.recv().await.expect("publish Some");
+            assert_eq!(evt.topic(), "late");
+        });
+    }
+
+    /// AC-19 — a publish whose `reply_by` has already passed is refused at
+    /// once; a hold whose granted slot arrives after `reply_by` gives the
+    /// slot back and is counted, not enqueued.
+    #[test]
+    fn channel_admission_with_no_reply_time_left_counts_the_publish_and_gives_its_slot_back() {
+        let mut rt = legacy_timer_runtime();
+        rt.block_on(async {
+            let (tx, mut rx) = event_channel(0, Arc::default());
+
+            // Part 1: empty channel, `reply_by` already passed.
+            let admission = tx
+                .admit(
+                    Publish::fixture("expired", &[]),
+                    Duration::ZERO,
+                    std::time::Instant::now(),
+                )
+                .await;
+            assert_eq!(admission, Admission::NoReplyTime);
+            assert_eq!(tx.dropped_total(), 1);
+            assert_eq!(tx.queued_depth(), 0);
+
+            // Part 2: a granted slot arrives after `reply_by` has passed.
+            for _ in 0..EVENT_CHANNEL_CAPACITY {
+                tx.send(Publish::fixture("t", &[]));
+            }
+            let (_waker_arc, waker) = flag_waker();
+            let mut stalled = std::pin::pin!(tx.admit(
+                Publish::fixture("stalled", &[]),
+                ADMIT_WAIT,
+                std::time::Instant::now() + SHORT_ADMIT_WAIT,
+            ));
+            assert!(matches!(poll_once(&mut stalled, &waker), Poll::Pending));
+            rx.recv().await.expect("publish Some");
+            std::thread::sleep(SHORT_ADMIT_WAIT * 2);
+            let admission = stalled.await;
+            assert_eq!(admission, Admission::NoReplyTime);
+            assert_eq!(tx.dropped_total(), 2);
+            assert_eq!(tx.queued_depth(), EVENT_CHANNEL_CAPACITY - 1);
+
+            let admission = tx
+                .admit(
+                    Publish::fixture("next", &[]),
+                    Duration::ZERO,
+                    no_idle_limit(),
+                )
+                .await;
+            assert_eq!(admission, Admission::Enqueued);
+            for _ in 0..EVENT_CHANNEL_CAPACITY - 1 {
+                let evt = rx.recv().await.expect("publish Some");
+                assert_eq!(evt.topic(), "t");
+            }
+            let evt = rx.recv().await.expect("publish Some");
+            assert_eq!(evt.topic(), "next");
+        });
+    }
+
+    /// AC-3, AC-4 — the drop paths `admit` added share the one counter and
+    /// the one warn line `send` already used, on the `should_log_count`
+    /// cadence: a wait that runs out and a hold cancelled mid-wait count 2
+    /// and warn once, for drop #1 only. A second counter or a second warn
+    /// line for either new path fails here.
+    #[test]
+    fn channel_admission_drop_paths_share_one_counter_and_one_warn_line() {
+        let sink = capture_logs();
+        let mut rt = legacy_timer_runtime();
+        rt.block_on(async {
+            let (tx, _rx) = event_channel(3, Arc::default());
+            for _ in 0..EVENT_CHANNEL_CAPACITY {
+                tx.send(Publish::fixture("t", &[]));
+            }
+
+            // Drop #1: the wait runs out with no slot granted.
+            let admission = tx
+                .admit(
+                    Publish::fixture("late", &[]),
+                    SHORT_ADMIT_WAIT,
+                    no_idle_limit(),
+                )
+                .await;
+            assert_eq!(admission, Admission::Dropped);
+
+            // Drop #2: the waiting future is cancelled mid-hold.
+            monoio::select! {
+                _ = tx.admit(Publish::fixture("cancelled", &[]), ADMIT_WAIT, no_idle_limit()) => {
+                    panic!("admit returned while the channel was full")
+                }
+                () = monoio::time::sleep(REGISTER_PAUSE) => {}
+            }
+            assert_eq!(tx.dropped_total(), 2);
+        });
+
+        let logs = {
+            let bytes = sink.lock().expect("log buffer").clone();
+            String::from_utf8(bytes).expect("utf8 logs")
+        };
+        assert!(
+            has_line_at(
+                &logs,
+                "WARN",
+                &["worker 3: event channel full, dropped event (1 dropped total)"]
+            ),
+            "the shared drop warn line is missing or reworded: {logs}"
+        );
+        assert_eq!(
+            count_lines_at(&logs, "WARN", "dropped event"),
+            1,
+            "only drop #1 warns on the shared cadence: {logs}"
+        );
+    }
+
+    /// A closed receiver is debug-logged and never counted (decision log
+    /// 2026-09-11), and `admit`'s `reply_by` check must not turn it into a
+    /// counted `NoReplyTime` drop: with the idle budget already gone and the
+    /// receiver away, `admit` still reports `ReceiverClosed` and counts
+    /// nothing.
+    #[test]
+    fn channel_admission_with_a_closed_receiver_is_not_counted_when_no_reply_time_is_left() {
+        let sink = capture_logs();
+        let mut rt = legacy_timer_runtime();
+        rt.block_on(async {
+            let (tx, rx) = event_channel(5, Arc::default());
+            drop(rx);
+            let admission = tx
+                .admit(
+                    Publish::fixture("t", &[]),
+                    ADMIT_WAIT,
+                    std::time::Instant::now(),
+                )
+                .await;
+            assert_eq!(admission, Admission::ReceiverClosed);
+            assert_eq!(
+                tx.dropped_total(),
+                0,
+                "a closed-receiver discard must not be counted"
+            );
+        });
+
+        let logs = {
+            let bytes = sink.lock().expect("log buffer").clone();
+            String::from_utf8(bytes).expect("utf8 logs")
+        };
+        assert!(
+            has_line_at(
+                &logs,
+                "DEBUG",
+                &["worker 5: event receiver closed, event discarded"]
+            ),
+            "the closed-receiver debug line is missing or reworded: {logs}"
+        );
+        assert_eq!(
+            count_lines_at(&logs, "WARN", "dropped event"),
+            0,
+            "a closed-receiver discard must not warn as a drop: {logs}"
+        );
+    }
+
+    /// A receiver that goes away *during* a hold ends the wait at once with
+    /// the same uncounted `ReceiverClosed` discard: `room` never frees a
+    /// slot again, so waiting out the deadline would count an overflow drop
+    /// that never happened.
+    #[test]
+    fn channel_admission_held_when_the_receiver_closes_is_not_counted() {
+        let sink = capture_logs();
+        let mut rt = legacy_timer_runtime();
+        rt.block_on(async {
+            let (tx, rx) = event_channel(7, Arc::default());
+            for _ in 0..EVENT_CHANNEL_CAPACITY {
+                tx.send(Publish::fixture("t", &[]));
+            }
+            let (_waker_arc, waker) = flag_waker();
+            let mut held = std::pin::pin!(tx.admit(
+                Publish::fixture("held", &[]),
+                ADMIT_WAIT,
+                no_idle_limit()
+            ));
+            assert!(matches!(poll_once(&mut held, &waker), Poll::Pending));
+
+            let started = std::time::Instant::now();
+            drop(rx);
+            let admission = held.await;
+            assert_eq!(admission, Admission::ReceiverClosed);
+            assert!(
+                started.elapsed() < ADMIT_WAIT,
+                "the hold must end on closure, not on the ingest deadline"
+            );
+            assert_eq!(
+                tx.dropped_total(),
+                0,
+                "a closed-receiver discard must not be counted"
+            );
+        });
+
+        let logs = {
+            let bytes = sink.lock().expect("log buffer").clone();
+            String::from_utf8(bytes).expect("utf8 logs")
+        };
+        assert!(
+            has_line_at(
+                &logs,
+                "DEBUG",
+                &["worker 7: event receiver closed, event discarded"]
+            ),
+            "the closed-receiver debug line is missing or reworded: {logs}"
+        );
+        assert_eq!(
+            count_lines_at(&logs, "WARN", "dropped event"),
+            0,
+            "a closed-receiver discard must not warn as a drop: {logs}"
+        );
     }
 }

@@ -51,21 +51,37 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const RUN_RETURN_BOUND: Duration = Duration::from_secs(30);
 /// Watchdog for the same test: exceeded only by an actual hang.
 const RUN_WATCHDOG: Duration = Duration::from_secs(75);
+/// Drain deadline for the drop-total-after-join cohort test; long enough
+/// that the client finishes its during-drain batch before any force-close.
+const COHORT_DRAIN_TIMEOUT_SECS: u64 = 10;
+/// Publishes written before `shutdown()`; more than one event channel's
+/// 1024-slot capacity.
+const COHORT_BEFORE_DRAIN: u32 = 1500;
+/// Publishes written after `shutdown()`, during the drain.
+const COHORT_DURING_DRAIN: u32 = 200;
+/// Per-publish callback delay in the cohort test, so delivery of the whole
+/// batch takes measurable time.
+const COHORT_CALLBACK_DELAY: Duration = Duration::from_millis(1);
+/// v3 PINGREQ.
+const PINGREQ: [u8; 2] = [0xC0, 0x00];
+/// v3 PINGRESP.
+const PINGRESP: [u8; 2] = [0xD0, 0x00];
+/// v3 DISCONNECT.
+const DISCONNECT: [u8; 2] = [0xE0, 0x00];
+/// Listener-refusal probe budget: 100 × 50 ms = 5 s, covering a callback
+/// backlog that delays the shutdown watcher.
+const REFUSAL_PROBE_ATTEMPTS: usize = 100;
+const REFUSAL_PROBE_INTERVAL: Duration = Duration::from_millis(50);
 
 fn find_free_port() -> u16 {
     let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind free port");
     l.local_addr().expect("local_addr").port()
 }
 
-/// Connect to `addr` (retrying while the server may still be starting),
-/// complete the MQTT v3 handshake, and publish one sensor reading carrying
-/// `temperature`. The connected socket is returned so the caller can keep
-/// the connection open. Which worker serves it is the kernel's
-/// `SO_REUSEPORT` choice — every assertion here holds for any of them.
-fn connect_and_publish(
-    addr: std::net::SocketAddr,
-    temperature: i16,
-) -> std::io::Result<std::net::TcpStream> {
+/// Connect to `addr` (retrying while the server may still be starting) and
+/// complete the MQTT v3 handshake. The connected socket is returned with
+/// its read/write timeouts set.
+fn connect_v3(addr: std::net::SocketAddr) -> std::io::Result<std::net::TcpStream> {
     let mut connected = None;
     for _ in 0..CONNECT_ATTEMPTS {
         match std::net::TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
@@ -91,10 +107,35 @@ fn connect_and_publish(
             "unexpected CONNACK {connack:?}"
         )));
     }
+    Ok(client)
+}
+
+/// Complete the v3 handshake on `addr` and publish one sensor reading
+/// carrying `temperature`. The connected socket is returned so the caller
+/// can keep the connection open. Which worker serves it is the kernel's
+/// `SO_REUSEPORT` choice — every assertion here holds for any of them.
+fn connect_and_publish(
+    addr: std::net::SocketAddr,
+    temperature: i16,
+) -> std::io::Result<std::net::TcpStream> {
+    let mut client = connect_v3(addr)?;
     let mut publish = V3_PUBLISH;
     publish[5..7].copy_from_slice(&temperature.to_be_bytes());
     client.write_all(&publish)?;
     Ok(client)
+}
+
+/// `count` copies of `V3_PUBLISH`, each with its 4-byte payload (bytes
+/// 5..9) replaced by its big-endian index counted from `first`.
+fn indexed_publishes(first: u32, count: u32) -> Vec<u8> {
+    let count_usize = usize::try_from(count).expect("count fits usize");
+    let mut out = Vec::with_capacity(V3_PUBLISH.len() * count_usize);
+    for offset in 0..count {
+        let mut publish = V3_PUBLISH;
+        publish[5..9].copy_from_slice(&(first + offset).to_be_bytes());
+        out.extend_from_slice(&publish);
+    }
+    out
 }
 
 /// A callback that panics on `PANIC_TEMPERATURE` and ignores every other
@@ -651,5 +692,129 @@ fn v5_connack_advertises_the_configured_inbound_bound() {
     assert_eq!(
         connack, V5_CONNACK_ADVERTISING_4096,
         "accept CONNACK must advertise the configured 4096-byte inbound bound"
+    );
+}
+
+/// AC-14, AC-12 — shutdown delivers every publish admitted before and
+/// during the drain, and `DroppedPublishesHandle::total` read after `join`
+/// reconciles with what was delivered. See the per-outcome proof at the
+/// `event_channel` seam (Task 1) for why the sum alone cannot rule out one
+/// publish both delivered and counted while another is lost silently.
+#[test]
+fn drop_total_read_after_join_accounts_for_every_publish_admitted_before_and_during_a_drain() {
+    let (tx, rx) = std::sync::mpsc::channel::<(Vec<u32>, u64)>();
+    let _h = std::thread::Builder::new()
+        .name("api-drop-total-after-join".into())
+        .spawn(move || {
+            let outcome = (|| -> Result<(), Error> {
+                let port = find_free_port();
+                let addr: std::net::SocketAddr = format!("127.0.0.1:{port}")
+                    .parse()
+                    .expect("parse loopback addr");
+                let config = BrokerConfig::new(format!("127.0.0.1:{port}"))
+                    .num_workers(1)
+                    .drain_timeout_secs(COHORT_DRAIN_TIMEOUT_SECS)
+                    .ingest_deadline_secs(0);
+
+                let delivered: std::sync::Arc<std::sync::Mutex<Vec<u32>>> =
+                    std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                let sink = delivered.clone();
+                let callback: PublishCallback = std::sync::Arc::new(move |publish: &Publish| {
+                    let payload = publish.payload();
+                    let id = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                    sink.lock().expect("sink poisoned").push(id);
+                    std::thread::sleep(COHORT_CALLBACK_DELAY);
+                });
+
+                let handle = MqttBroker::start_with_callback(config, Some(callback))?;
+                let drops = handle.dropped_publishes_handle();
+
+                let mut client = connect_v3(addr).map_err(Error::Io)?;
+
+                let mut before_drain = indexed_publishes(0, COHORT_BEFORE_DRAIN);
+                before_drain.extend_from_slice(&PINGREQ);
+                client.write_all(&before_drain).map_err(Error::Io)?;
+
+                let mut pingresp = [0u8; 2];
+                client.read_exact(&mut pingresp).map_err(Error::Io)?;
+                if pingresp != PINGRESP {
+                    return Err(Error::Worker(format!(
+                        "expected PINGRESP after the before-drain batch, got {pingresp:?}"
+                    )));
+                }
+
+                handle.shutdown();
+
+                let mut drain_running = false;
+                for _ in 0..REFUSAL_PROBE_ATTEMPTS {
+                    if std::net::TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).is_err() {
+                        drain_running = true;
+                        break;
+                    }
+                    std::thread::sleep(REFUSAL_PROBE_INTERVAL);
+                }
+                if !drain_running {
+                    return Err(Error::Worker(
+                        "listener never refused a connection during the drain".into(),
+                    ));
+                }
+
+                let mut during_drain = indexed_publishes(COHORT_BEFORE_DRAIN, COHORT_DURING_DRAIN);
+                during_drain.extend_from_slice(&PINGREQ);
+                during_drain.extend_from_slice(&DISCONNECT);
+                client.write_all(&during_drain).map_err(Error::Io)?;
+
+                let mut pingresp2 = [0u8; 2];
+                client.read_exact(&mut pingresp2).map_err(Error::Io)?;
+                if pingresp2 != PINGRESP {
+                    return Err(Error::Worker(format!(
+                        "expected PINGRESP after the during-drain batch, got {pingresp2:?}"
+                    )));
+                }
+
+                let mut eof_probe = [0u8; 1];
+                let at_eof = matches!(client.read(&mut eof_probe), Ok(0));
+                if !at_eof {
+                    return Err(Error::Worker(
+                        "connection did not reach EOF after DISCONNECT".into(),
+                    ));
+                }
+                drop(client);
+
+                handle.join()?;
+
+                let ids = delivered.lock().expect("sink poisoned").clone();
+                let total_dropped = drops.total();
+                let _ = tx.send((ids, total_dropped));
+                Ok(())
+            })();
+            let _ = outcome;
+        })
+        .expect("spawn harness");
+
+    let Ok((mut ids, dropped)) = rx.recv_timeout(HARNESS_TIMEOUT) else {
+        panic!("harness did not report within {HARNESS_TIMEOUT:?}")
+    };
+
+    assert!(!ids.is_empty(), "at least one publish must be delivered");
+    assert!(
+        ids.iter()
+            .all(|&id| id < COHORT_BEFORE_DRAIN + COHORT_DURING_DRAIN),
+        "a delivered id was outside the published range: {ids:?}"
+    );
+
+    let before_dedup = ids.len();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(
+        ids.len(),
+        before_dedup,
+        "a publish was delivered more than once"
+    );
+
+    assert_eq!(
+        u64::try_from(ids.len()).expect("fits u64") + dropped,
+        u64::from(COHORT_BEFORE_DRAIN + COHORT_DURING_DRAIN),
+        "delivered + dropped must equal every published id"
     );
 }

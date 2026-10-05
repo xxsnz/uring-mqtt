@@ -7,8 +7,8 @@ mod error;
 #[doc(hidden)]
 pub use broker::fuzz;
 pub use broker::{
-    BrokerConfig, BrokerHandle, MaxInboundPacketSize, MqttBroker, Publish, PublishCallback, QoS,
-    ShutdownHandle,
+    BrokerConfig, BrokerHandle, DroppedPublishesHandle, MaxInboundPacketSize, MqttBroker, Publish,
+    PublishCallback, QoS, ShutdownHandle,
 };
 pub use connection::ConnectionState;
 pub use error::Error;

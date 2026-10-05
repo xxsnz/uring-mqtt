@@ -6,13 +6,17 @@ use std::cell::RefCell;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use monoio::buf::{IoBuf, IoBufMut, IoVecBuf, IoVecBufMut};
 use monoio::io::{AsyncReadRent, AsyncWriteRent};
 
 use super::handler::{handle_client_io, SessionOutcome};
 use super::worker::event_channel;
-use super::{Publish, DEFAULT_CONNECTION_TIMEOUT_SECS, DEFAULT_IDLE_TIMEOUT_SECS};
+use super::{
+    Publish, DEFAULT_CONNECTION_TIMEOUT_SECS, DEFAULT_IDLE_TIMEOUT_SECS,
+    DEFAULT_INGEST_DEADLINE_SECS,
+};
 use crate::codec::mqtt::MaxInboundPacketSize;
 use crate::error::Error;
 
@@ -52,8 +56,8 @@ pub(crate) struct SessionTrace {
 }
 
 /// Run `data` (format as for [`session`]) as one client connection through
-/// `handle_client_io`, then drain every publish the session delivered.
-/// Must not be called from inside a running monoio runtime.
+/// `handle_client_io`, draining every publish the session delivers while it
+/// runs. Must not be called from inside a running monoio runtime.
 pub(crate) fn run_session(data: &[u8]) -> SessionTrace {
     let (max_read, wire) = match data.split_first() {
         Some((&max_read, wire)) => (max_read, wire),
@@ -67,19 +71,25 @@ pub(crate) fn run_session(data: &[u8]) -> SessionTrace {
                 max_read,
                 bytes_written: 0,
             };
-            let result = handle_client_io(
+            // Drain while the session runs: a script past the channel capacity
+            // would otherwise wait out the ingest deadline on every publish.
+            let session = handle_client_io(
                 &mut io,
                 FUZZ_PEER_ADDR,
                 tx,
                 DEFAULT_CONNECTION_TIMEOUT_SECS,
                 DEFAULT_IDLE_TIMEOUT_SECS,
                 MaxInboundPacketSize::DEFAULT,
-            )
-            .await;
-            let mut delivered = Vec::new();
-            while let Some(publish) = rx.recv().await {
-                delivered.push(publish);
-            }
+                Duration::from_secs(DEFAULT_INGEST_DEADLINE_SECS),
+            );
+            let drain = async {
+                let mut delivered = Vec::new();
+                while let Some(publish) = rx.recv().await {
+                    delivered.push(publish);
+                }
+                delivered
+            };
+            let (result, delivered) = monoio::join!(session, drain);
             SessionTrace {
                 result,
                 bytes_written: io.bytes_written,
@@ -151,6 +161,7 @@ impl AsyncWriteRent for ScriptedIo<'_> {
 mod tests {
     use super::*;
     use crate::broker::handler::tests::{capture_logs, has_line_at};
+    use crate::broker::worker::EVENT_CHANNEL_CAPACITY;
     use crate::broker::QoS;
     use monoio::buf::VecBuf;
 
@@ -170,6 +181,17 @@ mod tests {
     /// body never arrives: a decoder that reserved the declared length before
     /// checking the bound is the F2.4 denial of service.
     const V3_PUBLISH_DECLARING_MAX_REMAINING_LENGTH: [u8; 5] = [0x30, 0xFF, 0xFF, 0xFF, 0x7F];
+    /// v3 CONNECT: ka=1, id "test", Clean Session — a 1.5 s idle budget.
+    const V3_CONNECT_KA1: [u8; 18] = {
+        let mut bytes = V3_CONNECT_TEST;
+        bytes[11] = 0x01;
+        bytes
+    };
+    /// v3 QoS 0 PUBLISH, topic "t", empty payload.
+    const V3_QOS0_PUBLISH_T_EMPTY: [u8; 5] = [0x30, 0x03, 0x00, 0x01, b't'];
+    const DISCONNECT: [u8; 2] = [0xE0, 0x00];
+    /// Publishes beyond one event channel's capacity.
+    const PUBLISHES_PAST_CAPACITY: usize = 100;
     /// Script bytes (prefix included) whose packets are malformed in ways the
     /// committed seeds do not cover. `session` must return on each of them.
     const ADVERSARIAL_SCRIPTS: &[(&str, &[u8])] = &[
@@ -794,6 +816,44 @@ mod tests {
                 );
             });
         });
+    }
+
+    /// AC-15 — a script past the event channel's capacity must still deliver
+    /// every publish: the drain must run concurrently with the session, not
+    /// wait out the ingest deadline once the channel fills.
+    #[test]
+    fn a_script_longer_than_the_channel_capacity_delivers_every_publish() {
+        let mut script = vec![UNCHUNKED];
+        script.extend_from_slice(&V3_CONNECT_KA1);
+        for _ in 0..EVENT_CHANNEL_CAPACITY + PUBLISHES_PAST_CAPACITY {
+            script.extend_from_slice(&V3_QOS0_PUBLISH_T_EMPTY);
+        }
+        script.extend_from_slice(&DISCONNECT);
+
+        let trace = run_session(&script);
+
+        assert_eq!(
+            observed(&trace.result),
+            Expected::Served,
+            "expected the session to be Served, got {:?}",
+            trace.result
+        );
+        assert_eq!(
+            trace.delivered.len(),
+            EVENT_CHANNEL_CAPACITY + PUBLISHES_PAST_CAPACITY,
+            "expected every publish past the channel capacity to be delivered"
+        );
+        for publish in &trace.delivered {
+            assert_eq!(publish.topic(), "t", "expected every publish on topic t");
+            assert!(
+                publish.payload().is_empty(),
+                "expected every publish to carry an empty payload"
+            );
+        }
+        assert_eq!(
+            trace.bytes_written, V3_CONNACK_LEN,
+            "expected only the CONNACK reply"
+        );
     }
 
     /// Pseudo-random, so the mutation sweep is reproducible without a dependency.

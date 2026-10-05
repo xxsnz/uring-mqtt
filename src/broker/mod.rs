@@ -16,6 +16,13 @@ use std::sync::Arc;
 /// teardown window.
 pub(crate) const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 5;
 
+/// Default `ingest_deadline_secs` for `BrokerConfig::new`. Five seconds
+/// stays far below the 90-second idle budget of a 60-second keep-alive. It
+/// bounds a wait the worker's timer can observe; a callback runs on the
+/// worker thread, so a slow callback lengthens a hold by its own run time
+/// and only the idle budget bounds that case.
+pub(crate) const DEFAULT_INGEST_DEADLINE_SECS: u64 = 5;
+
 /// Default `max_connections_per_worker` for `BrokerConfig::new`.
 const DEFAULT_MAX_CONNECTIONS_PER_WORKER: usize = 1000;
 
@@ -46,6 +53,13 @@ pub struct BrokerConfig {
     /// Grace period in seconds for draining active connections after shutdown
     /// is signaled; stragglers are force-closed when it expires.
     pub drain_timeout_secs: u64,
+    /// Longest a connection holds a decoded PUBLISH waiting for room in its
+    /// worker's full event channel. Past it the publish is dropped (counted
+    /// and warned) and still acknowledged. The connection's idle budget
+    /// bounds the wait as well. 0 drops at once. The worker's timer measures
+    /// the wait, so a slow callback on the same worker lengthens a hold
+    /// beyond it; the idle budget bounds that case.
+    pub ingest_deadline_secs: u64,
     /// Number of worker threads (defaults to CPU count)
     pub num_workers: Option<usize>,
     /// TCP listen backlog
@@ -72,6 +86,7 @@ impl BrokerConfig {
             connection_timeout_secs: DEFAULT_CONNECTION_TIMEOUT_SECS,
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
             drain_timeout_secs: DEFAULT_DRAIN_TIMEOUT_SECS,
+            ingest_deadline_secs: DEFAULT_INGEST_DEADLINE_SECS,
             num_workers: None,
             backlog: DEFAULT_BACKLOG,
             max_inbound_packet_size: MaxInboundPacketSize::DEFAULT,
@@ -99,6 +114,11 @@ impl BrokerConfig {
 
     pub fn drain_timeout_secs(mut self, secs: u64) -> Self {
         self.drain_timeout_secs = secs;
+        self
+    }
+
+    pub fn ingest_deadline_secs(mut self, secs: u64) -> Self {
+        self.ingest_deadline_secs = secs;
         self
     }
 
@@ -276,6 +296,26 @@ impl ShutdownHandle {
     }
 }
 
+/// Reader of a broker's lifetime drop total that outlives the
+/// [`BrokerHandle`] it was cloned from, so the final total stays readable
+/// after [`join`](BrokerHandle::join) consumes it.
+#[derive(Clone)]
+pub struct DroppedPublishesHandle {
+    counters: Vec<Arc<AtomicU64>>,
+}
+
+impl DroppedPublishesHandle {
+    /// The same total [`BrokerHandle::dropped_publishes`] reports, read now.
+    pub fn total(&self) -> u64 {
+        sum_counters(&self.counters)
+    }
+}
+
+/// Sum of every worker's lifetime drop counter.
+fn sum_counters(counters: &[Arc<AtomicU64>]) -> u64 {
+    counters.iter().map(|d| d.load(Ordering::Relaxed)).sum()
+}
+
 /// Running ingest server. Returned only after startup succeeded; owns the
 /// worker lifecycle through shutdown. Send. NOT Clone.
 pub struct BrokerHandle {
@@ -308,12 +348,24 @@ impl BrokerHandle {
     }
 
     /// Lifetime count of PUBLISH packets, at any QoS, that were discarded
-    /// instead of reaching the callback because a worker's event channel was
-    /// full, summed over every worker. A discard is counted whether or not
-    /// its acknowledgement was later written; each one is also warned on the
-    /// shared cadence. Monotonic; never reset.
+    /// instead of reaching the callback, summed over every worker: dropped
+    /// after waiting out the ingest deadline or the connection's idle budget
+    /// on a full event channel, or cut off mid-wait by a shutdown
+    /// force-close. A discard is counted whether or not its acknowledgement
+    /// was written; each one is also warned on the shared cadence.
+    /// Monotonic; never reset.
+    /// [`dropped_publishes_handle`](Self::dropped_publishes_handle) reads
+    /// the same total after [`join`](Self::join).
     pub fn dropped_publishes(&self) -> u64 {
-        self.dropped.iter().map(|d| d.load(Ordering::Relaxed)).sum()
+        sum_counters(&self.dropped)
+    }
+
+    /// Clone a reader of the drop total that outlives this handle, so the
+    /// final total stays readable after [`join`](Self::join) consumes it.
+    pub fn dropped_publishes_handle(&self) -> DroppedPublishesHandle {
+        DroppedPublishesHandle {
+            counters: self.dropped.clone(),
+        }
     }
 
     /// Wait for every worker thread to exit, aggregating their terminal
@@ -321,7 +373,10 @@ impl BrokerHandle {
     /// (or drop the handle) first if the embedder wants the workers to stop.
     /// A worker that exits unexpectedly signals shutdown to its siblings from
     /// its own thread, so this call returns rather than blocking on a live
-    /// sibling's accept loop.
+    /// sibling's accept loop. Each worker exits only after its event processor
+    /// has delivered every publish still queued when its sessions ended, so
+    /// this can outlast the drain deadline by the time the callback needs for
+    /// them.
     ///
     /// The first worker error wins; a thread panic surfaces as
     /// [`Error::Worker("worker thread panicked".into())`].
@@ -350,7 +405,8 @@ impl Drop for BrokerHandle {
     /// Signal shutdown and join every remaining worker. Results are logged
     /// at warn and discarded — the handle has already been moved out of by
     /// the time an embedder could observe them. Blocks up to the drain
-    /// deadline plus scheduling slack.
+    /// deadline, plus the time the callback needs for publishes still
+    /// queued, plus scheduling slack.
     fn drop(&mut self) {
         self.trigger.shutdown();
         for handle in self.handles.drain(..) {
@@ -411,8 +467,9 @@ impl MqttBroker {
     /// the connection, in the order the worker received them. A PUBACK or
     /// PUBREC means the PUBLISH was accepted for processing, not that the
     /// callback ran: the callback runs later, before or after the
-    /// acknowledgement is written, and never for a PUBLISH dropped because
-    /// the worker's event channel was full. It must return promptly:
+    /// acknowledgement is written, and never for a PUBLISH dropped after
+    /// waiting out the ingest deadline ([`BrokerConfig::ingest_deadline_secs`]) or
+    /// its connection's idle budget. It must return promptly:
     /// blocking stalls that worker's event processing AND its shutdown. A panic
     /// inside the callback unwinds the worker thread (monoio's task harness
     /// does not catch it) and surfaces from [`BrokerHandle::join`] as
@@ -665,6 +722,7 @@ mod tests {
         assert_eq!(config.connection_timeout_secs, 10);
         assert_eq!(config.idle_timeout_secs, 300);
         assert_eq!(config.drain_timeout_secs, 5);
+        assert_eq!(config.ingest_deadline_secs, 5);
         assert!(config.num_workers.is_none());
         assert_eq!(config.backlog, 1024);
         assert_eq!(config.max_inbound_packet_size.get(), 131_072);
@@ -684,6 +742,7 @@ mod tests {
             .connection_timeout_secs(5)
             .idle_timeout_secs(120)
             .drain_timeout_secs(20)
+            .ingest_deadline_secs(2)
             .num_workers(4)
             .backlog(512)
             .max_inbound_packet_size(MaxInboundPacketSize::new(4096).expect("in range"));
@@ -692,6 +751,7 @@ mod tests {
         assert_eq!(config.connection_timeout_secs, 5);
         assert_eq!(config.idle_timeout_secs, 120);
         assert_eq!(config.drain_timeout_secs, 20);
+        assert_eq!(config.ingest_deadline_secs, 2);
         assert_eq!(config.num_workers, Some(4));
         assert_eq!(config.backlog, 512);
         assert_eq!(config.max_inbound_packet_size.get(), 4096);
@@ -2067,14 +2127,18 @@ mod tests {
     /// handler (`Send + 'static`) and triggered from any thread, and
     /// `BrokerHandle` moves to whichever thread joins it. Dropping either
     /// re-export or either auto-trait breaks embedders at compile time —
-    /// nothing else in the suite names these paths.
+    /// nothing else in the suite names these paths. AC-13 adds
+    /// `DroppedPublishesHandle`, which an embedder clones out of the handle
+    /// before `join` consumes it and reads from any thread afterwards.
     #[test]
     fn lifecycle_types_are_re_exported_and_thread_safe() {
         const fn assert_send<T: Send>() {}
+        const fn assert_send_clone<T: Send + Clone>() {}
         const fn assert_send_sync_clone<T: Send + Sync + Clone>() {}
 
         assert_send::<crate::BrokerHandle>();
         assert_send_sync_clone::<crate::ShutdownHandle>();
+        assert_send_clone::<crate::DroppedPublishesHandle>();
 
         let start: fn(crate::BrokerConfig) -> Result<crate::BrokerHandle, Error> =
             crate::MqttBroker::start;
@@ -2462,6 +2526,7 @@ mod tests {
                 .overflow_token(registration.token()),
         )
         .expect("start");
+        let reader = handle.dropped_publishes_handle();
         assert_eq!(
             handle.dropped_publishes(),
             EXPECTED_DROPS,
@@ -2469,6 +2534,11 @@ mod tests {
         );
         handle.shutdown();
         assert!(handle.join().is_ok(), "clean shutdown");
+        assert_eq!(
+            reader.total(),
+            EXPECTED_DROPS,
+            "the reader must outlive join"
+        );
     }
 
     #[test]
@@ -2484,7 +2554,11 @@ mod tests {
             handles: Vec::new(),
             dropped: counters,
         };
+        let reader = handle.dropped_publishes_handle();
+        let reader_clone = reader.clone();
         assert_eq!(handle.dropped_publishes(), 0);
+        assert_eq!(reader.total(), 0);
+        assert_eq!(reader_clone.total(), 0);
 
         for _ in 0..worker::EVENT_CHANNEL_CAPACITY + WORKER_OVERFLOWS[0] {
             tx0.send(Publish::fixture("t", &[]));
@@ -2493,14 +2567,26 @@ mod tests {
             handle.dropped_publishes(),
             u64::try_from(WORKER_OVERFLOWS[0]).expect("fits u64"),
         );
+        assert_eq!(
+            reader.total(),
+            u64::try_from(WORKER_OVERFLOWS[0]).expect("fits u64"),
+        );
+        assert_eq!(
+            reader_clone.total(),
+            u64::try_from(WORKER_OVERFLOWS[0]).expect("fits u64"),
+        );
 
         for _ in 0..worker::EVENT_CHANNEL_CAPACITY + WORKER_OVERFLOWS[1] {
             tx1.send(Publish::fixture("t", &[]));
         }
         assert_eq!(handle.dropped_publishes(), EXPECTED_DROPS);
+        assert_eq!(reader.total(), EXPECTED_DROPS);
+        assert_eq!(reader_clone.total(), EXPECTED_DROPS);
 
         // A handle that snapshotted its total at construction reports 0
         // throughout and fails this check.
         assert_eq!(handle.dropped_publishes(), EXPECTED_DROPS);
+        assert_eq!(reader.total(), EXPECTED_DROPS);
+        assert_eq!(reader_clone.total(), EXPECTED_DROPS);
     }
 }
