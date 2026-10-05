@@ -75,7 +75,7 @@ fn log_handshake_transport_error(peer_addr: std::net::SocketAddr, err: &Error) {
 /// IO-generic body of `handle_client`. The public entry keeps the
 /// monomorphic `TcpStream` signature; tests substitute a `TestIo` wrapper.
 #[allow(clippy::too_many_lines)] // per-arm timeout diagnostics push the body to the pedantic 100-line boundary
-async fn handle_client_io<IO>(
+pub(super) async fn handle_client_io<IO>(
     stream: IO,
     peer_addr: std::net::SocketAddr,
     event_tx: EventSender,

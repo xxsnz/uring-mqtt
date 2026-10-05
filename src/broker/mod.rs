@@ -1,3 +1,5 @@
+#[cfg(any(test, fuzzing))]
+pub mod fuzz;
 mod handler;
 pub(crate) mod handshake;
 mod packet;
