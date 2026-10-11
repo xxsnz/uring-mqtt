@@ -1,8 +1,5 @@
-use monoio::io::sink::SinkExt;
-use monoio::io::stream::Stream;
 use monoio::io::{AsyncReadRent, AsyncWriteRent};
 use monoio::net::TcpStream;
-use monoio_codec::Framed;
 use std::num::NonZeroU32;
 use std::time::Duration;
 
@@ -10,18 +7,21 @@ use super::worker::{Admission, EventSender};
 use super::Publish;
 use crate::broker::handshake::{self, ConnectDecision};
 use crate::broker::packet::Disposition;
+#[cfg(test)]
+use crate::codec::mqtt::MqttEncoder;
 use crate::codec::mqtt::{
-    ConnectAck, ConnectAckReason, DecodeError, MaxInboundPacketSize, MqttEncoder, MqttPacket,
-    PacketV3, PacketV5,
+    ConnectAck, ConnectAckReason, DecodeError, MaxInboundPacketSize, MqttPacket, PacketV3, PacketV5,
 };
-use crate::codec::version::{ProtocolVersion, VersionDecoder};
+use crate::codec::version::ProtocolVersion;
 use crate::connection::ConnectionState;
 use crate::error::Error;
 use rmqtt_codec::v5::ConnectAckReason as V5ConnectAckReason;
 
+use super::runtime::{HandshakeIo, MonoioHandshake, MonoioTimer, PacketIo, Timer};
+
 /// What a completed (non-error) client session amounted to.
 #[derive(Debug)]
-pub(crate) enum SessionOutcome {
+pub enum SessionOutcome {
     Served,
     Refused,
     /// Closed by the packet loop's protocol-violation policy.
@@ -90,21 +90,19 @@ fn log_handshake_transport_error(peer_addr: std::net::SocketAddr, err: &Error) {
     }
 }
 
-/// IO-generic body of `handle_client`. The public entry keeps the
-/// monomorphic `TcpStream` signature; tests substitute a `TestIo` wrapper.
+/// IO-generic session entry. Runtime-generic over `H: HandshakeIo` and
+/// `T: Timer`; the shipped broker uses the `Monoio*` adapters (`handle_client_io`
+/// below), `bench/src/twin.rs` plugs in a tokio pair.
 #[allow(clippy::too_many_lines)] // per-arm timeout diagnostics push the body to the pedantic 100-line boundary
-pub(super) async fn handle_client_io<IO>(
-    stream: IO,
+pub async fn serve_session<H: HandshakeIo, T: Timer>(
+    io: H,
     peer_addr: std::net::SocketAddr,
     event_tx: EventSender,
     connection_timeout_secs: u64,
     idle_timeout_secs: u64,
     max_inbound_packet_size: MaxInboundPacketSize,
     ingest_deadline: Duration,
-) -> Result<SessionOutcome, Error>
-where
-    IO: AsyncReadRent + AsyncWriteRent,
-{
+) -> Result<SessionOutcome, Error> {
     let mut state = ConnectionState::new();
 
     // Shared handshake budget — version detect + CONNECT decode + the
@@ -117,9 +115,9 @@ where
     let remaining = || budget.saturating_sub(handshake_start.elapsed());
 
     // Phase 1: Detect protocol version.
-    let mut framed = Framed::new(stream, VersionDecoder::new(max_inbound_packet_size));
+    let mut io = io;
 
-    let version = match monoio::time::timeout(remaining(), framed.next()).await {
+    let version = match T::timeout(remaining(), io.next_version()).await {
         Ok(Some(Ok(v))) => v,
         Ok(Some(Err(e))) => {
             if let Some(DecodeError::MaxSizeExceeded) =
@@ -156,10 +154,10 @@ where
     tracing::debug!("Detected protocol version: {:?}", version);
 
     // Phase 2: Switch to versioned codec (preserves buffered bytes — pipelined packets survive).
-    let mut framed = framed.map_codec(|_| CodecPair::new(version, max_inbound_packet_size));
+    let mut packets = io.into_packets(version, max_inbound_packet_size);
 
     // Phase 3: Read CONNECT under the shared handshake budget.
-    let packet = match monoio::time::timeout(remaining(), framed.next()).await {
+    let packet = match T::timeout(remaining(), packets.next_packet()).await {
         Ok(Some(Ok((p, _id)))) => p,
         Ok(Some(Err(e))) => {
             // Decoder-level InvalidClientId → version-matched refusal CONNACK.
@@ -179,8 +177,8 @@ where
                         ),
                     ))),
                 };
-                bounded_send(
-                    &mut framed,
+                bounded_send::<_, T>(
+                    &mut packets,
                     refusal,
                     remaining(),
                     peer_addr,
@@ -241,8 +239,8 @@ where
             };
             tracing::warn!("CONNECT refused: {reason} from {peer_addr}");
             if sendable {
-                bounded_send(
-                    &mut framed,
+                bounded_send::<_, T>(
+                    &mut packets,
                     connack,
                     remaining(),
                     peer_addr,
@@ -269,8 +267,8 @@ where
             idle_timeout,
             max_packet_size,
         } => {
-            bounded_send(
-                &mut framed,
+            bounded_send::<_, T>(
+                &mut packets,
                 connack,
                 remaining(),
                 peer_addr,
@@ -281,8 +279,8 @@ where
             state.keep_alive = keep_alive_secs;
             state.last_packet_time = connect_received_at;
 
-            run_packet_loop(
-                &mut framed,
+            run_packet_loop::<_, T>(
+                &mut packets,
                 &mut state,
                 event_tx,
                 idle_timeout,
@@ -297,24 +295,47 @@ where
     Ok(outcome)
 }
 
+/// IO-generic body of `handle_client`. The public entry keeps the
+/// monomorphic `TcpStream` signature; tests substitute a `TestIo` wrapper.
+pub(super) async fn handle_client_io<IO>(
+    stream: IO,
+    peer_addr: std::net::SocketAddr,
+    event_tx: EventSender,
+    connection_timeout_secs: u64,
+    idle_timeout_secs: u64,
+    max_inbound_packet_size: MaxInboundPacketSize,
+    ingest_deadline: Duration,
+) -> Result<SessionOutcome, Error>
+where
+    IO: AsyncReadRent + AsyncWriteRent,
+{
+    serve_session::<_, MonoioTimer>(
+        MonoioHandshake::new(stream, max_inbound_packet_size),
+        peer_addr,
+        event_tx,
+        connection_timeout_secs,
+        idle_timeout_secs,
+        max_inbound_packet_size,
+        ingest_deadline,
+    )
+    .await
+}
+
 /// Main packet loop — idle deadline anchored to the last received packet.
 ///
 /// `max_packet_size` is the client's declared receive limit from CONNECT: every
 /// reply is gated against it, because a SUBACK's size follows the request's
 /// filter count and MQTT 5 forbids sending past the declared limit.
 #[allow(clippy::too_many_lines)] // reply-budget guard after the ingest wait, disposition-specific closes push past the pedantic 100-line boundary
-async fn run_packet_loop<IO>(
-    framed: &mut Framed<IO, CodecPair>,
+async fn run_packet_loop<P: PacketIo, T: Timer>(
+    packets: &mut P,
     state: &mut ConnectionState,
     event_tx: EventSender,
     idle_timeout: Duration,
     peer_addr: std::net::SocketAddr,
     max_packet_size: Option<NonZeroU32>,
     ingest_deadline: Duration,
-) -> Result<SessionOutcome, Error>
-where
-    IO: AsyncReadRent + AsyncWriteRent,
-{
+) -> Result<SessionOutcome, Error> {
     let mut awaiting = super::packet::AwaitingRelease::default();
     // Set once a PUBLISH waited for event-channel room. Until a read starts
     // from an empty read buffer, every packet decoded was already buffered
@@ -323,9 +344,9 @@ where
     // socket buffer cannot be told apart and get a fresh anchor.
     let mut hold_debt = false;
     loop {
-        let read_starts_fresh = framed.read_buffer().is_empty();
+        let read_starts_fresh = packets.read_buffer_is_empty();
         let remaining_idle = idle_timeout.saturating_sub(state.last_packet_time.elapsed());
-        let packet_result = monoio::time::timeout(remaining_idle, framed.next()).await;
+        let packet_result = T::timeout(remaining_idle, packets.next_packet()).await;
         match packet_result {
             Ok(Some(Ok((packet, _id)))) => {
                 if !hold_debt || read_starts_fresh {
@@ -339,7 +360,8 @@ where
                     Disposition::Deliver(publish) => {
                         let idle_left =
                             idle_timeout.saturating_sub(state.last_packet_time.elapsed());
-                        match deliver_publish(&event_tx, publish, idle_left, ingest_deadline).await
+                        match deliver_publish::<T>(&event_tx, publish, idle_left, ingest_deadline)
+                            .await
                         {
                             IngestStep::Continue { held } => hold_debt |= held,
                             IngestStep::IdleTimeout => {
@@ -352,7 +374,8 @@ where
                     Disposition::DeliverThenReply(publish, reply) => {
                         let idle_left =
                             idle_timeout.saturating_sub(state.last_packet_time.elapsed());
-                        match deliver_publish(&event_tx, publish, idle_left, ingest_deadline).await
+                        match deliver_publish::<T>(&event_tx, publish, idle_left, ingest_deadline)
+                            .await
                         {
                             IngestStep::Continue { held } => hold_debt |= held,
                             IngestStep::IdleTimeout => {
@@ -376,8 +399,8 @@ where
                             tracing::debug!("client idle timeout ({peer_addr})");
                             break Ok(SessionOutcome::Served);
                         }
-                        break Ok(close_with_violation(
-                            framed,
+                        break Ok(close_with_violation::<_, T>(
+                            packets,
                             violation,
                             reply_deadline,
                             peer_addr,
@@ -396,12 +419,12 @@ where
                     break Ok(SessionOutcome::Served);
                 }
                 if let Some(reply) = owed_reply {
-                    let version = framed.codec().version();
+                    let version = packets.version();
                     if let Some(violation) =
                         super::packet::reply_over_max_packet_size(reply, version, max_packet_size)
                     {
-                        break Ok(close_with_violation(
-                            framed,
+                        break Ok(close_with_violation::<_, T>(
+                            packets,
                             violation,
                             reply_deadline,
                             peer_addr,
@@ -409,8 +432,8 @@ where
                         )
                         .await);
                     }
-                    bounded_send(
-                        framed,
+                    bounded_send::<_, T>(
+                        packets,
                         reply.render(version),
                         reply_deadline,
                         peer_addr,
@@ -429,8 +452,8 @@ where
                         tracing::debug!("client idle timeout ({peer_addr})");
                         break Ok(SessionOutcome::Served);
                     }
-                    break Ok(close_with_violation(
-                        framed,
+                    break Ok(close_with_violation::<_, T>(
+                        packets,
                         violation,
                         reply_deadline,
                         peer_addr,
@@ -457,12 +480,12 @@ where
 /// while it is full for at most the ingest deadline or the idle budget
 /// left after `INGEST_REPLY_RESERVE`, whichever is shorter (spec §5.1).
 /// A publish the wait cannot place is dropped, counted and warned
-/// inside `EventSender::admit`. When the ingest deadline bounded the
+/// inside `EventSender::admit_with`. When the ingest deadline bounded the
 /// wait the caller still acknowledges it; when the idle budget did, or
 /// no idle budget was left to acknowledge it, the connection closes as
 /// an idle timeout. A closed receiver only debug-logs, and QoS 0 has no
 /// ack to send at all.
-async fn deliver_publish(
+async fn deliver_publish<T: Timer>(
     event_tx: &EventSender,
     publish: &rmqtt_codec::types::Publish,
     idle_left: Duration,
@@ -473,7 +496,7 @@ async fn deliver_publish(
     let idle_wait = idle_left.saturating_sub(INGEST_REPLY_RESERVE);
     let wait = ingest_deadline.min(idle_wait);
     match event_tx
-        .admit(Publish::from_codec(publish), wait, reply_by)
+        .admit_with::<T>(Publish::from_codec(publish), wait, reply_by)
         .await
     {
         Admission::NoReplyTime => IngestStep::IdleTimeout,
@@ -492,21 +515,18 @@ async fn deliver_publish(
 /// anonymous `Err`. `max_packet_size` is the client's declared receive limit:
 /// a DISCONNECT that does not fit under it is omitted rather than written, so
 /// the close never breaks the limit it may itself be enforcing.
-async fn close_with_violation<IO>(
-    framed: &mut Framed<IO, CodecPair>,
+async fn close_with_violation<P: PacketIo, T: Timer>(
+    packets: &mut P,
     violation: super::packet::Violation,
     deadline: Duration,
     peer_addr: std::net::SocketAddr,
     max_packet_size: Option<NonZeroU32>,
-) -> SessionOutcome
-where
-    IO: AsyncWriteRent,
-{
+) -> SessionOutcome {
     tracing::warn!("{} ({peer_addr}) — closing", violation.reason());
-    if let Some(pkt) = violation.disconnect(framed.codec().version(), max_packet_size) {
+    if let Some(pkt) = violation.disconnect(packets.version(), max_packet_size) {
         drop(
-            bounded_send(
-                framed,
+            bounded_send::<_, T>(
+                packets,
                 pkt,
                 deadline,
                 peer_addr,
@@ -519,68 +539,21 @@ where
 }
 
 /// Bounded `send_and_flush` under a deadline (handshake or idle).
-async fn bounded_send<IO>(
-    framed: &mut Framed<IO, CodecPair>,
+async fn bounded_send<P: PacketIo, T: Timer>(
+    packets: &mut P,
     pkt: MqttPacket,
     deadline: Duration,
     peer_addr: std::net::SocketAddr,
     timeout_context: &'static str,
-) -> Result<(), Error>
-where
-    IO: AsyncWriteRent,
-{
-    let send_fut = SinkExt::send_and_flush(framed, pkt);
-    match monoio::time::timeout(deadline, send_fut).await {
+) -> Result<(), Error> {
+    let send_fut = packets.send_and_flush(pkt);
+    match T::timeout(deadline, send_fut).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(Error::Io(e)),
         Err(_) => {
             tracing::debug!("{timeout_context} ({peer_addr})");
             Err(Error::Timeout)
         }
-    }
-}
-
-/// Combined codec for both encoding and decoding MQTT packets.
-struct CodecPair {
-    version: ProtocolVersion,
-    decoder: crate::codec::mqtt::MqttDecoder,
-    encoder: MqttEncoder,
-}
-
-impl CodecPair {
-    fn new(
-        version: ProtocolVersion,
-        max_inbound_packet_size: crate::codec::mqtt::MaxInboundPacketSize,
-    ) -> Self {
-        Self {
-            version,
-            decoder: crate::codec::mqtt::MqttDecoder::new(version, max_inbound_packet_size),
-            encoder: MqttEncoder::new(version),
-        }
-    }
-
-    fn version(&self) -> ProtocolVersion {
-        self.version
-    }
-}
-
-impl monoio_codec::Decoder for CodecPair {
-    type Item = (MqttPacket, u32);
-    type Error = std::io::Error;
-
-    fn decode(
-        &mut self,
-        src: &mut bytes::BytesMut,
-    ) -> Result<monoio_codec::Decoded<Self::Item>, Self::Error> {
-        self.decoder.decode(src)
-    }
-}
-
-impl monoio_codec::Encoder<MqttPacket> for CodecPair {
-    type Error = std::io::Error;
-
-    fn encode(&mut self, item: MqttPacket, dst: &mut bytes::BytesMut) -> Result<(), Self::Error> {
-        self.encoder.encode(item, dst)
     }
 }
 

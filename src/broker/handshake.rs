@@ -15,7 +15,7 @@ const KEEP_ALIVE_GRACE_MILLIS_PER_SEC: u64 = 1500;
 /// Supported ceiling for config-supplied timeouts (1 year). Larger u64 values are
 /// clamped: monoio's timer panics converting absurd Durations to millis, and an
 /// Instant sum can overflow. Clamping defines the supported-configuration contract.
-pub(crate) const MAX_TIMEOUT_SECS: u64 = 31_536_000;
+pub const MAX_TIMEOUT_SECS: u64 = 31_536_000;
 
 /// Outcome of evaluating the first decoded packet of a connection. Pure — no IO.
 pub(crate) enum ConnectDecision {

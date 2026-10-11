@@ -123,7 +123,7 @@ pub(crate) enum Admission {
 }
 
 #[derive(Clone)]
-pub(crate) struct EventSender {
+pub struct EventSender {
     tx: local_sync::mpsc::unbounded::Tx<Publish>,
     state: Rc<EventChannelState>,
     worker_id: usize,
@@ -138,7 +138,7 @@ impl EventSender {
     /// mid-wait (a shutdown force-close). A receiver that has gone away is debug-logged only and
     /// not counted. The caller acknowledges the publish in every case except
     /// the one it decides itself (an idle-budget close).
-    pub(crate) async fn admit(
+    pub(crate) async fn admit_with<T: crate::broker::runtime::Timer>(
         &self,
         publish: Publish,
         wait: std::time::Duration,
@@ -162,7 +162,7 @@ impl EventSender {
             completed: false,
             settled: false,
         };
-        if let Ok(granted) = monoio::time::timeout(wait, slot.acquire.as_mut()).await {
+        if let Ok(granted) = T::timeout(wait, slot.acquire.as_mut()).await {
             slot.completed = true;
             // A slot granted before a delayed wakeup is used: it is
             // reserved for this publish — unless the idle budget is gone,
@@ -186,6 +186,18 @@ impl EventSender {
         }
         // No slot in time: `slot` counts the publish as it drops here.
         Admission::Dropped
+    }
+
+    /// Test-only thin wrapper over `admit_with` using the shipped monoio timer.
+    #[cfg(test)]
+    pub(crate) async fn admit(
+        &self,
+        publish: Publish,
+        wait: std::time::Duration,
+        reply_by: std::time::Instant,
+    ) -> Admission {
+        self.admit_with::<crate::broker::runtime::MonoioTimer>(publish, wait, reply_by)
+            .await
     }
 
     /// Enqueue at once if a slot is free; `Err` hands the publish back
@@ -290,13 +302,13 @@ impl Drop for SlotWait<'_> {
     }
 }
 
-pub(crate) struct EventReceiver {
+pub struct EventReceiver {
     rx: local_sync::mpsc::unbounded::Rx<Publish>,
     state: Rc<EventChannelState>,
 }
 
 impl EventReceiver {
-    pub(crate) async fn recv(&mut self) -> Option<Publish> {
+    pub async fn recv(&mut self) -> Option<Publish> {
         let item = self.rx.recv().await;
         if item.is_some() {
             self.state.depth.set(self.state.depth.get() - 1);
@@ -319,10 +331,7 @@ impl Drop for EventReceiver {
 }
 
 /// Build a new bounded facade over a `local-sync` unbounded channel.
-pub(crate) fn event_channel(
-    worker_id: usize,
-    dropped: Arc<AtomicU64>,
-) -> (EventSender, EventReceiver) {
+pub fn event_channel(worker_id: usize, dropped: Arc<AtomicU64>) -> (EventSender, EventReceiver) {
     let state = Rc::new(EventChannelState {
         depth: Cell::new(0),
         dropped,

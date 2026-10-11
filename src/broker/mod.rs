@@ -1,8 +1,9 @@
 #[cfg(any(test, fuzzing))]
 pub mod fuzz;
-mod handler;
+pub(crate) mod handler;
 pub(crate) mod handshake;
 mod packet;
+pub(crate) mod runtime;
 pub(crate) mod worker;
 
 pub use crate::codec::mqtt::MaxInboundPacketSize;

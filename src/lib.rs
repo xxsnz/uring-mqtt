@@ -12,3 +12,14 @@ pub use broker::{
 };
 pub use connection::ConnectionState;
 pub use error::Error;
+
+#[cfg(feature = "runtime-seam")]
+#[doc(hidden)]
+pub mod runtime_seam {
+    pub use crate::broker::handler::{serve_session, SessionOutcome};
+    pub use crate::broker::handshake::MAX_TIMEOUT_SECS;
+    pub use crate::broker::runtime::{HandshakeIo, PacketIo, TimedOut, Timer};
+    pub use crate::broker::worker::{event_channel, EventReceiver, EventSender};
+    pub use crate::codec::mqtt::{MqttDecoder, MqttEncoder, MqttPacket};
+    pub use crate::codec::version::{ProtocolVersion, VersionDecoder};
+}

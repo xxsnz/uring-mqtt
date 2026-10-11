@@ -38,6 +38,7 @@ rumqttc = "0.24"
 
 [features]
 default = []
+runtime-seam = []
 
 [[example]]
 name = "simple_broker"

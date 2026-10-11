@@ -1,0 +1,63 @@
+[package]
+name = "uring-mqtt-bench"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[lib]
+name = "bench"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bench"
+path = "src/main.rs"
+
+[build-dependencies]
+# task 9: build.rs reads `git rev-parse --short HEAD` and `git status --porcelain`
+# from `..`. No crate deps are required: the build script shells out to git.
+
+[dependencies]
+uring-mqtt = { path = "..", features = ["runtime-seam"] }
+hdrhistogram = { version = "7.6", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+nix = { version = "0.31", features = ["time", "signal", "fs", "feature"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "io-util", "macros", "sync"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures-util = { version = "0.3", features = ["sink"] }
+monoio-codec = "0.3"
+rmqtt-codec = "0.2"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+ctrlc = { version = "3", features = ["termination"] }
+
+[workspace]
+members = ["."]
+
+[lints.rust]
+unsafe_code = "forbid"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Allow certain pedantic lints that are too noisy for this codebase
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+similar_names = "allow"
+return_self_not_must_use = "allow"
+needless_pass_by_value = "allow"   # EventCallback needs ownership
+inline_always = "allow"            # Hot path optimization
+doc_markdown = "allow"             # Too noisy for technical terms
+assert_is_empty = "allow"          # Record tests assert! on .is_empty() to name the emptiness they check
+needless_continue = "allow"        # Twin tests use Ok(_) => continue to make the Ok case explicit
+single_match_else = "allow"        # Gen's `match` arms document the Ok vs. not-Ok split explicitly
+result_large_err = "allow"         # Publish is too large to fit in `Result<(), Publish>` errors
+# Runner orchestration has long, multi-phase functions and a tuple of
+# (server, generator) start/end sample pairs. The a/b/c/d/e/f/g/h names
+# match the delta pattern in the spec table; longer names would obscure it.
+too_many_lines = "allow"
+too_many_arguments = "allow"
+many_single_char_names = "allow"

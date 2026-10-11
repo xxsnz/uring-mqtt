@@ -30,7 +30,7 @@ impl Error {
     /// (clean hangup, peer reset, broken pipe) that should not produce a log
     /// line at the worker level. Typed: matches variants and `io::ErrorKind`
     /// only — never message text.
-    pub(crate) fn is_routine_disconnect(&self) -> bool {
+    pub fn is_routine_disconnect(&self) -> bool {
         match self {
             Self::Timeout | Self::ClientClosed => true,
             Self::Io(e) => matches!(
