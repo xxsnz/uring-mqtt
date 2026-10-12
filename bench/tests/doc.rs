@@ -977,6 +977,104 @@ fn render_refuses_a_recorded_document_with_no_tool_versions() {
 }
 
 #[test]
+fn render_refuses_a_recorded_document_with_a_blank_tool_version() {
+    // `bench doc` prints a refusal with `{e:?}` (`dispatch_doc`), so the
+    // Debug form is what the operator reads; it must name the blank tool.
+    let mut records = full_recorded_set();
+    for rec in &mut records {
+        rec.env.tools = vec![
+            ("/usr/bin/perf".to_string(), "perf version 6.8.12".to_string()),
+            ("/usr/sbin/mosquitto".to_string(), String::new()),
+        ];
+    }
+    let err = render(&records, false).expect_err("a blank mosquitto version must refuse");
+    assert_eq!(format!("{err:?}"), "BlankToolVersion(\"/usr/sbin/mosquitto\")");
+
+    // Two blank entries, the first whitespace-only: the refusal names
+    // the first entry in `env.tools` order.
+    let mut records = full_recorded_set();
+    for rec in &mut records {
+        rec.env.tools = vec![
+            ("/usr/bin/perf".to_string(), "   ".to_string()),
+            ("/usr/sbin/mosquitto".to_string(), String::new()),
+        ];
+    }
+    let err = render(&records, false).expect_err("blank perf and mosquitto versions must refuse");
+    assert_eq!(format!("{err:?}"), "BlankToolVersion(\"/usr/bin/perf\")");
+
+    // Ordering guard: one record with a blank version among records
+    // that name it is a mixed environment first.
+    let mut records = full_recorded_set();
+    records[0].env.tools = vec![
+        ("/usr/bin/perf".to_string(), "perf version 6.8.12".to_string()),
+        ("/usr/sbin/mosquitto".to_string(), String::new()),
+    ];
+    match render(&records, false) {
+        Err(DocError::MixedEnvironment(field)) => assert_eq!(field, "tools"),
+        other => panic!("expected MixedEnvironment(tools), got {other:?}"),
+    }
+}
+
+#[test]
+fn render_refuses_a_tool_version_of_tabs_and_newlines() {
+    // Whitespace is not only spaces: a version of tabs and newlines is
+    // blank after trimming and must be refused like an empty one.
+    let mut records = full_recorded_set();
+    for rec in &mut records {
+        rec.env.tools = vec![("/usr/bin/strace".to_string(), "\t\n  \t".to_string())];
+    }
+    let err = render(&records, false).expect_err("a tab-and-newline version must refuse");
+    assert_eq!(format!("{err:?}"), "BlankToolVersion(\"/usr/bin/strace\")");
+}
+
+#[test]
+fn render_accepts_a_recorded_document_whose_tool_versions_are_padded() {
+    // The check is `trim().is_empty()`, not a comparison with the
+    // trimmed value: a padded but non-blank version identifies its
+    // binary and must still publish.
+    let mut records = full_recorded_set();
+    for rec in &mut records {
+        rec.env.tools = vec![
+            (
+                "/usr/bin/perf".to_string(),
+                "  perf version 6.8.12  ".to_string(),
+            ),
+            (
+                "/usr/sbin/mosquitto".to_string(),
+                "\tmosquitto version 2.0.18\n".to_string(),
+            ),
+        ];
+    }
+    let doc = render(&records, false).expect("a padded tool version must render");
+    assert!(
+        doc.contains("perf version 6.8.12"),
+        "the perf row must disclose its version in:\n{doc}"
+    );
+    assert!(
+        doc.contains("mosquitto version 2.0.18"),
+        "the mosquitto row must disclose its version in:\n{doc}"
+    );
+}
+
+#[test]
+fn render_refuses_a_blank_tool_version_before_a_protocol_violation() {
+    // Ordering guard: the blank-version check sits ahead of the
+    // protocol-constant checks, so a record set that breaks both names
+    // the unidentified tool, not the repetition.
+    let mut records = full_recorded_set();
+    for rec in &mut records {
+        rec.env.tools = vec![("/usr/sbin/mosquitto".to_string(), String::new())];
+    }
+    let target = records
+        .iter_mut()
+        .find(|r| r.repetition == 5 && r.kind == RunKind::Throughput)
+        .expect("a rep 5 throughput");
+    target.repetition = 1;
+    let err = render(&records, false).expect_err("a blank version and a bad repetition must refuse");
+    assert_eq!(format!("{err:?}"), "BlankToolVersion(\"/usr/sbin/mosquitto\")");
+}
+
+#[test]
 fn render_discloses_the_epic_strace_bias_for_strace_counts() {
     // (a) every 80 % latency record resumed under strace: the method
     // label must carry §9.1's own ptrace caveat, not the stale
@@ -1109,6 +1207,16 @@ fn smoke_render_accepts_an_empty_tool_set() {
     let mut records = vec![throughput_record(ServerKind::Uring, 1, 1, 1)];
     records[0].env.tools = Vec::new();
     let doc = render(&records, true).expect("smoke render must accept an empty tool set");
+    assert!(doc.contains("SMOKE — not publishable"), "doc:\n{doc}");
+}
+
+#[test]
+fn smoke_render_accepts_a_blank_tool_version() {
+    // The blank-version refusal is recorded-mode only, like the
+    // empty-set refusal.
+    let mut records = vec![throughput_record(ServerKind::Uring, 1, 1, 1)];
+    records[0].env.tools = vec![("/usr/sbin/mosquitto".to_string(), String::new())];
+    let doc = render(&records, true).expect("smoke render must accept a blank tool version");
     assert!(doc.contains("SMOKE — not publishable"), "doc:\n{doc}");
 }
 

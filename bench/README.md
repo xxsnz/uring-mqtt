@@ -193,7 +193,7 @@ Each check below is a gate — stop and report on failure.
    attach refusal (`ptrace(`) lands in `/tmp/strace.err`.
 
 4. **Env probe** — a smoke record's `Env.tools` lists each supplied
-   tool's first `--version` line:
+   tool's first non-blank `--version` line:
 
    ```sh
    "$bench" run --profile smoke --out /tmp/tools-check \

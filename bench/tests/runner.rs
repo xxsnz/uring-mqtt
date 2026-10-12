@@ -307,6 +307,130 @@ fn mosquitto_conf_renders_the_approved_options() {
     assert_eq!(conf, expected);
 }
 
+#[test]
+fn capture_env_refuses_a_tool_that_prints_no_version() {
+    let dir = temp_dir("blank-version");
+    let tool = make_script(&dir, "blank-version.sh", "printf '\\n   \\n'\n");
+    let err = capture_env(std::slice::from_ref(&tool))
+        .expect_err("a probe that prints no version must fail the capture");
+    assert!(err.contains(&tool.display().to_string()), "err must name the tool: {err}");
+    assert!(
+        err.contains("--version printed no non-blank line"),
+        "err must name the cause: {err}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn capture_env_records_the_first_non_blank_version_line() {
+    let dir = temp_dir("leading-blank-version");
+    let tool = make_script(
+        &dir,
+        "leading-blank-version.sh",
+        "printf '\\n  \\nfaketool version 1.2.3  \\nsecond line\\n'\n",
+    );
+    let env =
+        capture_env(std::slice::from_ref(&tool)).expect("a probe that prints a version must pass");
+    assert_eq!(
+        env.tools,
+        vec![(
+            tool.to_string_lossy().into_owned(),
+            "faketool version 1.2.3".to_string()
+        )]
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn capture_env_times_out_a_tool_that_prints_only_blank_lines() {
+    // Blank lines with no pause for ~10 s, well past the 5 s probe
+    // deadline, then EOF. The reader drops every one of them, so the
+    // probe must stop at its deadline: a probe that waited for EOF
+    // instead would report the wrong cause, and one whose reader
+    // queued the lines would grow that queue for 10 s.
+    let dir = temp_dir("blank-flood-version");
+    let tool = make_script(
+        &dir,
+        "blank-flood-version.sh",
+        "end=$(($(date +%s) + 10))\nwhile [ \"$(date +%s)\" -lt \"$end\" ]; do echo; done\n",
+    );
+    let err = capture_env(std::slice::from_ref(&tool))
+        .expect_err("a probe that never prints a version must fail the capture");
+    assert!(
+        err.contains("--version did not answer within"),
+        "err must name the deadline: {err}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn capture_env_refuses_a_tool_whose_version_stdout_is_empty() {
+    // A probe that prints no byte at all reaches EOF on its first
+    // receive, with no blank line to skip. It must report the same
+    // no-version cause as a probe that printed only blank lines.
+    let dir = temp_dir("silent-version");
+    let tool = make_script(&dir, "silent-version.sh", "exit 0\n");
+    let err = capture_env(std::slice::from_ref(&tool))
+        .expect_err("a probe that prints nothing must fail the capture");
+    assert!(err.contains(&tool.display().to_string()), "err must name the tool: {err}");
+    assert!(
+        err.contains("--version printed no non-blank line"),
+        "err must name the cause: {err}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn capture_env_skips_tab_only_lines_and_trims_the_version() {
+    // Whitespace is not only spaces: a tab-only line is blank and a
+    // tab-padded version line still records the bare version.
+    let dir = temp_dir("tab-version");
+    let tool = make_script(
+        &dir,
+        "tab-version.sh",
+        "printf '\\t\\n \\t \\n\\tfaketool version 4.5\\t\\n'\n",
+    );
+    let env =
+        capture_env(std::slice::from_ref(&tool)).expect("a probe that prints a version must pass");
+    assert_eq!(
+        env.tools,
+        vec![(
+            tool.to_string_lossy().into_owned(),
+            "faketool version 4.5".to_string()
+        )]
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn capture_env_probes_every_supplied_tool_in_order() {
+    // One blank-line prefix must not leak into the next probe: each
+    // tool gets its own reader, and `env.tools` keeps the supplied
+    // order so the `## Environment` rows name the right binaries.
+    let dir = temp_dir("two-tool-version");
+    let first = make_script(
+        &dir,
+        "first-version.sh",
+        "printf '\\n\\nfirsttool version 1.0\\n'\n",
+    );
+    let second = make_script(&dir, "second-version.sh", "printf 'secondtool version 2.0\\n'\n");
+    let env = capture_env(&[first.clone(), second.clone()]).expect("both probes must pass");
+    assert_eq!(
+        env.tools,
+        vec![
+            (
+                first.to_string_lossy().into_owned(),
+                "firsttool version 1.0".to_string()
+            ),
+            (
+                second.to_string_lossy().into_owned(),
+                "secondtool version 2.0".to_string()
+            )
+        ]
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // `DeliveryReport` and `RunRecord` are imported so this file's
 // `use` block surfaces the public types the runner consumes; clippy
 // trips if the imports go unused.

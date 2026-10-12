@@ -55,10 +55,13 @@ pub enum DocError {
     /// Recorded mode forbids more than one distinct value in the named
     /// `env` field across records.
     MixedEnvironment(String),
-    /// Recorded mode requires `env.tools` to name at least one tool
-    /// version: the document must identify the binaries behind its
-    /// figures.
+    /// Recorded mode requires `env.tools` to list at least one probed
+    /// tool: the document must identify the binaries behind its figures.
     NoToolVersions,
+    /// Recorded mode requires every `env.tools` entry to carry a
+    /// non-blank version string; holds the tool path of the first entry
+    /// whose version is empty after trimming.
+    BlankToolVersion(String),
     /// `analysis::recompute` flagged a record whose derived fields
     /// contradict its raw observations.
     InconsistentRecord(String),
@@ -171,6 +174,17 @@ pub fn render(records: &[RunRecord], smoke: bool) -> Result<String, DocError> {
         // one means no tool version was identified for any figure.
         if tool_sets.iter().any(Vec::is_empty) {
             return Err(DocError::NoToolVersions);
+        }
+
+        // Every entry becomes one `## Environment` row, so a blank
+        // version leaves that tool unidentified while the others are
+        // named.
+        if let Some((path, _)) = tool_sets
+            .iter()
+            .flatten()
+            .find(|(_, version)| version.trim().is_empty())
+        {
+            return Err(DocError::BlankToolVersion(path.clone()));
         }
 
         // Protocol invariants that name a single field across every

@@ -260,9 +260,9 @@ pub fn mosquitto_conf(port: u16) -> String {
 }
 
 /// Build the [`Env`] for one run. `tools` is the list of paths whose
-/// first `--version` line goes into `env.tools`; an empty slice is fine
+/// first non-blank `--version` line goes into `env.tools`; an empty slice is fine
 /// for a smoke run that uses no perf/strace/mosquitto. A tool that cannot
-/// be started, prints nothing, or misses the
+/// be started, prints no non-blank line, or misses the
 /// [`TOOL_VERSION_TIMEOUT_SECS`] deadline fails the whole capture, so no
 /// run starts against an environment whose tools were never identified.
 /// `git_sha` and `git_dirty` are read from the build-time env vars the
@@ -304,7 +304,7 @@ pub fn capture_env(tools: &[PathBuf]) -> Result<Env, String> {
     })
 }
 
-/// The first `--version` line of one tool, or the cause when the probe
+/// The first non-blank `--version` line of one tool, or the cause when the probe
 /// could not produce one. Nothing here waits on the child without a
 /// deadline: `Command::output` has none, and reading the pipe after the
 /// child exits has none either, because a background process the probe
@@ -324,7 +324,7 @@ fn tool_version(tool: &Path) -> Result<String, String> {
         .map_err(|e| e.to_string())?;
     let deadline = Instant::now() + Duration::from_secs(TOOL_VERSION_TIMEOUT_SECS);
     let first = match child.stdout.take() {
-        Some(stdout) => spawn_stdout_reader(TOOL_VERSION_LABEL, stdout)
+        Some(stdout) => spawn_stdout_reader(TOOL_VERSION_LABEL, stdout, BlankLines::Skip)
             .and_then(|lines| recv_version_line(&lines, deadline)),
         None => Err("--version stdout not piped".to_string()),
     };
@@ -338,27 +338,37 @@ fn tool_version(tool: &Path) -> Result<String, String> {
     first
 }
 
-/// The first line a `--version` probe prints, bounded by `deadline`. An
-/// empty line counts: the probe answered, and `capture_env` records what it
-/// said.
+/// The first non-blank line a `--version` probe prints, trimmed, bounded
+/// by `deadline`. Blank and whitespace-only lines never reach this
+/// receiver ([`BlankLines::Skip`]), so a probe that reaches EOF without a
+/// non-blank line answered with no version, and `capture_env` must fail
+/// rather than record an empty one. The deadline is checked before every
+/// receive and the receive waits only the time left, so nothing that
+/// arrives after expiry is reported as an answer.
 fn recv_version_line(
     lines: &mpsc::Receiver<StdoutLine>,
     deadline: Instant,
 ) -> Result<String, String> {
     loop {
-        match lines.recv_timeout(Duration::from_millis(WAIT_POLL_MS)) {
-            Ok(StdoutLine::Line(line)) => return Ok(line.trim().to_string()),
-            Ok(StdoutLine::Eof) => return Err("--version printed nothing".to_string()),
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "--version did not answer within {TOOL_VERSION_TIMEOUT_SECS}s"
+            ));
+        }
+        match lines.recv_timeout(remaining) {
+            Ok(StdoutLine::Line(line)) => {
+                let version = line.trim();
+                if !version.is_empty() {
+                    return Ok(version.to_string());
+                }
+            }
+            Ok(StdoutLine::Eof) => return Err("--version printed no non-blank line".to_string()),
             Ok(StdoutLine::Failed(e)) => return Err(format!("read --version stdout: {e}")),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return Err("--version stdout reader stopped".to_string());
             }
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "--version did not answer within {TOOL_VERSION_TIMEOUT_SECS}s"
-            ));
         }
     }
 }
@@ -584,6 +594,15 @@ enum StdoutLine {
     Failed(String),
 }
 
+/// Whether a stdout reader forwards whitespace-only lines. A receiver that
+/// discards them anyway asks for [`BlankLines::Skip`], so a child printing
+/// whitespace faster than the receiver reads cannot grow the reader's
+/// unbounded channel; a receiver matching exact lines keeps them.
+enum BlankLines {
+    Keep,
+    Skip,
+}
+
 /// Why [`drain_stderr_lines`] stopped, when it stopped for a reason the
 /// record has to name. EOF, a cancelled run and a disconnected reader are
 /// the clean endings and carry no member here.
@@ -605,6 +624,7 @@ enum DrainEnd {
 fn spawn_stdout_reader(
     label: &'static str,
     stdout: std::process::ChildStdout,
+    blanks: BlankLines,
 ) -> Result<mpsc::Receiver<StdoutLine>, String> {
     let (tx, rx) = mpsc::channel();
     std::thread::Builder::new()
@@ -616,6 +636,12 @@ fn spawn_stdout_reader(
                 line.clear();
                 let message = match reader.read_line(&mut line) {
                     Ok(0) => StdoutLine::Eof,
+                    // Dropped here rather than at the receiver: queueing a
+                    // line the receiver discards makes peak memory depend
+                    // on how fast the child prints.
+                    Ok(_) if matches!(blanks, BlankLines::Skip) && line.trim().is_empty() => {
+                        continue
+                    }
                     Ok(_) => StdoutLine::Line(line.clone()),
                     Err(e) => StdoutLine::Failed(e.to_string()),
                 };
@@ -727,7 +753,7 @@ fn take_handshake(guards: &mut ChildGuard, label: &'static str) -> Result<Handsh
     Ok(Handshake {
         label,
         stdin,
-        lines: spawn_stdout_reader(label, stdout)?,
+        lines: spawn_stdout_reader(label, stdout, BlankLines::Keep)?,
     })
 }
 
