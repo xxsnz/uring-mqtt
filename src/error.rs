@@ -30,7 +30,7 @@ impl Error {
     /// (clean hangup, peer reset, broken pipe) that should not produce a log
     /// line at the worker level. Typed: matches variants and `io::ErrorKind`
     /// only — never message text.
-    pub fn is_routine_disconnect(&self) -> bool {
+    pub(crate) fn is_routine_disconnect(&self) -> bool {
         match self {
             Self::Timeout | Self::ClientClosed => true,
             Self::Io(e) => matches!(
@@ -40,6 +40,14 @@ impl Error {
             Self::Decode(_) | Self::Encode(_) | Self::Protocol(_) | Self::Worker(_) => false,
         }
     }
+}
+
+/// [`Error::is_routine_disconnect`] for the benchmark's tokio twin, which
+/// reports session errors the way the shipped worker logs them. Reachable
+/// only through `runtime_seam`, so the shipped API does not grow.
+#[cfg(feature = "runtime-seam")]
+pub fn is_routine_disconnect(err: &Error) -> bool {
+    err.is_routine_disconnect()
 }
 
 #[cfg(test)]
@@ -162,6 +170,53 @@ mod tests {
 
         let msg = format!("{err}");
         assert_eq!(msg, "Client closed connection during handshake");
+    }
+
+    /// The seam function the benchmark twin calls is the only way an
+    /// external crate reaches the classifier, so it must publish the
+    /// same verdict the shipped worker logs by.
+    #[cfg(feature = "runtime-seam")]
+    #[test]
+    fn the_seam_classifier_publishes_the_method_verdict() {
+        let cases = [
+            (Error::Timeout, true),
+            (Error::ClientClosed, true),
+            (
+                Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "x",
+                )),
+                true,
+            ),
+            (
+                Error::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "x")),
+                true,
+            ),
+            (
+                Error::Io(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "x")),
+                false,
+            ),
+            (
+                Error::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "x")),
+                false,
+            ),
+            (Error::Decode(DecodeError::MalformedPacket), false),
+            (Error::Encode(EncodeError::MalformedPacket), false),
+            (Error::Protocol("reset closed Timeout".into()), false),
+            (Error::Worker("x".into()), false),
+        ];
+        for (err, expected) in &cases {
+            assert_eq!(
+                is_routine_disconnect(err),
+                *expected,
+                "seam classified {err:?} wrongly"
+            );
+            assert_eq!(
+                is_routine_disconnect(err),
+                err.is_routine_disconnect(),
+                "seam disagrees with the method for {err:?}"
+            );
+        }
     }
 
     #[test]

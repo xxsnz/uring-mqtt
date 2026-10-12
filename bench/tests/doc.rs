@@ -55,7 +55,13 @@ fn env() -> Env {
         host: "test-host".to_string(),
         git_sha: "b219eb1".to_string(),
         git_dirty: false,
-        tools: Vec::new(),
+        tools: vec![
+            ("/usr/bin/perf".to_string(), "perf version 6.8.12".to_string()),
+            (
+                "/usr/sbin/mosquitto".to_string(),
+                "mosquitto version 2.0.18".to_string(),
+            ),
+        ],
     }
 }
 
@@ -900,6 +906,210 @@ fn render_reports_median_throughput_and_p99_per_server() {
         doc.contains("| uring | 100 | 3.0 % | 95.0 | 40.0 | 40.0 | 80.0 | 1.25 | ok |"),
         "missing uring row in:\n{doc}"
     );
+}
+
+#[test]
+fn render_marks_every_tokio_driver_proof_not_applicable() {
+    // No fd evidence at all (not just a mismatched count) is the
+    // no-evidence case the parent review raised: driver_label must
+    // mark these rows `n/a`, not guess at the uring-only fd criterion.
+    let mut records = full_recorded_set();
+    for r in &mut records {
+        if r.server == ServerKind::Tokio {
+            r.driver = Some(bench::run_record::DriverFds {
+                io_uring_fds: 0,
+                eventpoll_fds: 0,
+            });
+        }
+    }
+    let doc = render(&records, false).expect("render ok");
+    let tokio_na_count = doc
+        .lines()
+        .filter(|l| *l == "| tokio | 100 | 3.0 % | 95.0 | 40.0 | 40.0 | 80.0 | 1.25 | n/a |")
+        .count();
+    assert_eq!(
+        tokio_na_count, 4,
+        "expected 4 tokio results rows marked n/a in:\n{doc}"
+    );
+    let tokio_ok_count = doc
+        .lines()
+        .filter(|l| l.starts_with("| tokio |") && l.ends_with("| ok |"))
+        .count();
+    assert_eq!(
+        tokio_ok_count, 0,
+        "tokio driver proof must never read ok in:\n{doc}"
+    );
+    let uring_ok_count = doc
+        .lines()
+        .filter(|l| *l == "| uring | 100 | 3.0 % | 95.0 | 40.0 | 40.0 | 80.0 | 1.25 | ok |")
+        .count();
+    assert_eq!(
+        uring_ok_count, 4,
+        "uring driver verdict must stay unchanged in:\n{doc}"
+    );
+}
+
+#[test]
+fn render_refuses_a_recorded_document_with_no_tool_versions() {
+    // (a) No record names a tool: the document cannot disclose which
+    // binaries produced its figures, so `render` must refuse it.
+    let mut records = full_recorded_set();
+    for rec in &mut records {
+        rec.env.tools = Vec::new();
+    }
+    match render(&records, false) {
+        Err(DocError::NoToolVersions) => {}
+        other => panic!("expected NoToolVersions, got {other:?}"),
+    }
+
+    // (b) Failure-mode ordering guard (decision Q4): a record set whose
+    // tools disagree (one record empty, the rest named) is a
+    // `MixedEnvironment("tools")`, not `NoToolVersions` — the mismatch
+    // check runs first.
+    let mut mixed_records = full_recorded_set();
+    mixed_records[0].env.tools = Vec::new();
+    match render(&mixed_records, false) {
+        Err(DocError::MixedEnvironment(field)) => {
+            assert_eq!(field, "tools");
+        }
+        other => panic!("expected MixedEnvironment(tools), got {other:?}"),
+    }
+}
+
+#[test]
+fn render_discloses_the_epic_strace_bias_for_strace_counts() {
+    // (a) every 80 % latency record resumed under strace: the method
+    // label must carry §9.1's own ptrace caveat, not the stale
+    // "inflates" wording.
+    let mut records = full_recorded_set();
+    let mut mutated = 0usize;
+    for rec in records
+        .iter_mut()
+        .filter(|r| r.kind == RunKind::Latency && r.rate_fraction_pct == Some(80))
+    {
+        assert_eq!(
+            rec.syscalls.method,
+            SyscallMethod::Perf,
+            "fixture already not perf before mutation"
+        );
+        rec.syscalls.method = SyscallMethod::Strace;
+        rec.syscalls.raw = Some(STRACE_RAW.to_string());
+        assert_eq!(rec.syscalls.method, SyscallMethod::Strace, "mutation did not take");
+        mutated += 1;
+    }
+    assert!(mutated > 0, "no 80% latency records found to mutate");
+
+    let doc = render(&records, false).expect("render ok");
+    let expected_strace_line = "| Syscall method | strace (ptrace slows each syscall, which raises completions per `io_uring_enter` and flatters io_uring) |";
+    assert!(
+        doc.lines().any(|l| l == expected_strace_line),
+        "missing strace caveat line in:\n{doc}"
+    );
+    assert!(!doc.contains("inflates"), "stale caveat text found in:\n{doc}");
+
+    // (b) edge — perf counts carry no caveat.
+    let perf_doc = render(&full_recorded_set(), false).expect("render ok");
+    assert!(
+        perf_doc.lines().any(|l| l == "| Syscall method | perf |"),
+        "missing plain perf line in:\n{perf_doc}"
+    );
+    assert!(
+        !perf_doc.contains("ptrace"),
+        "unexpected ptrace mention in:\n{perf_doc}"
+    );
+}
+
+#[test]
+fn render_qualifies_every_mosquitto_result_row_with_subscriber_receipt() {
+    let records = full_recorded_set();
+    let doc = render(&records, false).expect("render ok");
+    let expected_row =
+        "| mosquitto (endpoint = subscriber receipt) | 100 | 3.0 % | 95.0 | 40.0 | 40.0 | 80.0 | 1.25 | n/a |";
+    let qualified_count = doc.lines().filter(|l| *l == expected_row).count();
+    assert_eq!(
+        qualified_count, 2,
+        "expected 2 qualified mosquitto results rows (one per QoS) in:\n{doc}"
+    );
+    let unqualified_count = doc.lines().filter(|l| l.starts_with("| mosquitto | 100 |")).count();
+    assert_eq!(
+        unqualified_count, 0,
+        "unqualified mosquitto results row found in:\n{doc}"
+    );
+    // Regression guard for decision Q2 (not an AC): the connections row
+    // stays plain, not qualified with the subscriber-receipt endpoint.
+    let connections_count = doc
+        .lines()
+        .filter(|l| *l == "| mosquitto | 1000 | 0.0 % |")
+        .count();
+    assert_eq!(
+        connections_count, 1,
+        "expected plain mosquitto connections row in:\n{doc}"
+    );
+}
+
+#[test]
+fn render_marks_a_tokio_row_with_no_driver_record_not_applicable() {
+    // A record stored before the twin reported any fd count carries
+    // `driver: None`. The uring-only proof has nothing to say about it,
+    // so the cell must read `n/a` and never the `failed` the deleted
+    // tokio arm produced.
+    let mut records = full_recorded_set();
+    for r in &mut records {
+        if r.server == ServerKind::Tokio {
+            r.driver = None;
+        }
+    }
+    let doc = render(&records, false).expect("render ok");
+    let tokio_na_count = doc
+        .lines()
+        .filter(|l| *l == "| tokio | 100 | 3.0 % | 95.0 | 40.0 | 40.0 | 80.0 | 1.25 | n/a |")
+        .count();
+    assert_eq!(
+        tokio_na_count, 4,
+        "expected 4 tokio results rows marked n/a in:\n{doc}"
+    );
+    let tokio_failed_count = doc
+        .lines()
+        .filter(|l| l.starts_with("| tokio |") && l.ends_with("| failed |"))
+        .count();
+    assert_eq!(
+        tokio_failed_count, 0,
+        "tokio driver proof must never read failed in:\n{doc}"
+    );
+}
+
+#[test]
+fn render_names_a_failed_mosquitto_configuration_by_its_bare_label() {
+    // `config_label` feeds the refusal messages and needs the bare
+    // kebab name: the results-row qualification must not leak into it.
+    let records: Vec<RunRecord> = full_recorded_set()
+        .into_iter()
+        .filter(|r| !(r.server == ServerKind::Mosquitto && r.kind == RunKind::Throughput))
+        .collect();
+    match render(&records, false) {
+        Err(DocError::FailedConfigurations(names)) => {
+            assert!(
+                names.iter().any(|n| n == "mosquitto-w1-q0-throughput"),
+                "expected the bare mosquitto configuration label, got {names:?}"
+            );
+            assert!(
+                !names.iter().any(|n| n.contains("endpoint")),
+                "the results-row qualification leaked into a configuration label: {names:?}"
+            );
+        }
+        other => panic!("expected FailedConfigurations, got {other:?}"),
+    }
+}
+
+#[test]
+fn smoke_render_accepts_an_empty_tool_set() {
+    // The tool-version refusal is recorded-mode only: a smoke document
+    // is already marked unpublishable, and `bench doc --smoke` renders
+    // sets captured without a tool probe.
+    let mut records = vec![throughput_record(ServerKind::Uring, 1, 1, 1)];
+    records[0].env.tools = Vec::new();
+    let doc = render(&records, true).expect("smoke render must accept an empty tool set");
+    assert!(doc.contains("SMOKE — not publishable"), "doc:\n{doc}");
 }
 
 #[test]

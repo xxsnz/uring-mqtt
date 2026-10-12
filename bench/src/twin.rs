@@ -18,9 +18,9 @@ use tokio_util::codec::Framed;
 
 use monoio_codec::{Decoder as MonoioDecoder, Decoded as MonoioDecoded};
 use uring_mqtt::runtime_seam::{
-    event_channel, EventReceiver, HandshakeIo, MqttDecoder, MqttEncoder, MqttPacket, PacketIo,
-    ProtocolVersion, serve_session, SessionOutcome, TimedOut, Timer, VersionDecoder,
-    MAX_TIMEOUT_SECS,
+    event_channel, EventReceiver, HandshakeIo, is_routine_disconnect, MqttDecoder, MqttEncoder,
+    MqttPacket, PacketIo, ProtocolVersion, serve_session, SessionOutcome, TimedOut, Timer,
+    VersionDecoder, MAX_TIMEOUT_SECS,
 };
 use uring_mqtt::{BrokerConfig, MaxInboundPacketSize, PublishCallback};
 
@@ -448,7 +448,7 @@ async fn worker_main(
                                 Ok(SessionOutcome::Violation) => {
                                     Some(format!("session {peer}: protocol violation"))
                                 }
-                                Err(e) if e.is_routine_disconnect() => None,
+                                Err(e) if is_routine_disconnect(&e) => None,
                                 Err(e) => Some(format!("session {peer}: {e}")),
                             }
                         });

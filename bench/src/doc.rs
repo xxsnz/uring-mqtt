@@ -32,6 +32,11 @@ use crate::runner::{
 /// never shows a figure taken from a failed run.
 const FAILED: &str = "FAILED";
 
+/// Server cell of a mosquitto row in `## Results`: §9.1 measures
+/// mosquitto at a subscriber, not at the callback, and orders the
+/// document to say so in those rows.
+const MOSQUITTO_RESULTS_LABEL: &str = "mosquitto (endpoint = subscriber receipt)";
+
 /// Reasons `bench doc` can refuse to render a document. Every variant
 /// is the operator's only signal that an unpublishable record set exists;
 /// tests assert on these variants one-for-one.
@@ -50,6 +55,10 @@ pub enum DocError {
     /// Recorded mode forbids more than one distinct value in the named
     /// `env` field across records.
     MixedEnvironment(String),
+    /// Recorded mode requires `env.tools` to name at least one tool
+    /// version: the document must identify the binaries behind its
+    /// figures.
+    NoToolVersions,
     /// `analysis::recompute` flagged a record whose derived fields
     /// contradict its raw observations.
     InconsistentRecord(String),
@@ -156,6 +165,12 @@ pub fn render(records: &[RunRecord], smoke: bool) -> Result<String, DocError> {
         // kernel.
         if tool_sets.len() > 1 {
             return Err(DocError::MixedEnvironment("tools".to_string()));
+        }
+        // A document must name the binaries behind its figures. Every
+        // record shares one `env.tools` value at this point, so an empty
+        // one means no tool version was identified for any figure.
+        if tool_sets.iter().any(Vec::is_empty) {
+            return Err(DocError::NoToolVersions);
         }
 
         // Protocol invariants that name a single field across every
@@ -630,7 +645,7 @@ fn results_row(
 
     format!(
         "| {server} | {msgs} | {spread} | {server_cpu} | {gen_cpu} | {p50} | {p80} | {sys} | {driver} |",
-        server = server_label(server),
+        server = if server == ServerKind::Mosquitto { MOSQUITTO_RESULTS_LABEL } else { server_label(server) },
         p50 = latency_p99_us(passing, &lat50_key),
         p80 = latency_p99_us(passing, &lat80_key),
         sys = syscalls_per_msg(passing, &lat80_key),
@@ -729,7 +744,8 @@ fn syscalls_per_msg(passing: &HashMap<ConfigKey, Vec<RunRecord>>, key: &ConfigKe
 }
 
 fn driver_label(runs: &[RunRecord], server: ServerKind, workers: u32) -> String {
-    if server == ServerKind::Mosquitto {
+    // §9.1 defines a driver proof for the monoio server only.
+    if server != ServerKind::Uring {
         return "n/a".to_string();
     }
     if runs.is_empty() {
@@ -737,7 +753,6 @@ fn driver_label(runs: &[RunRecord], server: ServerKind, workers: u32) -> String 
     }
     let all_match = runs.iter().all(|r| match (server, r.driver) {
         (ServerKind::Uring, Some(d)) => d.io_uring_fds == workers && d.eventpoll_fds == 0,
-        (ServerKind::Tokio, Some(d)) => d.io_uring_fds == 0,
         _ => false,
     });
     if all_match {
@@ -851,7 +866,7 @@ fn syscalls_method_label(passing: &HashMap<ConfigKey, Vec<RunRecord>>) -> String
     let label = methods.iter().copied().collect::<Vec<_>>().join(", ");
     if methods.contains("strace") {
         format!(
-            "{label} (strace inflates the syscall count it measures — only comparative runs are valid)"
+            "{label} (ptrace slows each syscall, which raises completions per `io_uring_enter` and flatters io_uring)"
         )
     } else {
         label
