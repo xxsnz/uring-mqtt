@@ -55,12 +55,20 @@ pub enum DocError {
     /// Recorded mode forbids more than one distinct value in the named
     /// `env` field across records.
     MixedEnvironment(String),
+    /// Recorded mode requires the shared `git_sha`, `kernel`, `host` or
+    /// `cpu_model` to render a non-blank cell; holds the field name.
+    BlankEnvironment(String),
     /// Recorded mode requires `env.tools` to list at least one probed
     /// tool: the document must identify the binaries behind its figures.
     NoToolVersions,
     /// Recorded mode requires every `env.tools` entry to carry a
-    /// non-blank version string; holds the tool path of the first entry
-    /// whose version is empty after trimming.
+    /// non-blank path; holds the zero-based position of the first entry
+    /// whose path renders blank.
+    BlankToolPath(usize),
+    /// Recorded mode requires every `env.tools` entry to carry a version
+    /// that renders as a non-blank cell; holds the tool path of the first
+    /// entry whose version holds nothing but whitespace and control
+    /// characters.
     BlankToolVersion(String),
     /// `analysis::recompute` flagged a record whose derived fields
     /// contradict its raw observations.
@@ -169,11 +177,42 @@ pub fn render(records: &[RunRecord], smoke: bool) -> Result<String, DocError> {
         if tool_sets.len() > 1 {
             return Err(DocError::MixedEnvironment("tools".to_string()));
         }
+        // `## Environment` prints each of these fields as one cell for
+        // every figure in the document, and every record shares one
+        // value of each at this point. A value that `cell` renders blank
+        // publishes a cell that identifies nothing, so the field is named
+        // instead.
+        let disclosed = [
+            ("git_sha", &git_shas),
+            ("kernel", &kernels),
+            ("host", &hosts),
+            ("cpu_model", &cpu_models),
+        ];
+        if let Some((field, _)) = disclosed
+            .iter()
+            .find(|(_, values)| values.iter().any(|v| cell(v).trim().is_empty()))
+        {
+            return Err(DocError::BlankEnvironment((*field).to_string()));
+        }
         // A document must name the binaries behind its figures. Every
         // record shares one `env.tools` value at this point, so an empty
         // one means no tool version was identified for any figure.
         if tool_sets.iter().any(Vec::is_empty) {
             return Err(DocError::NoToolVersions);
+        }
+
+        // A path that `cell` renders blank publishes a tool row that
+        // names no binary. Every record shares one `env.tools` value at
+        // this point, so the position is the entry's index in each
+        // record. Checked over every entry before any version, so an
+        // entry with both blank names its position rather than an
+        // empty path.
+        if let Some(index) = tool_sets
+            .iter()
+            .flatten()
+            .position(|(path, _)| cell(path).trim().is_empty())
+        {
+            return Err(DocError::BlankToolPath(index));
         }
 
         // Every entry becomes one `## Environment` row, so a blank
@@ -182,7 +221,7 @@ pub fn render(records: &[RunRecord], smoke: bool) -> Result<String, DocError> {
         if let Some((path, _)) = tool_sets
             .iter()
             .flatten()
-            .find(|(_, version)| version.trim().is_empty())
+            .find(|(_, version)| cell(version).trim().is_empty())
         {
             return Err(DocError::BlankToolVersion(path.clone()));
         }

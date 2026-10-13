@@ -1074,6 +1074,278 @@ fn render_refuses_a_blank_tool_version_before_a_protocol_violation() {
     assert_eq!(format!("{err:?}"), "BlankToolVersion(\"/usr/sbin/mosquitto\")");
 }
 
+/// `full_recorded_set()` with `edit` applied to every record's `env`.
+fn recorded_set_with_env(edit: impl Fn(&mut Env)) -> Vec<RunRecord> {
+    let mut records = full_recorded_set();
+    for rec in &mut records {
+        edit(&mut rec.env);
+    }
+    records
+}
+
+/// `bench doc` prints a refusal with `{e:?}` (`dispatch_doc`), so the
+/// Debug form is what the operator reads.
+fn assert_recorded_refusal(records: &[RunRecord], expected: &str) {
+    let err = render(records, false).expect_err(expected);
+    assert_eq!(format!("{err:?}"), expected);
+}
+
+#[test]
+fn render_refuses_a_recorded_document_with_a_blank_environment_field() {
+    assert_recorded_refusal(
+        &recorded_set_with_env(|env| env.git_sha = String::new()),
+        "BlankEnvironment(\"git_sha\")",
+    );
+    assert_recorded_refusal(
+        &recorded_set_with_env(|env| env.kernel = "   ".to_string()),
+        "BlankEnvironment(\"kernel\")",
+    );
+    // `cell` turns control characters into spaces, so a NUL-only
+    // host publishes a blank cell too.
+    assert_recorded_refusal(
+        &recorded_set_with_env(|env| env.host = "\u{0}".to_string()),
+        "BlankEnvironment(\"host\")",
+    );
+    assert_recorded_refusal(
+        &recorded_set_with_env(|env| env.cpu_model = "\t\u{7}\n".to_string()),
+        "BlankEnvironment(\"cpu_model\")",
+    );
+
+    // Two blank fields: the refusal names the first in the order
+    // git_sha, kernel, host, cpu_model.
+    assert_recorded_refusal(
+        &recorded_set_with_env(|env| {
+            env.host = String::new();
+            env.cpu_model = String::new();
+        }),
+        "BlankEnvironment(\"host\")",
+    );
+
+    // Ordering guard: one record with a blank host among records
+    // that name it is a mixed environment first.
+    let mut records = full_recorded_set();
+    records[0].env.host = String::new();
+    match render(&records, false) {
+        Err(DocError::MixedEnvironment(field)) => assert_eq!(field, "host"),
+        other => panic!("expected MixedEnvironment(host), got {other:?}"),
+    }
+
+    // Ordering guard: every mixed check, `tools` included, runs
+    // before the blank check.
+    let mut records = recorded_set_with_env(|env| env.host = String::new());
+    records[0].env.tools.pop();
+    match render(&records, false) {
+        Err(DocError::MixedEnvironment(field)) => assert_eq!(field, "tools"),
+        other => panic!("expected MixedEnvironment(tools), got {other:?}"),
+    }
+}
+
+#[test]
+fn render_refuses_a_recorded_document_with_a_blank_tool_path() {
+    // A blank path with a real version publishes a tool row that
+    // names no binary; the refusal names the entry's position.
+    assert_recorded_refusal(
+        &recorded_set_with_env(|env| {
+            env.tools = vec![
+                (String::new(), "perf version 6.8.12".to_string()),
+                ("/usr/sbin/mosquitto".to_string(), "mosquitto version 2.0.18".to_string()),
+            ];
+        }),
+        "BlankToolPath(0)",
+    );
+    assert_recorded_refusal(
+        &recorded_set_with_env(|env| {
+            env.tools = vec![
+                ("/usr/bin/perf".to_string(), "perf version 6.8.12".to_string()),
+                ("  ".to_string(), "mosquitto version 2.0.18".to_string()),
+            ];
+        }),
+        "BlankToolPath(1)",
+    );
+    assert_recorded_refusal(
+        &recorded_set_with_env(|env| {
+            env.tools = vec![("\u{0}".to_string(), "perf version 6.8.12".to_string())];
+        }),
+        "BlankToolPath(0)",
+    );
+
+    // Any blank path wins over any blank version: a version refusal
+    // would name an empty path.
+    assert_recorded_refusal(
+        &recorded_set_with_env(|env| env.tools = vec![(String::new(), String::new())]),
+        "BlankToolPath(0)",
+    );
+    assert_recorded_refusal(
+        &recorded_set_with_env(|env| {
+            env.tools = vec![
+                ("/usr/bin/perf".to_string(), String::new()),
+                (String::new(), "mosquitto version 2.0.18".to_string()),
+            ];
+        }),
+        "BlankToolPath(1)",
+    );
+    // Two blank paths: the first wins.
+    assert_recorded_refusal(
+        &recorded_set_with_env(|env| {
+            env.tools = vec![
+                (String::new(), "perf version 6.8.12".to_string()),
+                (String::new(), String::new()),
+            ];
+        }),
+        "BlankToolPath(0)",
+    );
+
+    // Ordering guard: one record with a blank path among records
+    // that name it is a mixed environment first.
+    let mut records = full_recorded_set();
+    records[0].env.tools[0].0 = String::new();
+    match render(&records, false) {
+        Err(DocError::MixedEnvironment(field)) => assert_eq!(field, "tools"),
+        other => panic!("expected MixedEnvironment(tools), got {other:?}"),
+    }
+}
+
+#[test]
+fn render_refuses_a_tool_version_of_control_characters() {
+    // `cell` turns control characters into spaces, so a version of
+    // NUL and BEL publishes a blank cell.
+    assert_recorded_refusal(
+        &recorded_set_with_env(|env| {
+            env.tools = vec![("/usr/bin/strace".to_string(), "\u{0}\u{7}".to_string())];
+        }),
+        "BlankToolVersion(\"/usr/bin/strace\")",
+    );
+}
+
+#[test]
+fn smoke_render_accepts_blank_environment_fields_and_tool_paths() {
+    // Both refusals are recorded-mode only: a smoke document is
+    // already marked unpublishable.
+    let mut records = vec![throughput_record(ServerKind::Uring, 1, 1, 1)];
+    records[0].env.git_sha = String::new();
+    records[0].env.kernel = String::new();
+    records[0].env.host = String::new();
+    records[0].env.cpu_model = String::new();
+    records[0].env.tools = vec![(String::new(), "perf version 6.8.12".to_string())];
+    let doc = render(&records, true).expect("smoke render must accept blank env fields");
+    assert!(doc.contains("SMOKE — not publishable"), "doc:\n{doc}");
+}
+
+#[test]
+fn smoke_render_accepts_a_tool_version_of_control_characters() {
+    // The renders-blank predicate sits inside `if !smoke` for the
+    // version check too: a smoke document still publishes a version of
+    // NUL and BEL.
+    let mut records = vec![throughput_record(ServerKind::Uring, 1, 1, 1)];
+    records[0].env.tools = vec![("/usr/bin/strace".to_string(), "\u{0}\u{7}".to_string())];
+    let doc = render(&records, true).expect("smoke render must accept a control-only version");
+    assert!(doc.contains("SMOKE — not publishable"), "doc:\n{doc}");
+}
+
+#[test]
+fn render_refuses_a_blank_environment_field_before_a_missing_tool_list() {
+    // Refusal order: the blank-environment check sits ahead of
+    // `NoToolVersions`, so a set that breaks both names the field whose
+    // cell identifies nothing rather than the absent tool list.
+    assert_recorded_refusal(
+        &recorded_set_with_env(|env| {
+            env.host = String::new();
+            env.tools = Vec::new();
+        }),
+        "BlankEnvironment(\"host\")",
+    );
+}
+
+#[test]
+fn render_refuses_a_blank_environment_field_before_a_protocol_violation() {
+    // Ordering guard: the blank-environment check sits ahead of the
+    // protocol-constant checks, so a record set that breaks both names
+    // the unidentified field, not the repetition.
+    let mut records = recorded_set_with_env(|env| env.cpu_model = String::new());
+    let target = records
+        .iter_mut()
+        .find(|r| r.repetition == 5 && r.kind == RunKind::Throughput)
+        .expect("a rep 5 throughput");
+    target.repetition = 1;
+    assert_recorded_refusal(&records, "BlankEnvironment(\"cpu_model\")");
+}
+
+#[test]
+fn render_refuses_a_blank_tool_path_before_a_protocol_violation() {
+    // Ordering guard: the blank-path check sits ahead of the
+    // protocol-constant checks, so a record set that breaks both names
+    // the tool entry, not the repetition.
+    let mut records = recorded_set_with_env(|env| {
+        env.tools = vec![(String::new(), "perf version 6.8.12".to_string())];
+    });
+    let target = records
+        .iter_mut()
+        .find(|r| r.repetition == 5 && r.kind == RunKind::Throughput)
+        .expect("a rep 5 throughput");
+    target.repetition = 1;
+    assert_recorded_refusal(&records, "BlankToolPath(0)");
+}
+
+#[test]
+fn render_refuses_a_dirty_tree_and_a_debug_build_before_a_blank_environment_field() {
+    // Refusal order: provenance decides before disclosure. A dirty tree
+    // or a debug build with a blank field names the build, because a
+    // fresh run is the remedy for both.
+    assert_recorded_refusal(
+        &recorded_set_with_env(|env| {
+            env.git_dirty = true;
+            env.git_sha = String::new();
+        }),
+        "DirtyTree",
+    );
+
+    let mut records = recorded_set_with_env(|env| env.git_sha = String::new());
+    records[0].build = Build::Debug;
+    assert_recorded_refusal(&records, "DebugBuild");
+}
+
+#[test]
+fn render_refuses_an_environment_field_of_only_unicode_whitespace() {
+    // A no-break space is not a control character, so `cell` keeps it,
+    // but it still publishes a cell that identifies nothing: the
+    // predicate is `cell(v).trim().is_empty()`, and `trim` removes every
+    // Unicode whitespace character.
+    assert_recorded_refusal(
+        &recorded_set_with_env(|env| env.host = "\u{a0}\u{2003}".to_string()),
+        "BlankEnvironment(\"host\")",
+    );
+}
+
+#[test]
+fn render_accepts_environment_fields_that_render_a_non_blank_cell() {
+    // No false positive: the check refuses a cell that holds nothing,
+    // not one that `cell` escapes or pads. A pipe and a backslash are
+    // escaped into visible cell text, so both must still publish.
+    let records = recorded_set_with_env(|env| {
+        env.git_sha = "  b219eb1  ".to_string();
+        env.host = "|".to_string();
+        env.cpu_model = "\\".to_string();
+        env.tools = vec![(" /usr/bin/perf ".to_string(), "perf version 6.8.12".to_string())];
+    });
+    let doc = render(&records, false).expect("non-blank env cells must render");
+    assert!(
+        doc.contains("b219eb1"),
+        "the commit row must disclose its value in:\n{doc}"
+    );
+    assert!(
+        doc.contains("/usr/bin/perf"),
+        "the perf row must disclose its path in:\n{doc}"
+    );
+    assert!(
+        doc.contains("\\|"),
+        "the host cell must escape its pipe in:\n{doc}"
+    );
+    assert!(
+        doc.contains("\\\\"),
+        "the cpu_model cell must escape its backslash in:\n{doc}"
+    );
+}
+
 #[test]
 fn render_discloses_the_epic_strace_bias_for_strace_counts() {
     // (a) every 80 % latency record resumed under strace: the method

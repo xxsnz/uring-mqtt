@@ -249,8 +249,18 @@ exit 1:
   non-smoke render.
 - `DebugBuild` — any record was produced by a debug build.
 - `DirtyTree` — any record's source tree was uncommitted at build.
-- `MixedEnvironment(field)` — more than one distinct `git_sha` or
-  `kernel` across records (other mismatches are in `check_resume`).
+- `MixedEnvironment(field)` — records disagree on `git_sha`,
+  `kernel`, `host`, `cpu_model` or `tools`.
+- `BlankEnvironment(field)` — the shared `git_sha`, `kernel`, `host`
+  or `cpu_model` is blank. `bench run` captures these once per run
+  (from `/proc` and the build); fix the host and record a fresh run —
+  `--resume` refuses a changed value, and an edited record no longer
+  shows what was captured.
+- `NoToolVersions` — the shared `env.tools` lists no tool.
+- `BlankToolPath(index)` — the `env.tools` entry at that zero-based
+  position has a blank path.
+- `BlankToolVersion(path)` — the `env.tools` entry for that path has
+  a blank version.
 - `InconsistentRecord(file: mismatches)` — `recompute` rejected at
   least one record.
 - `ProtocolViolation(text)` — recorded constants diverge, repetition
