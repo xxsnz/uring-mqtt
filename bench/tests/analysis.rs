@@ -9,8 +9,9 @@ use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 
 use bench::analysis::{
-    config_passes, count_driver_fds, cpu_count, cpu_percent, derive, interleave, matched_rates,
-    median, metric, parse_perf_count, parse_strace_total, percentile, reconcile, recompute,
+    config_failure, config_passes, count_driver_fds, cpu_count, cpu_percent, derive, interleave,
+    matched_rates, median, metric, parse_perf_count, parse_strace_total, percentile, reconcile,
+    recompute,
     spread, GENERATOR_LATENESS_FRACTION, SYSCALL_FRACTION_PCT,
 };
 use bench::gen::slot_counts;
@@ -241,6 +242,7 @@ fn baseline_record(kind: RunKind, server: ServerKind) -> RunRecord {
         harness_errors: Vec::new(),
         valid: true,
         invalid_reasons: Vec::new(),
+        cancelled: false,
     }
 }
 
@@ -271,7 +273,8 @@ fn metric_reads_syscalls_per_message_for_a_counted_run() {
     let tight_records: Vec<RunRecord> = per_msg
         .iter()
         .zip(p99.iter())
-        .map(|(&pm, &p)| {
+        .zip(1u32..)
+        .map(|((&pm, &p), rep)| {
             let mut r = counted_run_record();
             r.syscalls.per_msg = Some(pm);
             r.latency_ns = Some(LatencySummary {
@@ -280,6 +283,7 @@ fn metric_reads_syscalls_per_message_for_a_counted_run() {
                 max: p,
                 histogram: vec![(p, 1)],
             });
+            r.repetition = rep;
             r
         })
         .collect();
@@ -288,9 +292,11 @@ fn metric_reads_syscalls_per_message_for_a_counted_run() {
     let wide_per_msg = [5.0, 6.0, 5.0, 5.0, 5.0];
     let wide_records: Vec<RunRecord> = wide_per_msg
         .iter()
-        .map(|&pm| {
+        .zip(1u32..)
+        .map(|(&pm, rep)| {
             let mut r = counted_run_record();
             r.syscalls.per_msg = Some(pm);
+            r.repetition = rep;
             r
         })
         .collect();
@@ -925,9 +931,11 @@ fn config_passes_requires_every_repetition_valid_and_within_spread() {
     let tight = [100.0, 102.0, 98.0, 101.0, 99.0];
     let tight_records: Vec<RunRecord> = tight
         .iter()
-        .map(|&v| {
+        .zip(1u32..)
+        .map(|(&v, rep)| {
             let mut r = valid_record(RunKind::Throughput);
             r.throughput_msgs_per_sec = Some(v);
+            r.repetition = rep;
             r
         })
         .collect();
@@ -945,9 +953,11 @@ fn config_passes_requires_every_repetition_valid_and_within_spread() {
     let wide = [100.0, 105.0, 110.0, 95.0, 100.0];
     let wide_records: Vec<RunRecord> = wide
         .iter()
-        .map(|&v| {
+        .zip(1u32..)
+        .map(|(&v, rep)| {
             let mut r = valid_record(RunKind::Throughput);
             r.throughput_msgs_per_sec = Some(v);
+            r.repetition = rep;
             r
         })
         .collect();
@@ -957,6 +967,205 @@ fn config_passes_requires_every_repetition_valid_and_within_spread() {
     // Wrong repetition count fails regardless of spread.
     let fewer: Vec<RunRecord> = tight_records.iter().take(4).cloned().collect();
     assert!(!config_passes(&fewer, 5, true));
+}
+
+#[test]
+fn config_passes_refuses_an_attempt_with_a_cancelled_run() {
+    // A run cut short by a signal is no repetition: one cancelled run
+    // among five otherwise-passing ones must fail the whole attempt.
+    let throughputs = [100.0, 102.0, 98.0, 101.0, 99.0];
+    let mut runs: Vec<RunRecord> = throughputs
+        .iter()
+        .zip(1u32..=5)
+        .map(|(&v, rep)| {
+            let mut r = valid_record(RunKind::Throughput);
+            r.throughput_msgs_per_sec = Some(v);
+            r.repetition = rep;
+            r
+        })
+        .collect();
+    assert!(config_passes(&runs, 5, true));
+
+    let mut cancelled = serde_json::to_value(&runs[4]).expect("serialize the run");
+    cancelled
+        .as_object_mut()
+        .expect("run is a JSON object")
+        .insert("cancelled".to_string(), serde_json::Value::Bool(true));
+    runs[4] = serde_json::from_value(cancelled).expect("deserialize the cancelled run");
+    assert!(!config_passes(&runs, 5, true));
+}
+
+#[test]
+fn config_passes_refuses_an_attempt_that_repeats_a_repetition() {
+    let throughputs = [100.0, 102.0, 98.0, 101.0, 99.0];
+
+    // Repetition 1 appears twice; repetition 5 never appears.
+    let bad_reps = [1u32, 1, 2, 3, 4];
+    let runs: Vec<RunRecord> = throughputs
+        .iter()
+        .zip(bad_reps.iter())
+        .map(|(&v, &rep)| {
+            let mut r = valid_record(RunKind::Throughput);
+            r.throughput_msgs_per_sec = Some(v);
+            r.repetition = rep;
+            r
+        })
+        .collect();
+    assert!(!config_passes(&runs, 5, true));
+
+    // Same metrics, repetitions 1..=5: the attempt is complete.
+    let runs: Vec<RunRecord> = throughputs
+        .iter()
+        .zip(1u32..=5)
+        .map(|(&v, rep)| {
+            let mut r = valid_record(RunKind::Throughput);
+            r.throughput_msgs_per_sec = Some(v);
+            r.repetition = rep;
+            r
+        })
+        .collect();
+    assert!(config_passes(&runs, 5, true));
+}
+
+#[test]
+fn config_passes_refuses_an_attempt_whose_repetition_numbers_are_not_one_to_n() {
+    // Five records can carry five distinct numbers that are still not the
+    // set `1..=5`: a gap above the count, or a zero-based run. Neither is a
+    // complete attempt, and neither is caught by counting the records.
+    let throughputs = [100.0, 102.0, 98.0, 101.0, 99.0];
+    let build = |reps: [u32; 5]| -> Vec<RunRecord> {
+        throughputs
+            .iter()
+            .zip(reps.iter())
+            .map(|(&v, &rep)| {
+                let mut r = valid_record(RunKind::Throughput);
+                r.throughput_msgs_per_sec = Some(v);
+                r.repetition = rep;
+                r
+            })
+            .collect()
+    };
+
+    // Repetition 5 never ran; a sixth one did.
+    assert!(!config_passes(&build([1, 2, 3, 4, 6]), 5, true));
+    // Zero-based: repetition 5 is missing again.
+    assert!(!config_passes(&build([0, 1, 2, 3, 4]), 5, true));
+    // The same five metrics over `1..=5`: the attempt is complete.
+    assert!(config_passes(&build([1, 2, 3, 4, 5]), 5, true));
+}
+
+#[test]
+fn config_passes_refuses_a_repetition_without_its_metric() {
+    let mut runs: Vec<RunRecord> = [100.0, 102.0, 98.0, 101.0]
+        .iter()
+        .zip(1u32..)
+        .map(|(&v, rep)| {
+            let mut r = valid_record(RunKind::Throughput);
+            r.throughput_msgs_per_sec = Some(v);
+            r.repetition = rep;
+            r
+        })
+        .collect();
+    let mut fifth = valid_record(RunKind::Throughput);
+    fifth.repetition = 5;
+    fifth.throughput_msgs_per_sec = None;
+    runs.push(fifth);
+    assert!(!config_passes(&runs, 5, true));
+
+    runs.last_mut().expect("fifth run").throughput_msgs_per_sec = Some(99.0);
+    assert!(config_passes(&runs, 5, true));
+}
+
+#[test]
+fn config_failure_names_the_gate_condition_that_refused_the_attempt() {
+    // The verdict `config_passes` reports is `config_failure(..).is_none()`,
+    // and the matrix prints the reason for an attempt that did not count:
+    // each gate condition must name itself there.
+    let build = |values: [Option<f64>; 5], reps: [u32; 5]| -> Vec<RunRecord> {
+        values
+            .iter()
+            .zip(reps.iter())
+            .map(|(&v, &rep)| {
+                let mut r = valid_record(RunKind::Throughput);
+                r.throughput_msgs_per_sec = v;
+                r.repetition = rep;
+                r
+            })
+            .collect()
+    };
+    let tight = [
+        Some(100.0),
+        Some(102.0),
+        Some(98.0),
+        Some(101.0),
+        Some(99.0),
+    ];
+    let reps = [1, 2, 3, 4, 5];
+
+    let passing = build(tight, reps);
+    assert_eq!(config_failure(&passing, 5, true), None);
+
+    // A cancelled run, read before the repetition set it also breaks.
+    let mut cancelled_runs = passing.clone();
+    let mut cancelled = serde_json::to_value(&cancelled_runs[4]).expect("serialize the run");
+    cancelled
+        .as_object_mut()
+        .expect("run is a JSON object")
+        .insert("cancelled".to_string(), serde_json::Value::Bool(true));
+    cancelled_runs[4] = serde_json::from_value(cancelled).expect("deserialize the cancelled run");
+    let reason = config_failure(&cancelled_runs, 5, true).expect("a cancelled run must fail");
+    assert!(
+        reason.contains("repetition 5 was cancelled"),
+        "reason must name the cancelled repetition: {reason}"
+    );
+
+    // An incomplete repetition set names the numbers it holds.
+    let reason =
+        config_failure(&build(tight, [1, 2, 3, 4, 6]), 5, true).expect("a gap must fail");
+    assert!(
+        reason.contains("[1, 2, 3, 4, 6]") && reason.contains("1..=5"),
+        "reason must name the repetitions and the set they are not: {reason}"
+    );
+
+    // An invalid run names its repetition and the stored reasons.
+    let mut invalid_runs = passing.clone();
+    invalid_runs[2].valid = false;
+    invalid_runs[2].invalid_reasons = vec!["stalled connections 3".to_string()];
+    let reason = config_failure(&invalid_runs, 5, true).expect("an invalid run must fail");
+    assert!(
+        reason.contains("repetition 3 is invalid") && reason.contains("stalled connections 3"),
+        "reason must name the invalid repetition and why: {reason}"
+    );
+
+    // A missing metric is read only under enforcement.
+    let no_metric = build(
+        [Some(100.0), Some(102.0), Some(98.0), Some(101.0), None],
+        reps,
+    );
+    let reason = config_failure(&no_metric, 5, true).expect("a missing metric must fail");
+    assert!(
+        reason.contains("repetition 5 has no"),
+        "reason must name the repetition without a metric: {reason}"
+    );
+    assert_eq!(config_failure(&no_metric, 5, false), None);
+
+    // A spread above the limit names the spread it measured.
+    let wide = build(
+        [
+            Some(100.0),
+            Some(105.0),
+            Some(110.0),
+            Some(95.0),
+            Some(100.0),
+        ],
+        reps,
+    );
+    let reason = config_failure(&wide, 5, true).expect("a wide spread must fail");
+    assert!(
+        reason.contains("spread") && reason.contains("0.15"),
+        "reason must name the spread it measured: {reason}"
+    );
+    assert_eq!(config_failure(&wide, 5, false), None);
 }
 
 #[test]

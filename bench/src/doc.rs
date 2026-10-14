@@ -74,8 +74,8 @@ pub enum DocError {
     /// contradict its raw observations.
     InconsistentRecord(String),
     /// A recorded-mode protocol invariant was violated: timing
-    /// constants, the cpu-set pair, the repetition set, the
-    /// matched-rate, or the counted counter evidence.
+    /// constants, the cpu-set pair, the matched-rate, or the
+    /// counted counter evidence.
     ProtocolViolation(String),
     /// A fixed-matrix configuration is missing or its highest attempt
     /// failed `config_passes(runs, 5, true)`.
@@ -356,26 +356,13 @@ pub fn render(records: &[RunRecord], smoke: bool) -> Result<String, DocError> {
         return Err(DocError::FailedConfigurations(failed_names));
     }
 
-    // Recorded-mode protocol invariants attached to one (or all) of the
-    // configurations: repetition set of the highest attempt, counter
-    // evidence on the 80 % latency rows, matched-rate alignment.
+    // Recorded-mode protocol invariants attached to one (or all) of
+    // the configurations: counter evidence on the counted rows only,
+    // one syscall method, matched-rate alignment. The repetition set is
+    // `config_passes`' job, already enforced above.
     if !smoke {
         for key in &expected {
             if let Some(runs) = by_key.get(key) {
-                let highest_attempt = runs.iter().map(|r| r.attempt).max().unwrap_or(0);
-                let attempt_runs: Vec<&RunRecord> =
-                    runs.iter().filter(|r| r.attempt == highest_attempt).collect();
-                let mut reps: Vec<u32> = attempt_runs.iter().map(|r| r.repetition).collect();
-                reps.sort_unstable();
-                let expected_reps: Vec<u32> = (1..=repetitions).collect();
-                if reps != expected_reps {
-                    return Err(DocError::ProtocolViolation(format!(
-                        "{}: repetition numbers {:?} != 1..={}",
-                        config_label(key),
-                        reps,
-                        repetitions
-                    )));
-                }
                 // Counter evidence is a property of every counted
                 // record, not only of the attempt the table publishes:
                 // a recorded session counts syscalls in all of them, so

@@ -701,22 +701,83 @@ pub fn metric(record: &RunRecord) -> Option<f64> {
     }
 }
 
-/// `true` when `runs` cover every repetition, every run is valid, and
-/// (when `enforce_spread` is set) the per-run metric spread is within
-/// [`SPREAD_LIMIT`].
-pub fn config_passes(runs: &[RunRecord], repetitions: u32, enforce_spread: bool) -> bool {
-    let rep = usize::try_from(repetitions).expect("repetitions fits in usize");
-    if runs.len() != rep {
-        return false;
+/// Why `runs` are not a complete attempt, in the order
+/// [`attempt_complete`] reads the conditions. `None` when they are one.
+/// The reason is the diagnostic half of the predicate: both
+/// [`attempt_complete`] and [`config_failure`] read it, so one
+/// definition decides the verdict and names it.
+fn incomplete_reason(runs: &[RunRecord], repetitions: u32) -> Option<String> {
+    if let Some(cancelled) = runs.iter().find(|r| r.cancelled) {
+        return Some(format!(
+            "repetition {} was cancelled",
+            cancelled.repetition
+        ));
     }
-    if runs.iter().any(|r| !r.valid) {
-        return false;
+    let mut reps: Vec<u32> = runs.iter().map(|r| r.repetition).collect();
+    reps.sort_unstable();
+    if !reps.iter().copied().eq(1..=repetitions) {
+        return Some(format!("repetitions {reps:?} are not 1..={repetitions}"));
+    }
+    None
+}
+
+/// `true` when `runs` hold the repetition numbers `1..=repetitions`,
+/// each exactly once, and none of them was cancelled — a run cut
+/// short by a signal is no repetition. A missing number is a
+/// repetition that never ran; a repeated one is a record that ran
+/// once and counts twice.
+pub fn attempt_complete(runs: &[RunRecord], repetitions: u32) -> bool {
+    incomplete_reason(runs, repetitions).is_none()
+}
+
+/// Which condition of [`config_passes`] refused `runs`, in the order
+/// that gate reads them. `None` when the configuration passes, so
+/// `config_failure(..).is_none()` *is* the verdict. A caller that only
+/// decides whether to retry reads [`config_passes`]; one that has to
+/// tell the operator why an attempt did not count reads this.
+pub fn config_failure(
+    runs: &[RunRecord],
+    repetitions: u32,
+    enforce_spread: bool,
+) -> Option<String> {
+    if let Some(reason) = incomplete_reason(runs, repetitions) {
+        return Some(reason);
+    }
+    if let Some(invalid) = runs.iter().find(|r| !r.valid) {
+        return Some(format!(
+            "repetition {} is invalid: {}",
+            invalid.repetition,
+            invalid.invalid_reasons.join("; ")
+        ));
     }
     if !enforce_spread {
-        return true;
+        return None;
     }
-    let metrics: Vec<f64> = runs.iter().filter_map(metric).collect();
-    spread(&metrics).is_some_and(|s| s <= SPREAD_LIMIT)
+    let mut metrics: Vec<f64> = Vec::with_capacity(runs.len());
+    for run in runs {
+        match metric(run) {
+            Some(value) => metrics.push(value),
+            None => {
+                return Some(format!(
+                    "repetition {} has no {:?} metric",
+                    run.repetition, run.kind
+                ))
+            }
+        }
+    }
+    match spread(&metrics) {
+        Some(s) if s <= SPREAD_LIMIT => None,
+        Some(s) => Some(format!("spread {s:.4} is above the {SPREAD_LIMIT} limit")),
+        None => Some("spread is undefined: the metric median is 0".to_string()),
+    }
+}
+
+/// `true` when `runs` are a complete attempt ([`attempt_complete`]),
+/// every run is valid, and (when `enforce_spread` is set) every run has
+/// its metric and their spread is within [`SPREAD_LIMIT`].
+/// [`config_failure`] names the condition that refused them.
+pub fn config_passes(runs: &[RunRecord], repetitions: u32, enforce_spread: bool) -> bool {
+    config_failure(runs, repetitions, enforce_spread).is_none()
 }
 
 /// Matched latency rates from the slowest throughput competitor:

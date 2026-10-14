@@ -7,8 +7,12 @@
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use nix::sys::signal::kill;
+use nix::unistd::{getpgid, getpgrp, getpid, getppid, setpgid, Pid};
 
 use bench::record::DeliveryReport;
 use bench::run_record::{
@@ -19,8 +23,42 @@ use bench::record::Timeline;
 use bench::record::Window;
 
 use bench::runner::{
-    capture_env, check_provenance, mosquitto_conf, run_one, HostSetup, RunSpec,
+    capture_env, check_provenance, head_sha, mosquitto_conf, run_one, HostSetup, RunSpec,
+    GIT_HEAD_TIMEOUT_SECS,
 };
+
+/// Slack a probe assertion grants [`GIT_HEAD_TIMEOUT_SECS`] for the kill,
+/// the reap and the test host's scheduling.
+const PROBE_RETURN_SLACK_SECS: u64 = 2;
+
+/// Poll interval of the probe assertions that wait for a pid file or for a
+/// killed process to disappear.
+const PROBE_POLL: Duration = Duration::from_millis(20);
+
+/// Lifetime of the background process a fake `git` wrapper leaves behind.
+/// Long enough to outlive the probe's whole deadline, so a descendant that
+/// is still alive afterwards is a cleanup failure and not an exit of its
+/// own.
+const DESCENDANT_SLEEP_SECS: u64 = GIT_HEAD_TIMEOUT_SECS * 10;
+
+/// The stdout read cap of `head_sha`, mirrored here because the runner
+/// keeps it private. `head_sha_stops_reading_at_its_stdout_cap` hides a
+/// SHA behind more bytes than this.
+const GIT_HEAD_STDOUT_CAP_BYTES: usize = 4096;
+
+/// Whitespace-only padding that fixture prints ahead of its SHA: one byte
+/// past the cap already puts the SHA out of the capped reader's reach, and
+/// the line's own newline makes the margin two.
+const CAP_PADDING_BYTES: usize = GIT_HEAD_STDOUT_CAP_BYTES + 1;
+
+/// Name of the fixture `head_sha_kills_a_git_that_left_its_process_group`
+/// re-runs this test binary on, as a fake `git` that calls `setpgid`.
+const GROUP_ESCAPE_FIXTURE: &str = "group_escape_fixture";
+
+/// Environment variable through which that test hands the fixture the path
+/// of the file the fixture records its move in. An inherited variable
+/// keeps the path out of the command line, which libtest parses.
+const GROUP_ESCAPE_FILE_ENV: &str = "BENCH_TEST_GROUP_ESCAPE_FILE";
 
 /// Build a HostSetup pointing at the real bench binary with default CPU
 /// sets, an empty tool list, and the supplied scratch_dir/cancel flag.
@@ -67,6 +105,78 @@ fn make_script(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
     }
     fs::set_permissions(&path, perms).expect("chmod");
     path
+}
+
+/// The pid a fake `git` wrapper wrote to `path`, or `None` while the file
+/// is missing or holds a partially written line. The terminating newline
+/// is written last, so a line without it is not complete yet.
+fn read_pid_file(path: &std::path::Path) -> Option<i32> {
+    let body = fs::read_to_string(path).ok()?;
+    body.strip_suffix('\n')?.trim().parse().ok()
+}
+
+/// The `pid pgid` pair a fake `git` wrote to `path` after moving itself
+/// out of the group it was spawned into, or `None` while the file is
+/// missing or holds a partially written line. The terminating newline is
+/// written last, so a line without it is not complete yet.
+fn read_pid_pgid_file(path: &std::path::Path) -> Option<(i32, i32)> {
+    let body = fs::read_to_string(path).ok()?;
+    let (pid, pgid) = body.strip_suffix('\n')?.trim().split_once(' ')?;
+    Some((pid.trim().parse().ok()?, pgid.trim().parse().ok()?))
+}
+
+/// The error `exec` reports for a script that some process still holds
+/// open for writing.
+const SCRIPT_BUSY: &str = "Text file busy";
+
+/// How long [`probe_script`] keeps retrying a fixture the kernel reports
+/// as busy before it hands the error to the test.
+const SCRIPT_BUSY_RETRY_SECS: u64 = 5;
+
+/// `head_sha` on a fixture script, with the time its last attempt took.
+///
+/// libtest runs these tests in parallel, and a child one test forks
+/// inherits every descriptor another test's [`make_script`] has open on
+/// its script until that child execs. An `exec` of the script inside that
+/// window fails with `ETXTBSY` — a statement about the fixture's start,
+/// not about the probe under test — so it is retried instead of asserted
+/// on. `head_sha` itself never opens the script for writing, so a busy
+/// script is always this race. The duration is of the last attempt alone,
+/// so a retry cannot push a probe past the bound it is asserted to keep.
+fn probe_script(
+    script: &std::path::Path,
+    cancel: &AtomicBool,
+) -> (Result<String, String>, Duration) {
+    let deadline = Instant::now() + Duration::from_secs(SCRIPT_BUSY_RETRY_SECS);
+    loop {
+        let started = Instant::now();
+        let result = head_sha(script, cancel);
+        let elapsed = started.elapsed();
+        let busy = result
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.contains(SCRIPT_BUSY));
+        if !busy || Instant::now() >= deadline {
+            return (result, elapsed);
+        }
+        std::thread::sleep(PROBE_POLL);
+    }
+}
+
+/// `true` when `pid` names a process that has terminated and that nothing
+/// has reaped yet. The group kill orphans the fake wrapper's descendant,
+/// and a zombie still answers `kill(pid, None)` with `Ok` until its new
+/// parent collects it — so this is what separates a killed descendant from
+/// one that is still running.
+fn is_zombie(pid: i32) -> bool {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // `comm` is parenthesised and can itself contain spaces and brackets,
+    // so the state field is the first token after the last ')'.
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .is_some_and(|state| state == "Z")
 }
 
 #[test]
@@ -292,6 +402,303 @@ fn provenance_check_refuses_a_stale_or_dirty_build() {
 
     // Matching and clean: Ok.
     check_provenance("abc1234", false, "abc1234").expect("matching build must pass");
+}
+
+#[test]
+fn head_sha_returns_the_trimmed_line_git_prints() {
+    let dir = temp_dir("head-sha-trim");
+    let a = make_script(
+        &dir,
+        "fake-git-a.sh",
+        "[ \"$*\" = \"rev-parse --short HEAD\" ] || exit 3\nprintf '  abc1234  \n'\n",
+    );
+    let b = make_script(
+        &dir,
+        "fake-git-b.sh",
+        "[ \"$*\" = \"rev-parse --short HEAD\" ] || exit 3\nprintf '\n\tdef5678\n'\n",
+    );
+
+    assert_eq!(
+        probe_script(&a, &AtomicBool::new(false)).0,
+        Ok("abc1234".to_string())
+    );
+    assert_eq!(
+        probe_script(&b, &AtomicBool::new(false)).0,
+        Ok("def5678".to_string())
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn head_sha_reports_a_git_that_exits_non_zero() {
+    let dir = temp_dir("head-sha-exit");
+    let bad = make_script(&dir, "fake-git-bad.sh", "exit 128\n");
+
+    let err = probe_script(&bad, &AtomicBool::new(false))
+        .0
+        .expect_err("a non-zero exit must fail");
+    assert!(
+        err.contains("git rev-parse exited with"),
+        "err must name the cause: {err}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn head_sha_refuses_a_git_that_prints_no_sha() {
+    // A `git` that exits 0 without naming a commit — and one that prints
+    // only blank lines, which the reader skips — leaves the probe no SHA.
+    // Returning an empty string there would put an empty `git_sha` into
+    // every record of the recorded set, so the probe must refuse instead.
+    let dir = temp_dir("head-sha-silent");
+    let silent = make_script(&dir, "fake-git-silent.sh", "exit 0\n");
+    let blank = make_script(&dir, "fake-git-blank.sh", "printf '\\n \\n\\t\\n'\n");
+
+    for script in [&silent, &blank] {
+        let err = probe_script(script, &AtomicBool::new(false))
+            .0
+            .expect_err("a git that prints no SHA must fail the probe");
+        assert!(
+            err.contains("git rev-parse printed no line"),
+            "err must name the missing line for {}: {err}",
+            script.display()
+        );
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn head_sha_refuses_a_git_that_prints_a_sha_and_holds_past_its_deadline() {
+    // The SHA arrives, then the executable keeps running well past the 5 s
+    // deadline. Its answer is outside the bound AC-15 promises, so the
+    // probe must report the deadline and not the printed SHA.
+    let dir = temp_dir("head-sha-late");
+    let late = make_script(&dir, "fake-git-late.sh", "printf 'abc1234\\n'\nsleep 8\n");
+
+    let err = probe_script(&late, &AtomicBool::new(false))
+        .0
+        .expect_err("an answer past the deadline must fail the probe");
+    assert!(
+        err.contains("git rev-parse did not answer within"),
+        "err must name the deadline: {err}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn head_sha_bounds_the_stdout_of_a_flooding_git() {
+    // `yes` prints non-blank lines as fast as the pipe takes them and never
+    // exits on its own, so an unbounded reader would grow its line queue for
+    // the whole 5 s deadline. The capped reader stops at
+    // GIT_HEAD_STDOUT_BYTES_MAX and closes the pipe, which this flooder
+    // reports as a SIGPIPE exit; a flooder that survived the closed pipe
+    // would still be refused at the deadline. Either way the probe refuses
+    // the executable within its bound and keeps the first line it read out
+    // of the answer. The deadline cannot tell the capped reader from an
+    // uncapped one — `head_sha_stops_reading_at_its_stdout_cap` is the
+    // assertion that can.
+    let dir = temp_dir("head-sha-flood");
+    let flood = make_script(
+        &dir,
+        "fake-git-flood.sh",
+        "printf 'abc1234\\n'\nexec yes noise\n",
+    );
+
+    let (result, elapsed) = probe_script(&flood, &AtomicBool::new(false));
+    let err = result.expect_err("a flooding git must fail the probe");
+    assert!(
+        err.contains("git rev-parse exited with")
+            || err.contains("git rev-parse did not answer within"),
+        "err must name the exit or the deadline: {err}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(GIT_HEAD_TIMEOUT_SECS + PROBE_RETURN_SLACK_SECS),
+        "the probe must return within its bound, took {elapsed:?}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn head_sha_stops_reading_at_its_stdout_cap() {
+    // The byte bound itself, observable: this fake `git` pads its stdout
+    // with one whitespace-only line longer than the read cap, prints the
+    // SHA behind that padding and exits 0. The reader skips whitespace-only
+    // lines, so the padding is bytes and nothing else — a reader without a
+    // cap would walk past it and answer `abc1234`, while the capped reader
+    // reaches its limit inside the padding and reports a `git` that printed
+    // no line. The refusal is therefore a statement about how much the
+    // probe read, which no deadline assertion can make.
+    let dir = temp_dir("head-sha-cap");
+    let padded = make_script(
+        &dir,
+        "fake-git-padded.sh",
+        &format!("printf '%{CAP_PADDING_BYTES}s\\n' ''\nprintf 'abc1234\\n'\n"),
+    );
+
+    let err = probe_script(&padded, &AtomicBool::new(false))
+        .0
+        .expect_err("a SHA behind more padding than the cap must not be read");
+    assert!(
+        err.contains("git rev-parse printed no line"),
+        "err must name the missing line: {err}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn head_sha_kills_the_descendant_of_a_refused_git_wrapper() {
+    // A `git` on PATH can be a wrapper script that leaves a background
+    // process behind. The descendant inherits the probe's stdout pipe, so a
+    // probe that signalled the wrapper's pid alone would report its refusal
+    // while the descendant kept running with the pipe open. The wrapper
+    // records its descendant's pid, the probe is cancelled as soon as that
+    // pid is readable, and the descendant must be gone once the probe
+    // returns.
+    let dir = temp_dir("head-sha-descendant");
+    let pid_file = dir.join("descendant.pid");
+    let wrapper = make_script(
+        &dir,
+        "fake-git-wrapper.sh",
+        &format!(
+            "sleep {DESCENDANT_SLEEP_SECS} &\nprintf '%s\\n' \"$!\" > {}\nwait\n",
+            pid_file.display()
+        ),
+    );
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_for_watcher = Arc::clone(&cancel);
+    let watched_pid_file = pid_file.clone();
+    let watcher = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(GIT_HEAD_TIMEOUT_SECS);
+        loop {
+            if let Some(pid) = read_pid_file(&watched_pid_file) {
+                cancel_for_watcher.store(true, Ordering::SeqCst);
+                return Some(pid);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(PROBE_POLL);
+        }
+    });
+
+    let err = probe_script(&wrapper, &cancel)
+        .0
+        .expect_err("a cancelled probe must fail");
+    let descendant = watcher
+        .join()
+        .expect("watcher thread")
+        .expect("the wrapper must record its descendant pid");
+    assert!(err.contains("cancelled"), "err must name the cause: {err}");
+
+    // The descendant is orphaned by the group kill and reaped by init, so
+    // the ESRCH can arrive a scheduling moment after the probe returned —
+    // and on a host whose init is slow to collect it, never: a zombie
+    // still answers `kill`, so the state of the pid decides.
+    let deadline = Instant::now() + Duration::from_secs(PROBE_RETURN_SLACK_SECS);
+    loop {
+        match kill(Pid::from_raw(descendant), None) {
+            Err(nix::errno::Errno::ESRCH) => break,
+            Ok(()) => {
+                if is_zombie(descendant) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "descendant pid {descendant} outlived the refused probe"
+                );
+            }
+            Err(e) => panic!("kill({descendant}, None) -> unexpected errno {e}"),
+        }
+        std::thread::sleep(PROBE_POLL);
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn head_sha_kills_a_git_that_left_its_process_group() {
+    // A `git` is free to call `setpgid` and join another group. The group
+    // signal of the cleanup then names a group the probe is no longer in,
+    // so only the signal addressed to the probe's own pid can end it — and
+    // without that signal the reap after it blocks forever. The fixture is
+    // this test binary re-run on [`GROUP_ESCAPE_FIXTURE`] (a shell cannot
+    // make the `setpgid` call, and an interpreter on `PATH` is not a
+    // prerequisite this suite declares): it moves itself into the test
+    // process's group, records the move, and then outlives the whole
+    // deadline. The probe must still return within its bound.
+    let dir = temp_dir("head-sha-group-escape");
+    let move_file = dir.join("moved.pgid");
+    let fixture_exe = std::env::current_exe().expect("the path of this test binary");
+    let escaper = make_script(
+        &dir,
+        "fake-git-escape.sh",
+        &format!(
+            "{GROUP_ESCAPE_FILE_ENV}='{}'\nexport {GROUP_ESCAPE_FILE_ENV}\n\
+             exec '{}' {GROUP_ESCAPE_FIXTURE} --exact --ignored\n",
+            move_file.display(),
+            fixture_exe.display()
+        ),
+    );
+
+    // The probe runs off the test thread, so a cleanup that blocks fails
+    // this assertion instead of hanging the whole suite.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let probe = escaper.clone();
+    let prober = std::thread::spawn(move || {
+        let _ = tx.send(probe_script(&probe, &AtomicBool::new(false)).0);
+    });
+    let err = rx
+        .recv_timeout(Duration::from_secs(
+            GIT_HEAD_TIMEOUT_SECS + PROBE_RETURN_SLACK_SECS,
+        ))
+        .expect("the probe must return within its bound")
+        .expect_err("a git that never answers must fail the probe");
+    prober.join().expect("probe thread");
+    assert!(
+        err.contains("git rev-parse did not answer within"),
+        "err must name the deadline: {err}"
+    );
+
+    // Without the move the group signal alone would have ended the probe,
+    // and the bound above would prove nothing about the pid signal.
+    let (pid, pgid) = read_pid_pgid_file(&move_file)
+        .expect("the fixture must record the group it moved into");
+    assert_ne!(
+        pgid, pid,
+        "the fixture must leave the group it leads for this test to mean anything"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The fake `git` of `head_sha_kills_a_git_that_left_its_process_group`,
+/// not a test of its own: `#[ignore]` keeps it out of the suite, and that
+/// test runs this binary with `--exact --ignored` to get a `git` that
+/// leaves the process group the probe spawned it into. Without
+/// [`GROUP_ESCAPE_FILE_ENV`] — a `--ignored` run of the whole suite — it
+/// returns at once and moves nothing.
+#[test]
+#[ignore = "fixture process of head_sha_kills_a_git_that_left_its_process_group"]
+fn group_escape_fixture() {
+    let Ok(move_file) = std::env::var(GROUP_ESCAPE_FILE_ENV) else {
+        return;
+    };
+    // The probe's parent is the test process that spawned the probe, so
+    // its group is a group in this session that the probe does not lead.
+    let parent_group = getpgid(Some(getppid())).expect("the parent's process group");
+    setpgid(Pid::from_raw(0), parent_group).expect("join the parent's process group");
+    // One write, with the terminating newline last, so a reader never
+    // sees half a line.
+    fs::write(&move_file, format!("{} {}\n", getpid(), getpgrp()))
+        .expect("record the move");
+    std::thread::sleep(Duration::from_secs(DESCENDANT_SLEEP_SECS));
 }
 
 #[test]
@@ -573,6 +980,7 @@ fn _shape_references() {
         harness_errors: Vec::new(),
         valid: false,
         invalid_reasons: Vec::new(),
+        cancelled: false,
     };
     let _ = DeliveryReport {
         delivered: 0,

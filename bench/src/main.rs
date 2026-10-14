@@ -422,9 +422,11 @@ fn dispatch_run(
     // tool), and until the handler is installed SIGTERM takes its default
     // action: the runner dies and the probe it started keeps running with
     // no diagnostic (AC-52). With the handler installed the runner stays
-    // alive, so `runner::tool_version`'s kill-and-reap always runs — at
-    // the latest after its own `TOOL_VERSION_TIMEOUT_SECS` deadline — and
-    // the flag is read again before the matrix starts.
+    // alive, so `runner::head_sha` and `runner::tool_version` reap their
+    // probe on every path, and kill a probe that has not exited on its own
+    // — `head_sha` as soon as it sees the flag, `tool_version` at the
+    // latest after its own `TOOL_VERSION_TIMEOUT_SECS` deadline — and the
+    // flag is read again before the matrix starts.
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_for_signal = cancel.clone();
     if let Err(e) = ctrlc::set_handler(move || {
@@ -437,7 +439,7 @@ fn dispatch_run(
     // Phase 3: recorded-profile provenance. A recorded run must come
     // from a clean binary that matches the working tree (AC-57).
     if profile == Profile::Recorded {
-        let head_sha = match head_sha() {
+        let head_sha = match runner::head_sha(Path::new("git"), &cancel) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("{e}");
@@ -700,24 +702,5 @@ fn write_atomically(path: &Path, body: &str) -> Result<(), String> {
         return Err(format!("write out: {e}"));
     }
     Ok(())
-}
-
-/// `git rev-parse --short HEAD` of the working tree the runner is
-/// about to invoke, for [`runner::check_provenance`].
-fn head_sha() -> Result<String, String> {
-    let out = std::process::Command::new("git")
-        .arg("rev-parse")
-        .arg("--short")
-        .arg("HEAD")
-        .output()
-        .map_err(|e| format!("git rev-parse: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "git rev-parse exited with {:?}: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
-        ));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 

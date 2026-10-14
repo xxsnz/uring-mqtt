@@ -194,6 +194,12 @@ pub struct RunRecord {
     pub harness_errors: Vec<String>,
     pub valid: bool,
     pub invalid_reasons: Vec<String>,
+    /// `true` when SIGINT/SIGTERM had already been received by the time the
+    /// run returned: the run may have been cut short, so it is no repetition
+    /// of its attempt. Set by `matrix::run_configs`; records written before
+    /// this field existed read as `false`.
+    #[serde(default)]
+    pub cancelled: bool,
 }
 
 fn server_lower(server: ServerKind) -> &'static str {

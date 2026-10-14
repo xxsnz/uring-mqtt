@@ -192,6 +192,7 @@ fn throughput_record(server: ServerKind, workers: u32, qos: u8, rep: u32) -> Run
         harness_errors: Vec::new(),
         valid: true,
         invalid_reasons: Vec::new(),
+        cancelled: false,
     }
 }
 
@@ -282,6 +283,7 @@ fn latency_record(
         harness_errors: Vec::new(),
         valid: true,
         invalid_reasons: Vec::new(),
+        cancelled: false,
     }
 }
 
@@ -359,6 +361,7 @@ fn connections_record(server: ServerKind, workers: u32, rep: u32) -> RunRecord {
         harness_errors: Vec::new(),
         valid: true,
         invalid_reasons: Vec::new(),
+        cancelled: false,
     }
 }
 
@@ -694,6 +697,34 @@ fn render_ignores_a_failed_earlier_attempt_of_a_retried_configuration() {
     );
 }
 
+/// AC-14: the uring 1-worker QoS 1 throughput configuration was
+/// interrupted mid-attempt-1 (its repetition 2 record is cancelled) and
+/// resumed as attempt 2, which completed and passed. `render` must read
+/// the resumed, passing attempt and must not refuse on account of the
+/// interrupted one still sitting on disk.
+#[test]
+fn render_publishes_a_configuration_resumed_after_an_interrupted_attempt() {
+    let mut records = full_recorded_set();
+    for r in &mut records {
+        if r.server == ServerKind::Uring
+            && r.workers == 1
+            && r.qos == Some(1)
+            && r.kind == RunKind::Throughput
+        {
+            r.attempt = 2;
+        }
+    }
+    let mut interrupted_rep1 = throughput_record(ServerKind::Uring, 1, 1, 1);
+    interrupted_rep1.attempt = 1;
+    records.push(interrupted_rep1);
+    let mut interrupted_rep2 = throughput_record(ServerKind::Uring, 1, 1, 2);
+    interrupted_rep2.attempt = 1;
+    interrupted_rep2.cancelled = true;
+    records.push(interrupted_rep2);
+
+    render(&records, false).expect("render ok");
+}
+
 #[test]
 fn render_refuses_an_inconsistent_record() {
     let mut records = full_recorded_set();
@@ -760,10 +791,13 @@ fn render_refuses_a_repeated_repetition_number() {
         .expect("a rep 5 throughput");
     target.repetition = 1;
     match render(&records, false) {
-        Err(DocError::ProtocolViolation(text)) => {
-            assert!(text.contains("repetition"), "text = {text}");
+        Err(DocError::FailedConfigurations(names)) => {
+            assert!(
+                names.iter().any(|n| n == "uring-w1-q1-throughput"),
+                "expected FailedConfigurations(uring-w1-q1-throughput), got {names:?}"
+            );
         }
-        other => panic!("expected ProtocolViolation(repetition), got {other:?}"),
+        other => panic!("expected FailedConfigurations(uring-w1-q1-throughput), got {other:?}"),
     }
 }
 
@@ -1569,6 +1603,50 @@ fn smoke_render_marks_a_failed_connections_configuration() {
     assert!(
         !doc.contains("| uring | 1000 |"),
         "a failed connections configuration rendered a figure:\n{doc}"
+    );
+}
+
+#[test]
+fn smoke_render_marks_a_configuration_that_repeats_a_repetition_failed() {
+    // Both records claim repetition 1: the attempt never completes its
+    // two-repetition smoke set, so the configuration counts as failed.
+    let records = vec![
+        connections_record(ServerKind::Uring, 1, 1),
+        connections_record(ServerKind::Uring, 1, 1),
+    ];
+    let doc = render(&records, true).expect("smoke render ok");
+    let table = doc
+        .split("## Connections per second — 1 worker(s)")
+        .nth(1)
+        .expect("1-worker connections table")
+        .split("\n## ")
+        .next()
+        .unwrap();
+    assert!(
+        table.contains("| uring | FAILED | FAILED |"),
+        "expected a FAILED conn/s row in:\n{table}"
+    );
+    assert!(
+        !table.contains("| uring | 1000 |"),
+        "a repeated-repetition configuration rendered a figure:\n{table}"
+    );
+
+    // Control: distinct repetitions 1 and 2 render a passing figure.
+    let control_records = vec![
+        connections_record(ServerKind::Uring, 1, 1),
+        connections_record(ServerKind::Uring, 1, 2),
+    ];
+    let control_doc = render(&control_records, true).expect("smoke render ok");
+    let control_table = control_doc
+        .split("## Connections per second — 1 worker(s)")
+        .nth(1)
+        .expect("1-worker connections table")
+        .split("\n## ")
+        .next()
+        .unwrap();
+    assert!(
+        control_table.contains("| uring | 1000 |"),
+        "expected a passing conn/s row in:\n{control_table}"
     );
 }
 

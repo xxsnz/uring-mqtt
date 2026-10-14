@@ -28,6 +28,9 @@ const SIGTERM_EXIT_TIMEOUT: Duration = Duration::from_secs(15);
 /// between runs, so the budget covers one smoke run's warmup, window and
 /// drain grace.
 const DROP_SIGTERM_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a recorded run may take to give up on a `git rev-parse` that
+/// never answers: the probe's own 5 s deadline plus process start-up.
+const GIT_PROBE_EXIT_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn temp_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -68,9 +71,14 @@ struct RunChild {
 
 impl RunChild {
     fn spawn(args: &[&str]) -> Self {
+        Self::spawn_with_env(args, &[])
+    }
+
+    fn spawn_with_env(args: &[&str], envs: &[(&str, &str)]) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_bench"))
             .arg("run")
             .args(args)
+            .envs(envs.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -196,6 +204,35 @@ fn read_children_pids(parent_pid: u32) -> Vec<u32> {
     text.split_whitespace()
         .filter_map(|s| s.parse::<u32>().ok())
         .collect()
+}
+
+/// A fake `git` on its own `PATH` entry, prepended to the real one, whose
+/// `#!/bin/sh` body is `body`. Returns the `PATH` value for `spawn_with_env`.
+fn fake_git(work: &std::path::Path, body: &str) -> String {
+    let dir = work.join("git-bin");
+    fs::create_dir_all(&dir).expect("create git-bin dir");
+    make_marker(&dir, "git", body);
+    format!("{}:{}", dir.display(), std::env::var("PATH").unwrap_or_default())
+}
+
+/// One `bench run --profile recorded` invocation with `marker` standing in
+/// for both the counter and mosquitto binaries, and `path` as its `PATH`.
+fn spawn_recorded(out_dir: &std::path::Path, marker: &std::path::Path, path: &str) -> RunChild {
+    RunChild::spawn_with_env(
+        &[
+            "--profile",
+            "recorded",
+            "--out",
+            out_dir.to_str().unwrap(),
+            "--syscalls",
+            "perf",
+            "--perf-bin",
+            marker.to_str().unwrap(),
+            "--mosquitto-bin",
+            marker.to_str().unwrap(),
+        ],
+        &[("PATH", path)],
+    )
 }
 
 fn wait_for_children(parent_pid: u32, want: usize, timeout: Duration) -> Vec<u32> {
@@ -667,4 +704,89 @@ fn sigterm_during_a_tool_probe_reaps_it_and_runs_nothing() {
     }
     let count = count_json(&out_dir);
     assert_eq!(count, 0, "a cancelled preflight runs nothing, got {count}");
+}
+
+/// A recorded run's provenance probe (`runner::head_sha`) must give up on a
+/// `git rev-parse` that never answers, within its own 5 s deadline, instead
+/// of blocking on `Command::output()` forever (AC-15).
+#[test]
+fn recorded_run_gives_up_on_a_git_probe_that_never_answers() {
+    let work = temp_dir("git-probe-hang");
+    let path = fake_git(
+        &work,
+        "echo $$ > \"$(dirname \"$0\")/git.pid\"\nexec sleep 30\n",
+    );
+    let marker = make_marker(&work, "marker.sh", "touch \"$(dirname \"$0\")/invoked\"\n");
+    let out_dir = work.join("out");
+    fs::create_dir_all(&out_dir).unwrap();
+
+    let mut run = spawn_recorded(&out_dir, &marker, &path);
+    assert_exited_with(&mut run, 1, GIT_PROBE_EXIT_TIMEOUT, "hung git probe");
+    let stderr_text = run.collect_stderr(Duration::from_secs(2)).join("\n");
+    assert!(
+        stderr_text.contains("did not answer within"),
+        "stderr must report the git probe timeout, got: {stderr_text}"
+    );
+    let pid_path = work.join("git-bin").join("git.pid");
+    let pid_text = fs::read_to_string(&pid_path).expect("read git.pid");
+    let pid: i32 = pid_text.trim().parse().expect("git.pid is a pid");
+    match kill(Pid::from_raw(pid), None) {
+        Err(nix::errno::Errno::ESRCH) => {}
+        Ok(()) => panic!("hung git pid {pid} still alive after probe timeout"),
+        Err(e) => panic!("kill({pid}, None) -> unexpected errno {e}"),
+    }
+    let count = count_json(&out_dir);
+    assert_eq!(
+        count, 0,
+        "a refused provenance probe writes nothing, got {count}"
+    );
+}
+
+/// SIGTERM during the provenance probe must kill and reap the hung `git`
+/// and report cancellation, never the probe's own timeout message (AC-16).
+#[test]
+fn sigterm_during_the_git_probe_reaps_it_and_runs_nothing() {
+    let work = temp_dir("git-probe-sigterm");
+    let path = fake_git(
+        &work,
+        "echo $$ > \"$(dirname \"$0\")/git.pid\"\nexec sleep 30\n",
+    );
+    let marker = make_marker(&work, "marker.sh", "touch \"$(dirname \"$0\")/invoked\"\n");
+    let out_dir = work.join("out");
+    fs::create_dir_all(&out_dir).unwrap();
+
+    let mut run = spawn_recorded(&out_dir, &marker, &path);
+    let parent = run.pid();
+    let pids = wait_for_children(parent, 1, CHILDREN_POLL_TIMEOUT);
+    assert!(
+        !pids.is_empty(),
+        "expected the git probe under runner pid {parent}"
+    );
+    let pid = i32::try_from(parent).expect("fits in i32");
+    kill(Pid::from_raw(pid), Signal::SIGTERM).expect("sigterm");
+    let status = run.wait_exit_code(SIGTERM_EXIT_TIMEOUT);
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "the runner must report the cancellation itself, got {status:?}"
+    );
+    let stderr_text = run.collect_stderr(Duration::from_secs(2)).join("\n");
+    assert!(
+        stderr_text.contains("cancelled"),
+        "stderr must report the cancellation, got: {stderr_text}"
+    );
+    assert!(
+        !stderr_text.contains("did not answer"),
+        "a cancelled probe must not also report its own timeout, got: {stderr_text}"
+    );
+    for child_pid in &pids {
+        let cpid = i32::try_from(*child_pid).expect("fits in i32");
+        match kill(Pid::from_raw(cpid), None) {
+            Err(nix::errno::Errno::ESRCH) => {}
+            Ok(()) => panic!("git probe pid {cpid} still alive after runner SIGTERM"),
+            Err(e) => panic!("kill({cpid}, None) -> unexpected errno {e}"),
+        }
+    }
+    let count = count_json(&out_dir);
+    assert_eq!(count, 0, "a cancelled probe runs nothing, got {count}");
 }

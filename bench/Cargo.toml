@@ -21,7 +21,7 @@ uring-mqtt = { path = "..", features = ["runtime-seam"] }
 hdrhistogram = { version = "7.6", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-nix = { version = "0.31", features = ["time", "signal", "fs", "feature"] }
+nix = { version = "0.31", features = ["time", "signal", "fs", "feature", "process"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "io-util", "macros", "sync"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 futures-util = { version = "0.3", features = ["sink"] }

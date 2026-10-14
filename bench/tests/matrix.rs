@@ -9,7 +9,6 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -25,7 +24,7 @@ use bench::run_record::{
     Build, ConfigKey, Counts, CpuSets, CpuUsage, DriverFds, Env, GeneratorErrors, LatencySummary,
     Profile, RunKind, RunRecord, ServerKind, SyscallMethod, Syscalls, SCHEMA_VERSION,
 };
-use bench::runner::{HostSetup, ProtocolConstants, RunSpec};
+use bench::runner::{HostSetup, ProtocolConstants, RunSpec, SCRATCH_REUSED_PREFIX};
 
 const ORIGIN_NS: u64 = 10_000_000_000;
 const WINDOW_START_NS: u64 = 12_000_000_000;
@@ -214,6 +213,7 @@ fn passing_record(
         harness_errors: Vec::new(),
         valid: true,
         invalid_reasons: Vec::new(),
+        cancelled: false,
     }
 }
 
@@ -243,12 +243,6 @@ fn temp_dir(tag: &str) -> PathBuf {
     dir
 }
 
-fn set_mode(path: &Path, mode: u32) {
-    let mut perms = fs::metadata(path).expect("stat").permissions();
-    perms.set_mode(mode);
-    fs::set_permissions(path, perms).expect("chmod");
-}
-
 #[test]
 fn servers_for_keeps_mosquitto_only_for_one_worker() {
     let servers = RECORDED_SERVERS.to_vec();
@@ -275,7 +269,7 @@ fn failed_configuration_is_rerun_and_failed_attempts_are_kept() {
     let cancel = AtomicBool::new(false);
     let spec = throughput_spec();
     let mut calls: Vec<(u32, u32)> = Vec::new();
-    let outcome = run_configs(&[spec], &constants, &out_dir, &scratch, &cancel, |s| {
+    let outcome = run_configs(&[spec], &HashMap::new(), &constants, &out_dir, &scratch, &cancel, |s| {
         // The record carries the attempt and repetition the seam passed,
         // so the assertions below read the executor's own inputs.
         calls.push((s.attempt, s.repetition));
@@ -342,6 +336,7 @@ fn each_configuration_advances_from_its_own_attempt() {
     let mut calls: Vec<(ServerKind, u32)> = Vec::new();
     let outcome = run_configs(
         &[first, second],
+        &HashMap::new(),
         &constants,
         &out_dir,
         &scratch,
@@ -366,11 +361,10 @@ fn each_configuration_advances_from_its_own_attempt() {
 }
 
 #[test]
-fn a_resumed_configuration_stops_at_the_absolute_attempt_cap() {
-    // Decision Q9 caps a configuration at three attempts in total. A
-    // config resumed at attempt 3 of 3 runs that attempt and then fails;
-    // counting three more rounds from the resumed number would give it
-    // five.
+fn a_resumed_configuration_runs_only_its_remaining_attempts() {
+    // Decision Q9 caps a configuration at three completed attempts. A
+    // config resumed with one attempt left runs attempt 3 once and then
+    // fails.
     let constants = ProtocolConstants {
         warmup_secs: WARMUP_SECS,
         window_secs: WINDOW_SECS,
@@ -384,14 +378,23 @@ fn a_resumed_configuration_stops_at_the_absolute_attempt_cap() {
     let cancel = AtomicBool::new(false);
     let mut spec = throughput_spec();
     spec.attempt = 3;
+    let key = passing_record(&spec, 1, 3, 100).key();
     let mut attempts: Vec<u32> = Vec::new();
-    let outcome = run_configs(&[spec], &constants, &out_dir, &scratch, &cancel, |s| {
-        attempts.push(s.attempt);
-        let mut rec = passing_record(s, s.repetition, s.attempt, 100);
-        rec.valid = false;
-        rec.invalid_reasons.push("test-marker".to_string());
-        rec
-    })
+    let outcome = run_configs(
+        &[spec],
+        &HashMap::from([(key, 1)]),
+        &constants,
+        &out_dir,
+        &scratch,
+        &cancel,
+        |s| {
+            attempts.push(s.attempt);
+            let mut rec = passing_record(s, s.repetition, s.attempt, 100);
+            rec.valid = false;
+            rec.invalid_reasons.push("test-marker".to_string());
+            rec
+        },
+    )
     .expect("run_configs");
 
     assert_eq!(attempts, vec![3, 3], "attempt 3 only, both repetitions");
@@ -403,9 +406,8 @@ fn a_resumed_configuration_stops_at_the_absolute_attempt_cap() {
 fn cancellation_stops_scheduling_and_leaves_the_resume_budget() {
     // SIGTERM during a round must not charge the repetitions and attempts
     // it never started. Running them out would write a cancellation record
-    // for attempts 1 to 3, and `resume_plan` would then ask for attempt 4,
-    // which the absolute cap refuses — the interruption would cost the
-    // configuration its whole budget.
+    // for attempts 1 to 3, and every one of them would complete an attempt
+    // — the interruption would cost the configuration its whole budget.
     let constants = ProtocolConstants {
         warmup_secs: WARMUP_SECS,
         window_secs: WINDOW_SECS,
@@ -419,7 +421,7 @@ fn cancellation_stops_scheduling_and_leaves_the_resume_budget() {
     let cancel = AtomicBool::new(false);
     let spec = throughput_spec();
     let mut attempts: Vec<(u32, u32)> = Vec::new();
-    let err = run_configs(&[spec], &constants, &out_dir, &scratch, &cancel, |s| {
+    let err = run_configs(&[spec], &HashMap::new(), &constants, &out_dir, &scratch, &cancel, |s| {
         attempts.push((s.attempt, s.repetition));
         // The signal arrives while the first repetition runs, so that run
         // produces an invalid record and nothing after it is dispatched.
@@ -444,8 +446,54 @@ fn cancellation_stops_scheduling_and_leaves_the_resume_budget() {
     let plan = resume_plan(&existing, &constants);
     assert_eq!(
         plan.get(&existing[0].key()),
-        Some(&ResumeState::NextAttempt(2)),
+        Some(&ResumeState::NextAttempt { attempt: 2, remaining: 3 }),
         "resume must continue at attempt 2, not past the cap"
+    );
+}
+
+#[test]
+fn a_run_cut_short_by_a_signal_is_recorded_as_cancelled() {
+    // The run cut short by the signal must carry `"cancelled": true` on
+    // disk; a run that finished before the signal arrived must carry
+    // `"cancelled": false`, not the absence of the key.
+    let constants = ProtocolConstants {
+        warmup_secs: WARMUP_SECS,
+        window_secs: WINDOW_SECS,
+        repetitions: 2,
+        drain_grace_secs: 2,
+        max_config_attempts: 3,
+        enforce_spread: false,
+    };
+    let out_dir = temp_dir("cancel-flag");
+    let scratch = temp_dir("cancel-flag-scratch");
+    let cancel = AtomicBool::new(false);
+    let mut tokio = throughput_spec();
+    tokio.server = ServerKind::Tokio;
+    let specs = [throughput_spec(), tokio];
+    run_configs(&specs, &HashMap::new(), &constants, &out_dir, &scratch, &cancel, |s| {
+        if s.server == ServerKind::Tokio {
+            cancel.store(true, Ordering::SeqCst);
+        }
+        passing_record(s, s.repetition, s.attempt, 100)
+    })
+    .expect_err("cancelled");
+
+    let uring_text = fs::read_to_string(out_dir.join("uring-w1-q1-throughput-a1-r1.json"))
+        .expect("read the uring record");
+    let uring: serde_json::Value = serde_json::from_str(&uring_text).expect("parse uring record");
+    assert_eq!(
+        uring["cancelled"],
+        serde_json::Value::Bool(false),
+        "the run that finished before the signal is not cancelled"
+    );
+
+    let tokio_text = fs::read_to_string(out_dir.join("tokio-w1-q1-throughput-a1-r1.json"))
+        .expect("read the tokio record");
+    let tokio: serde_json::Value = serde_json::from_str(&tokio_text).expect("parse tokio record");
+    assert_eq!(
+        tokio["cancelled"],
+        serde_json::Value::Bool(true),
+        "the run in progress when the signal arrived is cancelled"
     );
 }
 
@@ -470,24 +518,30 @@ fn a_record_that_cannot_be_persisted_drops_its_scratch_directory() {
     let spec = throughput_spec();
     // The record's own name is the scratch directory's name, so build the
     // record the executor will return first and derive the directory from
-    // it. The run's raw evidence stands in for what `run_one` leaves there.
+    // it. The stub creates the run's scratch directory and raw evidence
+    // during the run, as `run_one` does.
     let mut planned = spec.clone();
     planned.repetition = 1;
     let stem = passing_record(&planned, 1, 1, 100)
         .file_name()
         .replace(".json", "");
     let run_scratch = scratch.join(&stem);
-    fs::create_dir_all(&run_scratch).expect("create run scratch");
-    fs::write(run_scratch.join("gen.json"), b"{}").expect("write evidence");
-    // A read-only output directory makes every record write fail the way a
-    // full filesystem would, while `create_dir_all` on it still succeeds.
-    set_mode(&out_dir, 0o500);
 
-    let err = run_configs(&[spec], &constants, &out_dir, &scratch, &cancel, |s| {
-        passing_record(s, s.repetition, s.attempt, 100)
+    let err = run_configs(&[spec], &HashMap::new(), &constants, &out_dir, &scratch, &cancel, |s| {
+        fs::create_dir_all(&run_scratch).expect("create run scratch");
+        fs::write(run_scratch.join("gen.json"), b"{}").expect("write evidence");
+        let record = passing_record(s, s.repetition, s.attempt, 100);
+        // A temporary record planted while the run is in progress — after
+        // `attempt_in_use` inspected the attempt and before the write —
+        // fails the write the way a full filesystem would. `create_new`
+        // refuses it whatever the test runner's privileges, where a
+        // read-only output directory would still let a `CAP_DAC_OVERRIDE`
+        // runner through.
+        fs::write(out_dir.join(format!("{}.tmp", record.file_name())), b"planted")
+            .expect("plant the temporary record");
+        record
     })
     .expect_err("run_configs must report the write failure");
-    set_mode(&out_dir, 0o700);
 
     assert!(
         err.contains(&stem),
@@ -497,6 +551,157 @@ fn a_record_that_cannot_be_persisted_drops_its_scratch_directory() {
         !run_scratch.exists(),
         "the unpersisted run's scratch directory must be gone, {} still there",
         run_scratch.display()
+    );
+}
+
+#[test]
+fn a_run_that_did_not_create_its_scratch_directory_leaves_it_alone() {
+    // Two runs can inspect the same empty output directory before either
+    // creates anything, so `attempt_in_use` passes for both. Only one wins
+    // `run_one`'s exclusive `create_dir`; the loser's record carries the
+    // reuse marker, and its own failed write must not take the winner's
+    // raw evidence with it.
+    let constants = ProtocolConstants {
+        warmup_secs: WARMUP_SECS,
+        window_secs: WINDOW_SECS,
+        repetitions: 2,
+        drain_grace_secs: 2,
+        max_config_attempts: 3,
+        enforce_spread: false,
+    };
+    let work = temp_dir("scratch-not-ours");
+    let out_dir = work.join("out");
+    let scratch = work.join("scratch");
+    fs::create_dir_all(&out_dir).expect("create out dir");
+    let cancel = AtomicBool::new(false);
+    let spec = throughput_spec();
+    let mut planned = spec.clone();
+    planned.repetition = 1;
+    let stem = passing_record(&planned, 1, 1, 100)
+        .file_name()
+        .replace(".json", "");
+    let run_scratch = scratch.join(&stem);
+
+    let err = run_configs(&[spec], &HashMap::new(), &constants, &out_dir, &scratch, &cancel, |s| {
+        // The winning run creates the directory and its evidence while this
+        // one is in progress, which is why this one reports the reuse.
+        fs::create_dir_all(&run_scratch).expect("create the other run's scratch");
+        fs::write(run_scratch.join("gen.json"), b"{}").expect("write evidence");
+        let mut record = passing_record(s, s.repetition, s.attempt, 100);
+        record
+            .harness_errors
+            .push(format!("{SCRATCH_REUSED_PREFIX}{}", run_scratch.display()));
+        // The winner publishes its own temporary record for this attempt
+        // while this run is in progress, so this run's write collides.
+        // `create_new` refuses it whatever the test runner's privileges,
+        // where a read-only output directory would still let a
+        // `CAP_DAC_OVERRIDE` runner through.
+        fs::write(out_dir.join(format!("{}.tmp", record.file_name())), b"planted")
+            .expect("plant the winner's temporary record");
+        record
+    })
+    .expect_err("run_configs must report the write failure");
+
+    assert!(
+        err.contains(&stem),
+        "the write failure names the record, got {err}"
+    );
+    assert!(
+        run_scratch.join("gen.json").exists(),
+        "the other run's raw evidence must survive, {} is gone",
+        run_scratch.join("gen.json").display()
+    );
+}
+
+#[test]
+fn a_planted_temporary_record_is_refused_and_its_target_left_intact() {
+    let constants = ProtocolConstants {
+        warmup_secs: WARMUP_SECS,
+        window_secs: WINDOW_SECS,
+        repetitions: 2,
+        drain_grace_secs: 2,
+        max_config_attempts: 3,
+        enforce_spread: false,
+    };
+    let work = temp_dir("tmp-planted");
+    let out_dir = work.join("out");
+    let scratch = work.join("scratch");
+    fs::create_dir_all(&out_dir).expect("create out dir");
+    let cancel = AtomicBool::new(false);
+    let spec = throughput_spec();
+    let mut planned = spec.clone();
+    planned.repetition = 1;
+    let name = passing_record(&planned, 1, 1, 100).file_name();
+    let victim = work.join("victim.txt");
+    fs::write(&victim, b"original").expect("write victim");
+    let tmp = out_dir.join(format!("{name}.tmp"));
+
+    let err = run_configs(&[spec], &HashMap::new(), &constants, &out_dir, &scratch, &cancel, |s| {
+        std::os::unix::fs::symlink(&victim, &tmp).expect("plant tmp");
+        passing_record(s, s.repetition, s.attempt, 100)
+    })
+    .expect_err("run_configs must refuse the planted temporary record");
+
+    assert!(
+        err.contains("already exists; refusing to write through it"),
+        "error must name the refusal, got {err}"
+    );
+    assert_eq!(
+        fs::read(&victim).expect("read victim"),
+        b"original",
+        "the symlink target must stay byte-for-byte unchanged"
+    );
+    assert!(
+        fs::symlink_metadata(&tmp)
+            .expect("stat tmp")
+            .file_type()
+            .is_symlink(),
+        "the planted symlink must stay in place"
+    );
+    assert!(
+        !out_dir.join(&name).exists(),
+        "no final record must be published"
+    );
+}
+
+#[test]
+fn an_existing_record_is_refused_and_left_intact() {
+    let constants = ProtocolConstants {
+        warmup_secs: WARMUP_SECS,
+        window_secs: WINDOW_SECS,
+        repetitions: 2,
+        drain_grace_secs: 2,
+        max_config_attempts: 3,
+        enforce_spread: false,
+    };
+    let work = temp_dir("record-existing");
+    let out_dir = work.join("out");
+    let scratch = work.join("scratch");
+    fs::create_dir_all(&out_dir).expect("create out dir");
+    let cancel = AtomicBool::new(false);
+    let spec = throughput_spec();
+    let mut planned = spec.clone();
+    planned.repetition = 1;
+    let name = passing_record(&planned, 1, 1, 100).file_name();
+
+    let err = run_configs(&[spec], &HashMap::new(), &constants, &out_dir, &scratch, &cancel, |s| {
+        fs::write(out_dir.join(&name), b"existing").expect("plant record");
+        passing_record(s, s.repetition, s.attempt, 100)
+    })
+    .expect_err("run_configs must refuse to overwrite the existing record");
+
+    assert!(
+        err.contains("already exists; refusing to overwrite it"),
+        "error must name the refusal, got {err}"
+    );
+    assert_eq!(
+        fs::read(out_dir.join(&name)).expect("read record"),
+        b"existing",
+        "the existing record must stay byte-for-byte unchanged"
+    );
+    assert!(
+        !out_dir.join(format!("{name}.tmp")).exists(),
+        "no leftover temporary file must remain"
     );
 }
 
@@ -641,7 +846,7 @@ fn resume_plan_skips_passed_configurations_and_continues_attempt_numbers() {
     a2.repetition = 2;
     write_record(&out_dir, &a);
     write_record(&out_dir, &a2);
-    // Config B: attempt 1, rep 1 valid, rep 2 invalid -> NextAttempt(2)
+    // Config B: attempt 1, rep 1 valid, rep 2 invalid -> NextAttempt { attempt: 2, remaining: 2 }
     let b = make_record(
         Profile::Smoke,
         ServerKind::Tokio,
@@ -660,7 +865,7 @@ fn resume_plan_skips_passed_configurations_and_continues_attempt_numbers() {
     b2.invalid_reasons.push("test-marker".to_string());
     write_record(&out_dir, &b);
     write_record(&out_dir, &b2);
-    // Config C: attempt 2, rep 1 only (interrupted) -> NextAttempt(3)
+    // Config C: attempt 2, rep 1 only (interrupted) -> NextAttempt { attempt: 3, remaining: 3 }
     let c = make_record(
         Profile::Smoke,
         ServerKind::Uring,
@@ -678,8 +883,8 @@ fn resume_plan_skips_passed_configurations_and_continues_attempt_numbers() {
     let existing = read_records(&out_dir).expect("read_records");
     let plan = resume_plan(&existing, &constants);
     assert_eq!(plan.get(&a.key()), Some(&ResumeState::Passed));
-    assert_eq!(plan.get(&b.key()), Some(&ResumeState::NextAttempt(2)));
-    assert_eq!(plan.get(&c.key()), Some(&ResumeState::NextAttempt(3)));
+    assert_eq!(plan.get(&b.key()), Some(&ResumeState::NextAttempt { attempt: 2, remaining: 2 }));
+    assert_eq!(plan.get(&c.key()), Some(&ResumeState::NextAttempt { attempt: 3, remaining: 3 }));
 }
 
 #[test]
@@ -1038,9 +1243,9 @@ fn check_request_refuses_a_matrix_no_server_can_run() {
 #[test]
 fn resume_plan_saturates_an_attempt_number_it_cannot_advance() {
     // `attempt` deserializes any `u32`. A record carrying one this runner
-    // never produces must not overflow the resume decision; the saturated
-    // successor is past `max_config_attempts`, so `run_configs` leaves the
-    // configuration unrun and failed.
+    // never produces must not overflow the resume decision; an attempt
+    // that cannot advance gets `remaining: 0`, so `run_configs` leaves
+    // the configuration unrun and failed.
     let constants = ProtocolConstants {
         warmup_secs: WARMUP_SECS,
         window_secs: WINDOW_SECS,
@@ -1064,7 +1269,10 @@ fn resume_plan_saturates_an_attempt_number_it_cannot_advance() {
     let plan = resume_plan(std::slice::from_ref(&rec), &constants);
     assert_eq!(
         plan.get(&rec.key()),
-        Some(&ResumeState::NextAttempt(u32::MAX))
+        Some(&ResumeState::NextAttempt {
+            attempt: u32::MAX,
+            remaining: 0,
+        })
     );
 }
 
@@ -1480,6 +1688,722 @@ fn run_matrix_with_resumes_a_counted_configuration_at_its_next_attempt() {
     );
 }
 
+/// An invalid record whose stored verdict matches what `reconcile`
+/// recomputes for it (one duplicate), the shape `check_resume`'s
+/// recomputation requires of a seeded fixture. Repetition and attempt
+/// come from `spec`, so a completed, failed attempt can be seeded by
+/// calling this once per repetition.
+fn failing_record(spec: &RunSpec) -> RunRecord {
+    let mut rec = passing_record(spec, spec.repetition, spec.attempt, 100);
+    rec.counts.duplicates = 1;
+    rec.invalid_reasons = reconcile(&rec);
+    rec.valid = rec.invalid_reasons.is_empty();
+    assert!(
+        !rec.valid,
+        "fixture must be a failed attempt, reasons {:?}",
+        rec.invalid_reasons
+    );
+    rec
+}
+
+/// AC-12: a configuration interrupted mid-session — one server stopped
+/// between its repetitions, the other cut short during one — resumes
+/// every configuration it cut short at the next attempt number, not only
+/// the one that was running when the signal arrived.
+#[test]
+fn an_interrupted_session_resumes_every_configuration_it_cut_short() {
+    let dir = temp_dir("interrupted-session");
+    let spec = MatrixSpec {
+        profile: Profile::Smoke,
+        servers: vec![ServerKind::Uring, ServerKind::Tokio],
+        workers: vec![1],
+        qos: vec![1],
+        out_dir: dir.join("out"),
+        resume: false,
+    };
+    let host = stub_host(&dir, SyscallMethod::None);
+    let cancel = host.cancel.clone();
+
+    let err = run_matrix_with(&spec, &host, |s| {
+        if s.kind == RunKind::Throughput && s.server == ServerKind::Tokio && s.repetition == 1 {
+            cancel.store(true, Ordering::SeqCst);
+        }
+        passing_record(s, s.repetition, s.attempt, 100)
+    })
+    .expect_err("an interrupted session must return cancelled");
+    assert_eq!(err, "cancelled");
+
+    // The records the interrupted session published, as a later process
+    // reads them: the attempt it cut short stays on disk under its own
+    // name, so the resumed attempt must not land on these bytes.
+    let out_dir = spec.out_dir.clone();
+    let before: Vec<(PathBuf, Vec<u8>)> = ["uring", "tokio"]
+        .into_iter()
+        .map(|server| out_dir.join(format!("{server}-w1-q1-throughput-a1-r1.json")))
+        .map(|path| {
+            let bytes = fs::read(&path)
+                .unwrap_or_else(|e| panic!("{}: must exist after phase 1: {e}", path.display()));
+            (path, bytes)
+        })
+        .collect();
+
+    cancel.store(false, Ordering::SeqCst);
+    let mut resumed_spec = spec.clone();
+    resumed_spec.resume = true;
+    let mut dispatched: Vec<(ServerKind, u32, u32)> = Vec::new();
+    let outcome = run_matrix_with(&resumed_spec, &host, |s| {
+        if s.kind == RunKind::Throughput {
+            dispatched.push((s.server, s.attempt, s.repetition));
+        }
+        passing_record(s, s.repetition, s.attempt, 100)
+    })
+    .expect("resumed run_matrix_with");
+
+    assert_eq!(
+        dispatched,
+        vec![
+            (ServerKind::Uring, 2, 1),
+            (ServerKind::Tokio, 2, 1),
+            (ServerKind::Uring, 2, 2),
+            (ServerKind::Tokio, 2, 2),
+        ]
+    );
+    assert!(outcome.failed.is_empty(), "failed={:?}", outcome.failed);
+
+    // What the resumed attempt left on disk, which is what a later
+    // process actually reads: one record per server and repetition, each
+    // naming attempt 2 and none of them cancelled.
+    for server in ["uring", "tokio"] {
+        for rep in 1..=2u32 {
+            let path = out_dir.join(format!("{server}-w1-q1-throughput-a2-r{rep}.json"));
+            let text = fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{}: must exist after resume: {e}", path.display()));
+            let value: serde_json::Value =
+                serde_json::from_str(&text).expect("parse the resumed record");
+            assert_eq!(value["attempt"], 2, "{}: attempt", path.display());
+            assert_eq!(value["repetition"], rep, "{}: repetition", path.display());
+            assert_eq!(
+                value["cancelled"],
+                serde_json::Value::Bool(false),
+                "{}: cancelled",
+                path.display()
+            );
+        }
+    }
+    // The interrupted attempt's records are untouched by the resume.
+    for (path, bytes) in &before {
+        let now = fs::read(path).expect("read the preserved record");
+        assert_eq!(now, *bytes, "{}: must be unchanged", path.display());
+    }
+}
+
+/// AC-12, AC-13: a configuration cancelled during the last repetition of
+/// its last permitted attempt still has an unspent attempt once its
+/// interrupted one is recognized as never having completed, and resumes
+/// at the next attempt number rather than being left failed.
+#[test]
+fn a_run_cancelled_in_the_last_attempt_resumes_with_its_unspent_attempt() {
+    let dir = temp_dir("cancelled-last-attempt");
+    let out_dir = dir.join("out");
+    fs::create_dir_all(&out_dir).expect("create out dir");
+    let mut before: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+    for attempt in 1..=2u32 {
+        for rep in 1..=5u32 {
+            let seed_spec = RunSpec {
+                profile: Profile::Recorded,
+                server: ServerKind::Uring,
+                workers: 1,
+                qos: Some(1),
+                kind: RunKind::Throughput,
+                rate_fraction_pct: None,
+                offered_rate: None,
+                repetition: rep,
+                attempt,
+            };
+            let rec = failing_record(&seed_spec);
+            let path = out_dir.join(rec.file_name());
+            write_record(&out_dir, &rec);
+            before.push((path.clone(), fs::read(&path).expect("read seeded record")));
+        }
+    }
+
+    let spec = MatrixSpec {
+        profile: Profile::Recorded,
+        servers: vec![ServerKind::Uring],
+        workers: vec![1],
+        qos: vec![1],
+        out_dir: out_dir.clone(),
+        resume: true,
+    };
+    let host = stub_host(&dir, SyscallMethod::None);
+    let cancel = host.cancel.clone();
+
+    let err = run_matrix_with(&spec, &host, |s| {
+        if s.kind == RunKind::Throughput {
+            let mut rec = passing_record(s, s.repetition, s.attempt, 100);
+            rec.invalid_reasons = reconcile(&rec);
+            rec.valid = rec.invalid_reasons.is_empty();
+            if s.attempt == 3 && s.repetition == 5 {
+                cancel.store(true, Ordering::SeqCst);
+            }
+            rec
+        } else {
+            passing_record(s, s.repetition, s.attempt, 100)
+        }
+    })
+    .expect_err("cancellation in the last attempt's last repetition must return cancelled");
+    assert_eq!(err, "cancelled");
+
+    for rep in 1..=5u32 {
+        let path = out_dir.join(format!("uring-w1-q1-throughput-a3-r{rep}.json"));
+        assert!(path.exists(), "{}: must exist after phase 1", path.display());
+        let text = fs::read_to_string(&path).expect("read attempt 3 record");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("parse attempt 3 record");
+        let want = serde_json::Value::Bool(rep == 5);
+        assert_eq!(value["cancelled"], want, "repetition {rep} cancelled flag");
+    }
+
+    cancel.store(false, Ordering::SeqCst);
+    let mut dispatched: Vec<(u32, u32)> = Vec::new();
+    let outcome = run_matrix_with(&spec, &host, |s| {
+        if s.kind == RunKind::Throughput {
+            dispatched.push((s.attempt, s.repetition));
+            failing_record(s)
+        } else {
+            passing_record(s, s.repetition, s.attempt, 100)
+        }
+    })
+    .expect("resumed run_matrix_with");
+
+    assert_eq!(
+        dispatched,
+        (1..=5u32).map(|rep| (4, rep)).collect::<Vec<_>>()
+    );
+    let key = ConfigKey {
+        server: ServerKind::Uring,
+        workers: 1,
+        qos: Some(1),
+        kind: RunKind::Throughput,
+        rate_fraction_pct: None,
+    };
+    assert!(
+        outcome.failed.contains(&key),
+        "failed={:?}",
+        outcome.failed
+    );
+    for (path, bytes) in &before {
+        let now = fs::read(path).expect("read preserved record");
+        assert_eq!(now, *bytes, "{}: must be unchanged", path.display());
+    }
+}
+
+/// AC-13 (regression guard): a configuration whose completed attempts
+/// already spent its whole `max_config_attempts` budget stays failed and
+/// is never dispatched again.
+#[test]
+fn a_spent_configuration_is_not_resumed() {
+    let dir = temp_dir("spent-configuration");
+    let out_dir = dir.join("out");
+    fs::create_dir_all(&out_dir).expect("create out dir");
+    for rep in 1..=2u32 {
+        let seed_spec = RunSpec {
+            profile: Profile::Smoke,
+            server: ServerKind::Uring,
+            workers: 1,
+            qos: Some(1),
+            kind: RunKind::Throughput,
+            rate_fraction_pct: None,
+            offered_rate: None,
+            repetition: rep,
+            attempt: 1,
+        };
+        let rec = failing_record(&seed_spec);
+        write_record(&out_dir, &rec);
+    }
+
+    let spec = MatrixSpec {
+        profile: Profile::Smoke,
+        servers: vec![ServerKind::Uring],
+        workers: vec![1],
+        qos: vec![1],
+        out_dir,
+        resume: true,
+    };
+    let host = stub_host(&dir, SyscallMethod::None);
+    let mut dispatched: Vec<(u32, u32)> = Vec::new();
+    let outcome = run_matrix_with(&spec, &host, |s| {
+        if s.kind == RunKind::Throughput {
+            dispatched.push((s.attempt, s.repetition));
+        }
+        passing_record(s, s.repetition, s.attempt, 100)
+    })
+    .expect("run_matrix_with");
+
+    assert!(
+        dispatched.is_empty(),
+        "a spent configuration must not be dispatched, got {dispatched:?}"
+    );
+    let key = ConfigKey {
+        server: ServerKind::Uring,
+        workers: 1,
+        qos: Some(1),
+        kind: RunKind::Throughput,
+        rate_fraction_pct: None,
+    };
+    assert!(
+        outcome.failed.contains(&key),
+        "failed={:?}",
+        outcome.failed
+    );
+}
+
+/// AC-19: an attempt number that cannot advance past `u32::MAX` is still
+/// resumed exactly once, at `u32::MAX`, rather than being refused as past
+/// the absolute attempt cap.
+#[test]
+fn an_attempt_number_that_cannot_advance_is_resumed_only_once() {
+    let dir = temp_dir("attempt-cannot-advance");
+    let out_dir = dir.join("out");
+    fs::create_dir_all(&out_dir).expect("create out dir");
+    for rep in 1..=5u32 {
+        let seed_spec = RunSpec {
+            profile: Profile::Recorded,
+            server: ServerKind::Uring,
+            workers: 1,
+            qos: Some(1),
+            kind: RunKind::Throughput,
+            rate_fraction_pct: None,
+            offered_rate: None,
+            repetition: rep,
+            attempt: u32::MAX - 1,
+        };
+        let rec = failing_record(&seed_spec);
+        write_record(&out_dir, &rec);
+    }
+
+    let spec = MatrixSpec {
+        profile: Profile::Recorded,
+        servers: vec![ServerKind::Uring],
+        workers: vec![1],
+        qos: vec![1],
+        out_dir,
+        resume: true,
+    };
+    let host = stub_host(&dir, SyscallMethod::None);
+    let mut dispatched: Vec<(u32, u32)> = Vec::new();
+    let outcome = run_matrix_with(&spec, &host, |s| {
+        if s.kind == RunKind::Throughput {
+            dispatched.push((s.attempt, s.repetition));
+        }
+        failing_record(s)
+    })
+    .expect("run_matrix_with");
+
+    assert_eq!(
+        dispatched,
+        (1..=5u32).map(|rep| (u32::MAX, rep)).collect::<Vec<_>>()
+    );
+    let key = ConfigKey {
+        server: ServerKind::Uring,
+        workers: 1,
+        qos: Some(1),
+        kind: RunKind::Throughput,
+        rate_fraction_pct: None,
+    };
+    assert!(
+        outcome.failed.contains(&key),
+        "failed={:?}",
+        outcome.failed
+    );
+}
+
+/// AC-20: an attempt number whose files already exist — a record, a
+/// temporary record (file or dangling symlink), or a scratch directory,
+/// for any of its repetitions — is skipped at no cost to the attempt
+/// budget, and every planted artifact is left untouched.
+#[test]
+fn an_attempt_whose_files_exist_is_skipped_at_no_cost() {
+    let constants = ProtocolConstants {
+        warmup_secs: WARMUP_SECS,
+        window_secs: WINDOW_SECS,
+        repetitions: 2,
+        drain_grace_secs: 2,
+        max_config_attempts: 3,
+        enforce_spread: false,
+    };
+    let spec = throughput_spec();
+    let key = passing_record(&spec, 1, 1, 100).key();
+    let a1_r2_name = passing_record(&spec, 2, 1, 100).file_name();
+    let a1_r1_stem = passing_record(&spec, 1, 1, 100).file_name().replace(".json", "");
+
+    // (a) a final record for attempt 1, repetition 2.
+    {
+        let work = temp_dir("skip-final-record");
+        let out_dir = work.join("out");
+        let scratch = work.join("scratch");
+        fs::create_dir_all(&out_dir).expect("create out dir");
+        fs::create_dir_all(&scratch).expect("create scratch dir");
+        let planted = out_dir.join(&a1_r2_name);
+        fs::write(&planted, b"published").expect("plant final record");
+        let remaining = HashMap::from([(key, 1u32)]);
+        let cancel = AtomicBool::new(false);
+        let mut attempts: Vec<u32> = Vec::new();
+        let outcome = run_configs(std::slice::from_ref(&spec), &remaining, &constants, &out_dir, &scratch, &cancel, |s| {
+            attempts.push(s.attempt);
+            passing_record(s, s.repetition, s.attempt, 100)
+        })
+        .expect("case a: an occupied final record must not block dispatch");
+        assert_eq!(attempts, vec![2, 2], "case a: attempt 1 must be skipped at no cost");
+        assert_eq!(outcome.passed.len(), 1, "case a");
+        assert_eq!(
+            fs::read(&planted).expect("read planted final record"),
+            b"published",
+            "case a: the planted record must be untouched"
+        );
+    }
+
+    // (b) a temporary record for attempt 1, repetition 2.
+    {
+        let work = temp_dir("skip-tmp-record");
+        let out_dir = work.join("out");
+        let scratch = work.join("scratch");
+        fs::create_dir_all(&out_dir).expect("create out dir");
+        fs::create_dir_all(&scratch).expect("create scratch dir");
+        let planted = out_dir.join(format!("{a1_r2_name}.tmp"));
+        fs::write(&planted, b"partial").expect("plant temporary record");
+        let remaining = HashMap::from([(key, 1u32)]);
+        let cancel = AtomicBool::new(false);
+        let mut attempts: Vec<u32> = Vec::new();
+        let outcome = run_configs(std::slice::from_ref(&spec), &remaining, &constants, &out_dir, &scratch, &cancel, |s| {
+            attempts.push(s.attempt);
+            passing_record(s, s.repetition, s.attempt, 100)
+        })
+        .expect("case b: an occupied temporary record must not block dispatch");
+        assert_eq!(attempts, vec![2, 2], "case b: attempt 1 must be skipped at no cost");
+        assert_eq!(outcome.passed.len(), 1, "case b");
+        assert_eq!(
+            fs::read(&planted).expect("read planted temporary record"),
+            b"partial",
+            "case b: the planted temporary record must be untouched"
+        );
+    }
+
+    // (c) a dangling symlink standing in for a temporary record.
+    {
+        let work = temp_dir("skip-dangling-symlink");
+        let out_dir = work.join("out");
+        let scratch = work.join("scratch");
+        fs::create_dir_all(&out_dir).expect("create out dir");
+        fs::create_dir_all(&scratch).expect("create scratch dir");
+        let planted = out_dir.join(format!("{a1_r2_name}.tmp"));
+        let target = work.join("missing");
+        std::os::unix::fs::symlink(&target, &planted).expect("plant dangling symlink");
+        let remaining = HashMap::from([(key, 1u32)]);
+        let cancel = AtomicBool::new(false);
+        let mut attempts: Vec<u32> = Vec::new();
+        let outcome = run_configs(std::slice::from_ref(&spec), &remaining, &constants, &out_dir, &scratch, &cancel, |s| {
+            attempts.push(s.attempt);
+            passing_record(s, s.repetition, s.attempt, 100)
+        })
+        .expect("case c: an occupied dangling symlink must not block dispatch");
+        assert_eq!(attempts, vec![2, 2], "case c: attempt 1 must be skipped at no cost");
+        assert_eq!(outcome.passed.len(), 1, "case c");
+        let meta = fs::symlink_metadata(&planted).expect("stat planted symlink");
+        assert!(meta.file_type().is_symlink(), "case c: the planted path must stay a symlink");
+        assert_eq!(
+            fs::read_link(&planted).expect("read planted symlink target"),
+            target,
+            "case c: the planted symlink's target must be untouched"
+        );
+    }
+
+    // (d) a scratch directory for attempt 1, repetition 1.
+    {
+        let work = temp_dir("skip-scratch-dir");
+        let out_dir = work.join("out");
+        let scratch = work.join("scratch");
+        fs::create_dir_all(&out_dir).expect("create out dir");
+        let run_scratch = scratch.join(&a1_r1_stem);
+        fs::create_dir_all(&run_scratch).expect("create scratch dir");
+        let evidence = run_scratch.join("gen.json");
+        fs::write(&evidence, b"evidence").expect("plant scratch evidence");
+        let remaining = HashMap::from([(key, 1u32)]);
+        let cancel = AtomicBool::new(false);
+        let mut attempts: Vec<u32> = Vec::new();
+        let outcome = run_configs(std::slice::from_ref(&spec), &remaining, &constants, &out_dir, &scratch, &cancel, |s| {
+            attempts.push(s.attempt);
+            passing_record(s, s.repetition, s.attempt, 100)
+        })
+        .expect("case d: an occupied scratch directory must not block dispatch");
+        assert_eq!(attempts, vec![2, 2], "case d: attempt 1 must be skipped at no cost");
+        assert_eq!(outcome.passed.len(), 1, "case d");
+        assert_eq!(
+            fs::read(&evidence).expect("read planted scratch evidence"),
+            b"evidence",
+            "case d: the planted scratch directory's evidence must be untouched"
+        );
+    }
+}
+
+/// AC-20: two occupied attempt numbers in a row are both skipped, and
+/// neither costs the attempt budget — a run cut short twice leaves two
+/// unpublished attempts behind. The record the dispatched attempt
+/// publishes leaves no temporary file of its own.
+#[test]
+fn two_occupied_attempt_numbers_in_a_row_are_both_skipped_at_no_cost() {
+    let constants = ProtocolConstants {
+        warmup_secs: WARMUP_SECS,
+        window_secs: WINDOW_SECS,
+        repetitions: 2,
+        drain_grace_secs: 2,
+        max_config_attempts: 3,
+        enforce_spread: false,
+    };
+    let work = temp_dir("skip-two-attempts");
+    let out_dir = work.join("out");
+    let scratch = work.join("scratch");
+    fs::create_dir_all(&out_dir).expect("create out dir");
+    fs::create_dir_all(&scratch).expect("create scratch dir");
+    let spec = throughput_spec();
+    let key = passing_record(&spec, 1, 1, 100).key();
+    // Attempt 1 left a published record, attempt 2 a temporary one.
+    let attempt1 = out_dir.join(passing_record(&spec, 1, 1, 100).file_name());
+    fs::write(&attempt1, b"published").expect("plant attempt 1 record");
+    let attempt2 = out_dir.join(format!("{}.tmp", passing_record(&spec, 1, 2, 100).file_name()));
+    fs::write(&attempt2, b"partial").expect("plant attempt 2 temporary record");
+
+    // A budget of one: a skip that charged it would dispatch nothing.
+    let remaining = HashMap::from([(key, 1u32)]);
+    let cancel = AtomicBool::new(false);
+    let mut attempts: Vec<u32> = Vec::new();
+    let outcome = run_configs(
+        std::slice::from_ref(&spec),
+        &remaining,
+        &constants,
+        &out_dir,
+        &scratch,
+        &cancel,
+        |s| {
+            attempts.push(s.attempt);
+            passing_record(s, s.repetition, s.attempt, 100)
+        },
+    )
+    .expect("two occupied attempt numbers must not block dispatch");
+
+    assert_eq!(
+        attempts,
+        vec![3, 3],
+        "attempts 1 and 2 must both be skipped at no cost"
+    );
+    assert_eq!(outcome.passed.len(), 1, "the third attempt must pass");
+    assert_eq!(
+        fs::read(&attempt1).expect("read planted attempt 1 record"),
+        b"published",
+        "the planted record must be untouched"
+    );
+    assert_eq!(
+        fs::read(&attempt2).expect("read planted attempt 2 temporary record"),
+        b"partial",
+        "the planted temporary record must be untouched"
+    );
+    for rep in 1..=2u32 {
+        let published = passing_record(&spec, rep, 3, 100).file_name();
+        assert!(
+            out_dir.join(&published).exists(),
+            "attempt 3 repetition {rep} must be published as {published}"
+        );
+        assert!(
+            !out_dir.join(format!("{published}.tmp")).exists(),
+            "the published record must leave no temporary file of its own"
+        );
+    }
+}
+
+/// AC-21: when an attempt number's occupancy cannot be determined — its
+/// scratch directory cannot be inspected — `run_configs` returns the
+/// inspection error before dispatching anything.
+#[test]
+fn an_attempt_that_cannot_be_inspected_is_not_dispatched() {
+    let constants = ProtocolConstants {
+        warmup_secs: WARMUP_SECS,
+        window_secs: WINDOW_SECS,
+        repetitions: 2,
+        drain_grace_secs: 2,
+        max_config_attempts: 3,
+        enforce_spread: false,
+    };
+    let out_dir = temp_dir("inspect-fail-out");
+    let work = temp_dir("inspect-fail-scratch");
+    // A regular file in the scratch directory's place makes every
+    // occupancy inspection under it fail with `ENOTDIR`, which no
+    // privilege bypasses — an unreadable directory would still be
+    // inspectable by a `CAP_DAC_OVERRIDE` runner.
+    let scratch = work.join("scratch");
+    fs::write(&scratch, b"not a directory").expect("plant the scratch file");
+    let spec = throughput_spec();
+    let cancel = AtomicBool::new(false);
+    let mut calls = 0u32;
+    let err = run_configs(&[spec], &HashMap::new(), &constants, &out_dir, &scratch, &cancel, |s| {
+        calls += 1;
+        passing_record(s, s.repetition, s.attempt, 100)
+    })
+    .expect_err("an uninspectable scratch directory must stop the dispatch");
+    assert!(
+        err.starts_with("inspect "),
+        "the error must name the inspection failure, got {err}"
+    );
+    assert_eq!(calls, 0, "nothing must be dispatched when occupancy cannot be determined");
+}
+
+/// AC-20: a fresh (non-`--resume`) run skips an attempt number left
+/// unpublished by a run cut short before its first record was written,
+/// at no cost to the attempt budget.
+#[test]
+fn a_fresh_run_skips_an_attempt_left_unpublished() {
+    let dir = temp_dir("fresh-run-skips-unpublished");
+    let out_dir = dir.join("out");
+    fs::create_dir_all(&out_dir).expect("create out dir");
+    let host = stub_host(&dir, SyscallMethod::None);
+
+    let seed_spec = throughput_spec();
+    let name = passing_record(&seed_spec, 1, 1, 100).file_name();
+    let tmp_path = out_dir.join(format!("{name}.tmp"));
+    fs::write(&tmp_path, b"partial").expect("plant temporary record");
+    let stem = name.replace(".json", "");
+    let run_scratch = host.scratch_dir.join(&stem);
+    fs::create_dir_all(&run_scratch).expect("create scratch dir");
+    let evidence = run_scratch.join("gen.json");
+    fs::write(&evidence, b"evidence").expect("plant scratch evidence");
+
+    let spec = MatrixSpec {
+        profile: Profile::Smoke,
+        servers: vec![ServerKind::Uring],
+        workers: vec![1],
+        qos: vec![1],
+        out_dir,
+        resume: false,
+    };
+    let mut dispatched: Vec<(u32, u32)> = Vec::new();
+    run_matrix_with(&spec, &host, |s| {
+        if s.kind == RunKind::Throughput {
+            dispatched.push((s.attempt, s.repetition));
+        }
+        passing_record(s, s.repetition, s.attempt, 100)
+    })
+    .expect("run_matrix_with");
+
+    assert_eq!(
+        dispatched,
+        vec![(2, 1), (2, 2)],
+        "attempt 1 must be skipped at no cost to the smoke budget of one"
+    );
+    assert_eq!(
+        fs::read(&tmp_path).expect("read seeded temporary record"),
+        b"partial",
+        "the seeded temporary record must be untouched"
+    );
+    assert_eq!(
+        fs::read(&evidence).expect("read seeded scratch evidence"),
+        b"evidence",
+        "the seeded scratch evidence must be untouched"
+    );
+}
+
+/// AC-20: a `--resume` run skips an attempt number left unpublished by a
+/// run cut short before its first record was written, at no cost to the
+/// attempt budget the completed attempt did not already spend.
+#[test]
+fn a_resume_skips_an_attempt_left_unpublished() {
+    let dir = temp_dir("resume-skips-unpublished");
+    let out_dir = dir.join("out");
+    fs::create_dir_all(&out_dir).expect("create out dir");
+    let host = stub_host(&dir, SyscallMethod::None);
+
+    for rep in 1..=5u32 {
+        let seed_spec = RunSpec {
+            profile: Profile::Recorded,
+            server: ServerKind::Uring,
+            workers: 1,
+            qos: Some(1),
+            kind: RunKind::Throughput,
+            rate_fraction_pct: None,
+            offered_rate: None,
+            repetition: rep,
+            attempt: 1,
+        };
+        let rec = failing_record(&seed_spec);
+        write_record(&out_dir, &rec);
+    }
+    let attempt2_rep1 = RunSpec {
+        profile: Profile::Recorded,
+        server: ServerKind::Uring,
+        workers: 1,
+        qos: Some(1),
+        kind: RunKind::Throughput,
+        rate_fraction_pct: None,
+        offered_rate: None,
+        repetition: 1,
+        attempt: 2,
+    };
+    let name = passing_record(&attempt2_rep1, 1, 2, 100).file_name();
+    let tmp_path = out_dir.join(format!("{name}.tmp"));
+    fs::write(&tmp_path, b"partial").expect("plant temporary record");
+    let stem = name.replace(".json", "");
+    let run_scratch = host.scratch_dir.join(&stem);
+    fs::create_dir_all(&run_scratch).expect("create scratch dir");
+    let evidence = run_scratch.join("gen.json");
+    fs::write(&evidence, b"evidence").expect("plant scratch evidence");
+
+    let spec = MatrixSpec {
+        profile: Profile::Recorded,
+        servers: vec![ServerKind::Uring],
+        workers: vec![1],
+        qos: vec![1],
+        out_dir,
+        resume: true,
+    };
+    let mut dispatched: Vec<(u32, u32)> = Vec::new();
+    let outcome = run_matrix_with(&spec, &host, |s| {
+        if s.kind == RunKind::Throughput {
+            dispatched.push((s.attempt, s.repetition));
+            failing_record(s)
+        } else {
+            passing_record(s, s.repetition, s.attempt, 100)
+        }
+    })
+    .expect("run_matrix_with");
+
+    assert_eq!(
+        dispatched,
+        (3..=4u32)
+            .flat_map(|a| (1..=5u32).map(move |r| (a, r)))
+            .collect::<Vec<_>>(),
+        "attempt 2 must be skipped at no cost: one completed attempt leaves two"
+    );
+    let key = ConfigKey {
+        server: ServerKind::Uring,
+        workers: 1,
+        qos: Some(1),
+        kind: RunKind::Throughput,
+        rate_fraction_pct: None,
+    };
+    assert!(
+        outcome.failed.contains(&key),
+        "failed={:?}",
+        outcome.failed
+    );
+    assert_eq!(
+        fs::read(&tmp_path).expect("read seeded temporary record"),
+        b"partial",
+        "the seeded temporary record must be untouched"
+    );
+    assert_eq!(
+        fs::read(&evidence).expect("read seeded scratch evidence"),
+        b"evidence",
+        "the seeded scratch evidence must be untouched"
+    );
+}
+
 /// The on-disk form of a counted record (PLAN.md ## Data Model):
 /// `"kind": "counted"` at the current schema, read back as
 /// `RunKind::Counted`. The records the matrix writes are what `--resume`
@@ -1516,4 +2440,73 @@ fn a_counted_record_round_trips_through_its_json_form() {
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].kind, RunKind::Counted);
     assert_eq!(records[0].rate_fraction_pct, Some(80));
+}
+
+/// A record written before this field existed has no `"cancelled"` key
+/// at all; `read_records` must still read it back as not cancelled.
+#[test]
+fn a_record_without_a_cancelled_field_reads_as_not_cancelled() {
+    let dir = temp_dir("no-cancelled-field");
+    let rec = make_record(
+        Profile::Smoke,
+        ServerKind::Uring,
+        1,
+        Some(1),
+        RunKind::Throughput,
+        None,
+        1,
+        1,
+        true,
+        "abc1234",
+    );
+    write_record(&dir, &rec);
+
+    let path = dir.join(rec.file_name());
+    let text = fs::read_to_string(&path).expect("read the record");
+    let mut value: serde_json::Value = serde_json::from_str(&text).expect("parse the record");
+    value
+        .as_object_mut()
+        .expect("record is a JSON object")
+        .remove("cancelled");
+    let file = fs::File::create(&path).expect("recreate the record file");
+    serde_json::to_writer_pretty(&file, &value).expect("write the record back without the key");
+
+    let records = read_records(&dir).expect("read_records");
+    assert_eq!(
+        serde_json::to_value(&records[0]).expect("serialize the record")["cancelled"],
+        serde_json::Value::Bool(false),
+        "a record with no cancelled key must read back as not cancelled"
+    );
+}
+
+/// A copied or renamed record must not count as a repetition that never
+/// ran: `read_records` refuses a `*.json` whose file name is not the
+/// name its own `file_name()` computes (AC-4).
+#[test]
+fn read_records_refuses_a_file_whose_name_is_not_its_records_name() {
+    let dir = temp_dir("mismatched-file-name");
+    let rec = make_record(
+        Profile::Smoke,
+        ServerKind::Uring,
+        1,
+        Some(1),
+        RunKind::Throughput,
+        None,
+        1,
+        1,
+        true,
+        "abc1234",
+    );
+    write_record(&dir, &rec);
+    fs::copy(dir.join(rec.file_name()), dir.join("copy.json")).expect("copy record");
+
+    let err = read_records(&dir).expect_err("a renamed copy must not read back");
+    assert!(
+        err.contains("copy.json"),
+        "error must name the offending file, got {err}"
+    );
+    assert!(
+        err.contains(&rec.file_name()),
+        "error must name the expected file name, got {err}"
+    );
 }

@@ -154,6 +154,7 @@ fn smoke_throughput_record(repetition: u32) -> RunRecord {
         harness_errors: Vec::new(),
         valid: true,
         invalid_reasons: Vec::new(),
+        cancelled: false,
     }
 }
 

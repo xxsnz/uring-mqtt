@@ -12,9 +12,9 @@
 //! `window.end_ns`. The selected [`SyscallMethod`] and the tool paths
 //! come from [`HostSetup`].
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::{AsFd, OwnedFd};
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,6 +26,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use nix::fcntl::{open, OFlag};
 use nix::sys::signal::{kill, Signal};
 use nix::sys::stat::Mode;
+use nix::sys::wait::{waitid, Id, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
 
 use crate::analysis::{count_driver_fds, derive, parse_perf_count, parse_strace_total, reconcile};
@@ -86,6 +87,30 @@ pub const COUNTER_CONTROL_TIMEOUT_SECS: u64 = 5;
 /// as the failure it was once this deadline passes.
 pub const TOOL_VERSION_TIMEOUT_SECS: u64 = 5;
 
+/// Upper bound on the recorded-run provenance probe [`head_sha`]: a `git`
+/// that never answers must not hold the runner before any record exists.
+pub const GIT_HEAD_TIMEOUT_SECS: u64 = 5;
+
+/// Cap on the stdout bytes [`head_sha`] reads from its `git`. The probe
+/// wants one short SHA, so everything past this cap is noise; reading it
+/// would let a `git` on `PATH` that prints without stopping, or one
+/// enormous line without a newline, grow the reader's line buffer and its
+/// channel for as long as [`GIT_HEAD_TIMEOUT_SECS`] lasts. The capped
+/// reader reports EOF at the cap and the deadline still bounds the child.
+const GIT_HEAD_STDOUT_BYTES_MAX: u64 = 4096;
+
+/// `process_group` argument that puts [`head_sha`]'s probe in a group of
+/// its own, led by the probe: the group id is then the probe's pid, and
+/// one signal reaches the probe and the descendants that stayed in its
+/// group (a descendant that starts a group of its own leaves it).
+const GIT_HEAD_OWN_PROCESS_GROUP: i32 = 0;
+
+/// Prefix of the harness error [`run_one`] records when the scratch
+/// directory of its spec already exists. It is the proof that this run
+/// did not create that directory: `matrix::run_configs` reads it to
+/// keep its hands off another run's raw evidence.
+pub const SCRATCH_REUSED_PREFIX: &str = "scratch directory reused: ";
+
 /// Taskset CPU set used when the caller does not override `HostSetup.cpu_sets.server`.
 pub const DEFAULT_SERVER_CPUS: &str = "0,2,4,6";
 
@@ -120,6 +145,9 @@ const COUNTER_LABEL: &str = "counter";
 
 /// Reader-thread label of one `--version` probe in [`capture_env`].
 const TOOL_VERSION_LABEL: &str = "version-probe";
+
+/// Reader-thread label of one `git rev-parse` probe in [`head_sha`].
+const GIT_HEAD_LABEL: &str = "git-head";
 
 /// Reader-thread label of the strace counter's stderr.
 const COUNTER_STDERR_LABEL: &str = "counter-stderr";
@@ -374,6 +402,187 @@ fn recv_version_line(
     }
 }
 
+/// `<git> rev-parse --short HEAD` of the working tree the runner is about
+/// to invoke, for [`check_provenance`]. Bounded by
+/// [`GIT_HEAD_TIMEOUT_SECS`]: the probe is killed and reaped if it has
+/// not exited by then, or sooner if `cancel` is set. `git` is the
+/// executable to run: `git` from `PATH` in production. `cancel` is the
+/// shared flag SIGINT/SIGTERM set; polling it every [`WAIT_POLL_MS`]
+/// gives the operator a same-tick cancellation instead of waiting out
+/// the deadline. Its stdout is read through a
+/// [`GIT_HEAD_STDOUT_BYTES_MAX`] cap, so neither the probe's memory nor
+/// its deadline depends on how much the executable prints. The probe runs
+/// in its own process group, so the cleanup reaches the descendants of a
+/// `git` that is a wrapper script: a background process the wrapper leaves
+/// behind holds the inherited stdout pipe open and would survive a signal
+/// addressed to the wrapper's pid alone. The cleanup signals the probe's
+/// own pid as well as that group, because an executable is free to call
+/// `setpgid` and leave the group it was spawned into: the group signal
+/// then reaches a group the probe is no longer in, and the pid signal is
+/// what keeps the reap — and with it this function — bounded.
+pub fn head_sha(git: &Path, cancel: &AtomicBool) -> Result<String, String> {
+    let mut child = Command::new(git)
+        .args(["rev-parse", "--short", "HEAD"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .process_group(GIT_HEAD_OWN_PROCESS_GROUP)
+        .spawn()
+        .map_err(|e| format!("git rev-parse: {e}"))?;
+    // The child leads the group it was spawned into, so its pid is the
+    // group id and the negated pid addresses the group.
+    let pid = i32::try_from(child.id()).ok().map(Pid::from_raw);
+    let group = pid.map(|pid| Pid::from_raw(-pid.as_raw()));
+    let deadline = Instant::now() + Duration::from_secs(GIT_HEAD_TIMEOUT_SECS);
+    let mut status: Option<WaitStatus> = None;
+    let result = match child.stdout.take() {
+        Some(stdout) => spawn_stdout_reader(
+            GIT_HEAD_LABEL,
+            stdout.take(GIT_HEAD_STDOUT_BYTES_MAX),
+            BlankLines::Skip,
+        )
+        .and_then(|lines| wait_for_head_sha(&mut child, &lines, deadline, cancel, &mut status)),
+        None => Err("git rev-parse stdout not piped".to_string()),
+    };
+    // SIGKILL the whole group, so a `git` wrapper's background descendant
+    // goes with the wrapper instead of outliving the probe with the
+    // inherited stdout pipe. Nothing above reaps the leader — the exit
+    // check is [`probe_exit`], which leaves it a zombie — so the leader
+    // still holds its pid here, and with it the id of the group it leads.
+    // The signal therefore cannot reach anything but this probe's own
+    // group, whether the leader is running or already exited.
+    if let Some(group) = group {
+        let _ = kill(group, Signal::SIGKILL);
+    }
+    // And the probe's own pid, which is the signal the bound rests on. An
+    // executable is free to call `setpgid` and join another group: the
+    // group signal above then names a group without the probe in it — an
+    // empty group answers `ESRCH` — and a probe that hangs on would block
+    // the `child.wait()` below with no deadline. An unreaped child still
+    // owns its pid, so this signal can no more reach a stranger than the
+    // group signal can, and a probe that already exited is a zombie,
+    // which SIGKILL leaves for the wait to reap.
+    if let Some(pid) = pid {
+        let _ = kill(pid, Signal::SIGKILL);
+    }
+    // After the signals, never before: this is the reap that frees the
+    // leader's pid, and the group it names must already be gone.
+    let _ = child.wait();
+    result
+}
+
+/// Wait for the `git rev-parse` child to print one line, bounded by
+/// `deadline`, polling `cancel` every [`WAIT_POLL_MS`] steps and keeping
+/// the first `WaitStatus` from [`probe_exit`] without calling it again. The
+/// first non-empty, trimmed line the receiver reads is the SHA; EOF
+/// with no line is a failed probe; a printed line on a non-zero exit is
+/// overwritten by the exit error. The deadline is checked before the exit
+/// status and the line, so a probe that answers only past the bound is
+/// refused with `did not answer within` rather than accepted.
+fn wait_for_head_sha(
+    child: &mut Child,
+    lines: &mpsc::Receiver<StdoutLine>,
+    deadline: Instant,
+    cancel: &AtomicBool,
+    status: &mut Option<WaitStatus>,
+) -> Result<String, String> {
+    let mut first: Option<String> = None;
+    let mut eof = false;
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Err("cancelled".to_string());
+        }
+        // Before the exit status and the line, so a probe first observed
+        // past the deadline is refused instead of accepted: the child can
+        // print its SHA, keep running past the bound and exit while this
+        // loop is off the CPU.
+        if deadline.saturating_duration_since(Instant::now()).is_zero() {
+            return Err(format!(
+                "git rev-parse did not answer within {GIT_HEAD_TIMEOUT_SECS}s"
+            ));
+        }
+        if status.is_none() {
+            match probe_exit(child) {
+                Ok(Some(s)) => *status = Some(s),
+                Ok(None) => {}
+                Err(e) => return Err(format!("git rev-parse: {e}")),
+            }
+        }
+        if let Some(s) = status.as_ref() {
+            if !matches!(s, WaitStatus::Exited(_, 0)) {
+                return Err(format!("git rev-parse exited with {}", probe_exit_note(*s)));
+            }
+            if let Some(sha) = first.as_ref() {
+                return Ok(sha.clone());
+            }
+            if eof {
+                return Err("git rev-parse printed no line".to_string());
+            }
+            // Status arrived (success) but neither the SHA line nor EOF
+            // has been seen yet — `probe_exit` saw the exit before the
+            // reader got either the Line or the Eof. Fall through to the
+            // recv path so the next iteration settles one way or the
+            // other, instead of tight-looping on this status.
+        }
+        // A poll step that the deadline cuts to zero returns at once and the
+        // check at the top of the loop reports the expiry.
+        let poll = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(WAIT_POLL_MS));
+        if eof {
+            sleep(poll);
+            continue;
+        }
+        match lines.recv_timeout(poll) {
+            Ok(StdoutLine::Line(line)) => {
+                if first.is_none() {
+                    let trimmed = line.trim().to_string();
+                    if !trimmed.is_empty() {
+                        first = Some(trimmed);
+                    }
+                }
+            }
+            Ok(StdoutLine::Eof) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                eof = true;
+            }
+            Ok(StdoutLine::Failed(e)) => return Err(format!("read git rev-parse stdout: {e}")),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+/// Non-reaping exit check of [`head_sha`]'s probe: `waitid` with `WNOWAIT`
+/// reports the exit and leaves the probe a zombie, so the probe keeps its
+/// pid — and the group it leads keeps its id — until [`head_sha`] has
+/// signalled the group and reaped the leader itself. `Child::try_wait`
+/// reaps instead, and a reaped leader whose group holds no surviving member
+/// frees the group id for reuse: the cleanup signal could then reach an
+/// unrelated group that took the id over. `Ok(None)` is a probe that is
+/// still running.
+fn probe_exit(child: &Child) -> Result<Option<WaitStatus>, String> {
+    let pid = i32::try_from(child.id()).map_err(|e| e.to_string())?;
+    match waitid(
+        Id::Pid(Pid::from_raw(pid)),
+        WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT | WaitPidFlag::WNOHANG,
+    ) {
+        Ok(WaitStatus::StillAlive) => Ok(None),
+        Ok(status) => Ok(Some(status)),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Describe the exit of [`head_sha`]'s probe the way [`exit_note`]
+/// describes a guarded child's: its code when it exited on its own, its
+/// signal when a signal ended it. Only those two states reach this note —
+/// [`probe_exit`] asks for `WEXITED` alone.
+fn probe_exit_note(status: WaitStatus) -> String {
+    match status {
+        WaitStatus::Exited(_, code) => format!("code {code}"),
+        WaitStatus::Signaled(_, signal, _) => format!("signal {signal}"),
+        other => format!("{other:?}"),
+    }
+}
+
 /// Refuse a recorded-run binary whose source and checkout disagree (AC-57).
 /// `build_sha`/`build_dirty` are read from the binary's own env vars; `head_sha`
 /// is the `git rev-parse --short HEAD` of the working tree the runner is
@@ -494,7 +703,9 @@ fn started_at_unix() -> u64 {
 
 /// Compute the on-disk directory stem for one configuration. Mirrors
 /// `RunRecord::file_name()` but stripped of the `.json` extension.
-fn stem_for(spec: &RunSpec) -> String {
+/// `matrix::run_configs` uses it to find the files an attempt number
+/// already owns.
+pub fn stem_for(spec: &RunSpec) -> String {
     build_minimal_record(spec).file_name().replace(".json", "")
 }
 
@@ -584,6 +795,7 @@ fn build_minimal_record(spec: &RunSpec) -> RunRecord {
         harness_errors: Vec::new(),
         valid: false,
         invalid_reasons: Vec::new(),
+        cancelled: false,
     }
 }
 
@@ -621,10 +833,12 @@ enum DrainEnd {
 /// Read a child's stdout on its own thread. A blocking `read_line` on the
 /// runner's thread would hold the runner past its own deadline when the
 /// child keeps stdout open without printing a newline, so the deadline and
-/// the cancellation flag are checked by the receiving loop instead.
-fn spawn_stdout_reader(
+/// the cancellation flag are checked by the receiving loop instead. The
+/// channel is unbounded: a caller whose child may print more than it reads
+/// hands in a capped reader (`Read::take`) so peak memory stays bounded.
+fn spawn_stdout_reader<R: Read + Send + 'static>(
     label: &'static str,
-    stdout: std::process::ChildStdout,
+    stdout: R,
     blanks: BlankLines,
 ) -> Result<mpsc::Receiver<StdoutLine>, String> {
     let (tx, rx) = mpsc::channel();
@@ -1826,7 +2040,7 @@ pub fn run_one(spec: &RunSpec, host: &HostSetup) -> RunRecord {
     // into it would overwrite that run's raw evidence while this record is
     // invalid anyway, so nothing below this line runs.
     if let Err(_e) = std::fs::create_dir(&dir) {
-        harness_errors.push(format!("scratch directory reused: {}", dir.display()));
+        harness_errors.push(format!("{SCRATCH_REUSED_PREFIX}{}", dir.display()));
         return finalize_record(
             spec,
             host,
@@ -2444,6 +2658,7 @@ fn finalize_record(
         harness_errors: harness_errors.to_vec(),
         valid: false,
         invalid_reasons: Vec::new(),
+        cancelled: false,
     };
     let derived = derive(&record);
     record.throughput_msgs_per_sec = derived.throughput_msgs_per_sec;

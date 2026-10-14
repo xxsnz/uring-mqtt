@@ -17,11 +17,16 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::analysis::{config_passes, interleave, median, matched_rates, recompute};
+use crate::analysis::{
+    attempt_complete, config_failure, config_passes, interleave, median, matched_rates, recompute,
+};
 use crate::run_record::{
     ConfigKey, CpuSets, Env, Profile, RunKind, RunRecord, ServerKind, SyscallMethod, SCHEMA_VERSION,
 };
-use crate::runner::{HostSetup, LATENCY_FRACTIONS_PCT, ProtocolConstants, RunSpec, SYSCALL_FRACTION_PCT};
+use crate::runner::{
+    HostSetup, stem_for, LATENCY_FRACTIONS_PCT, ProtocolConstants, RunSpec, SCRATCH_REUSED_PREFIX,
+    SYSCALL_FRACTION_PCT,
+};
 
 /// The full server set §9.1 records. A `bench run --profile recorded`
 /// refuses any other combination (AC-42).
@@ -50,12 +55,17 @@ pub struct MatrixSpec {
 }
 
 /// One entry in [`resume_plan`]. `Passed` means the highest attempt
-/// already passed and the config does not run again; `NextAttempt(a)`
-/// means the highest attempt failed and the next run uses attempt `a`.
+/// already passed and the config does not run again; `NextAttempt`
+/// carries the next attempt number and the completed attempts still
+/// available.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResumeState {
     Passed,
-    NextAttempt(u32),
+    /// The highest attempt did not pass. `attempt` is the number the
+    /// next run uses; `remaining` is how many more completed attempts
+    /// the configuration may run (`max_config_attempts` minus its
+    /// completed attempts, 0 when `attempt` cannot advance).
+    NextAttempt { attempt: u32, remaining: u32 },
 }
 
 /// What [`run_matrix`] (and [`run_configs`]) produced. `passed` are the
@@ -237,6 +247,9 @@ fn check_counter_bin(
 /// Read every `*.json` directly in `out_dir` as a `RunRecord`.
 /// `doc::load_records` (task 12) delegates to this. A file that does
 /// not parse is fatal: a partial record set is worse than no resume.
+/// A file whose name is not the record's own `file_name()` is fatal
+/// too: a copied or renamed record would otherwise count as a
+/// repetition that never ran.
 pub fn read_records(dir: &Path) -> Result<Vec<RunRecord>, String> {
     let mut out = Vec::new();
     let entries =
@@ -249,6 +262,13 @@ pub fn read_records(dir: &Path) -> Result<Vec<RunRecord>, String> {
                 .map_err(|e| format!("open {}: {e}", path.display()))?;
             let rec: RunRecord = serde_json::from_reader(file)
                 .map_err(|e| format!("parse {}: {e}", path.display()))?;
+            let expected = rec.file_name();
+            if path.file_name().and_then(|n| n.to_str()) != Some(expected.as_str()) {
+                return Err(format!(
+                    "{}: file name does not match its record, which names {expected}",
+                    path.display()
+                ));
+            }
             out.push(rec);
         }
     }
@@ -387,15 +407,22 @@ fn format_tools(tools: &[(String, String)]) -> String {
         .join(", ")
 }
 
-/// Compute the resume decision per configuration. The highest attempt
-/// for each key is the one that decides; the brief says "group by
-/// `key()`, take the highest attempt; `config_passes(runs of that
-/// attempt, repetitions, enforce_spread)` -> `Passed`, else
-/// `NextAttempt(highest + 1)`". The successor saturates: `attempt`
-/// deserializes any `u32`, and a record carrying one this runner never
-/// produces must not overflow the decision — `run_configs` refuses any
-/// attempt past `max_config_attempts` anyway, so the saturated value
-/// leaves that configuration unrun and failed.
+/// Compute the resume decision per configuration. Only a complete
+/// attempt ([`attempt_complete`] — repetitions `1..=repetitions` each
+/// present once, none marked `cancelled: true`) counts against
+/// `max_config_attempts`: an interrupted attempt stays on disk and
+/// costs nothing, so `remaining = max_config_attempts - completed` is
+/// what `run_configs` charges against. The highest attempt decides
+/// whether the configuration is `Passed`; otherwise `attempt` advances
+/// past every recorded attempt so no file name or scratch directory is
+/// reused. A configuration whose highest recorded attempt is
+/// `u32::MAX - 1` advances to `u32::MAX` and `run_configs` still
+/// dispatches that number once, so the operator sees the failure in
+/// `MatrixOutcome::failed` rather than a silent skip. One whose highest
+/// recorded attempt already is `u32::MAX` cannot advance at all: it
+/// keeps that number with `remaining: 0`, which dispatches nothing and
+/// leaves the configuration failed, because the only number left to run
+/// is one whose files are already on disk.
 pub fn resume_plan(
     existing: &[RunRecord],
     constants: &ProtocolConstants,
@@ -413,10 +440,40 @@ pub fn resume_plan(
             .filter(|r| r.attempt == highest)
             .cloned()
             .collect();
+        let mut groups: HashMap<u32, Vec<RunRecord>> = HashMap::new();
+        for rec in &runs {
+            groups.entry(rec.attempt).or_default().push(rec.clone());
+        }
+        let completed = u32::try_from(
+            groups
+                .values()
+                .filter(|g| attempt_complete(g, constants.repetitions))
+                .count(),
+        )
+        .unwrap_or(u32::MAX);
         if config_passes(&max_attempt_runs, constants.repetitions, constants.enforce_spread) {
             plan.insert(key, ResumeState::Passed);
         } else {
-            plan.insert(key, ResumeState::NextAttempt(highest.saturating_add(1)));
+            match highest.checked_add(1) {
+                Some(next) => {
+                    plan.insert(
+                        key,
+                        ResumeState::NextAttempt {
+                            attempt: next,
+                            remaining: constants.max_config_attempts.saturating_sub(completed),
+                        },
+                    );
+                }
+                None => {
+                    plan.insert(
+                        key,
+                        ResumeState::NextAttempt {
+                            attempt: highest,
+                            remaining: 0,
+                        },
+                    );
+                }
+            }
         }
     }
     plan
@@ -431,18 +488,27 @@ pub fn resume_plan(
 /// has used its last attempt. Each config carries its own attempt
 /// number — a resumed config starts at the attempt `resume_plan` gave
 /// it — so two configs resumed at different attempts never collide on
-/// a record filename. Decision Q9 caps a config at
-/// `max_config_attempts` attempts in absolute terms, so a config
-/// resumed at attempt 3 of 3 runs that attempt and no more. Every
-/// record is written to `out_dir/<file_name>`; failed attempts stay on
-/// disk. `cancel` is read before every dispatch, so an interruption
-/// charges an attempt only to the configuration that was running and
-/// never to the ones it had not started — their budget stays available
-/// to the `--resume` that follows. `scratch_dir` is the runner's scratch
-/// root, needed only to drop the scratch directory of a run whose record
-/// could not be persisted.
-pub fn run_configs<F: FnMut(&RunSpec) -> RunRecord>(
+/// a record filename. `remaining` caps each config at the completed
+/// attempts it has left (decision Q9: three per configuration); a key
+/// it does not list gets `constants.max_config_attempts`. Every round
+/// that finishes completes one attempt per active config; an
+/// interrupted round returns `Err` and completes none. Every record is
+/// written to `out_dir/<file_name>`; failed attempts stay on disk.
+/// `cancel` is read before every dispatch, so an interruption starts
+/// nothing further. It charges no configuration an attempt at all: the
+/// attempt it cut short is not a completed one ([`attempt_complete`]),
+/// and only completed attempts count against the budget, so every
+/// configuration's budget stays available to the `--resume` that
+/// follows. `scratch_dir` is the runner's scratch root,
+/// needed only to drop the scratch directory of a run whose record
+/// could not be persisted. An attempt number whose files already
+/// exist ([`attempt_in_use`]) is skipped at no cost, and the scratch
+/// directory is dropped only when the run created it itself
+/// ([`created_own_scratch`]), so a run never removes another run's
+/// evidence.
+pub fn run_configs<F: FnMut(&RunSpec) -> RunRecord, S: ::std::hash::BuildHasher>(
     specs: &[RunSpec],
+    remaining: &HashMap<ConfigKey, u32, S>,
     constants: &ProtocolConstants,
     out_dir: &Path,
     scratch_dir: &Path,
@@ -464,22 +530,64 @@ pub fn run_configs<F: FnMut(&RunSpec) -> RunRecord>(
         .iter()
         .map(|(key, spec)| (*key, spec.attempt.max(1)))
         .collect();
+    let mut left: HashMap<ConfigKey, u32> = spec_for_key
+        .keys()
+        .map(|key| {
+            (
+                *key,
+                remaining.get(key).copied().unwrap_or(constants.max_config_attempts),
+            )
+        })
+        .collect();
 
     let mut passed: Vec<ConfigKey> = Vec::new();
 
     loop {
-        let active_specs: Vec<RunSpec> = pending_keys
-            .iter()
-            .filter_map(|key| {
-                let attempt = *next_attempt.get(key)?;
-                if attempt > constants.max_config_attempts {
-                    return None;
+        let mut active_specs: Vec<RunSpec> = Vec::new();
+        for key in &pending_keys {
+            if *left.get(key).unwrap_or(&0) == 0 {
+                continue;
+            }
+            let Some(attempt) = next_attempt.get(key).copied() else {
+                continue;
+            };
+            let Some(template) = spec_for_key.get(key).cloned() else {
+                continue;
+            };
+            let mut spec = template;
+            spec.attempt = attempt;
+            while let Some(occupied) =
+                attempt_in_use(&spec, constants.repetitions, out_dir, scratch_dir)?
+            {
+                // Name the file that pushed the attempt number on. A run
+                // that lands on attempt 3 after skipping 1 and 2 looks
+                // like two lost attempts otherwise, and reconstructing an
+                // interrupted session needs the files that caused the jump
+                // (AC-62).
+                eprintln!(
+                    "skipping attempt {} of {:?}: {} exists",
+                    spec.attempt,
+                    key,
+                    occupied.display()
+                );
+                match spec.attempt.checked_add(1) {
+                    Some(next) => spec.attempt = next,
+                    None => {
+                        if let Some(slot) = left.get_mut(key) {
+                            *slot = 0;
+                        }
+                        break;
+                    }
                 }
-                let mut spec = spec_for_key.get(key)?.clone();
-                spec.attempt = attempt;
-                Some(spec)
-            })
-            .collect();
+            }
+            if *left.get(key).unwrap_or(&0) == 0 {
+                continue;
+            }
+            if let Some(slot) = next_attempt.get_mut(key) {
+                *slot = spec.attempt;
+            }
+            active_specs.push(spec);
+        }
         if active_specs.is_empty() {
             break;
         }
@@ -487,10 +595,10 @@ pub fn run_configs<F: FnMut(&RunSpec) -> RunRecord>(
         for (mut spec, rep) in interleave(&active_specs, constants.repetitions) {
             // Stop scheduling the moment SIGINT/SIGTERM arrives. Dispatching
             // the rest of the round would write a cancellation record for
-            // every remaining repetition and attempt, and `resume_plan`
-            // would then ask for an attempt past `max_config_attempts`,
-            // which this loop refuses — an interruption would cost the
-            // configuration its whole budget (AC-52, AC-62).
+            // every remaining repetition and attempt, and each of those
+            // records would complete an attempt that never really ran — an
+            // interruption would cost the configuration its whole budget
+            // (AC-52, AC-62).
             if cancel.load(Ordering::SeqCst) {
                 return Err("cancelled".to_string());
             }
@@ -499,10 +607,19 @@ pub fn run_configs<F: FnMut(&RunSpec) -> RunRecord>(
             // (which reads `spec.repetition` to build the per-run scratch
             // directory) names each repetition's directory distinctly.
             spec.repetition = rep;
-            let record = run(&spec);
+            let mut record = run(&spec);
+            // A signal that arrived while the run was in progress may have
+            // cut it short: mark it, keep it on disk, and stop scheduling.
+            let cancelled = cancel.load(Ordering::SeqCst);
+            record.cancelled = cancelled;
             if let Err(e) = write_record(out_dir, &record) {
-                discard_scratch(scratch_dir, &record);
+                if created_own_scratch(&record) {
+                    discard_scratch(scratch_dir, &record);
+                }
                 return Err(e);
+            }
+            if cancelled {
+                return Err("cancelled".to_string());
             }
             round.push(record);
         }
@@ -519,13 +636,35 @@ pub fn run_configs<F: FnMut(&RunSpec) -> RunRecord>(
                 still_pending.push(*key);
                 continue;
             };
-            if config_passes(runs, constants.repetitions, constants.enforce_spread) {
-                passed.push(*key);
-            } else {
-                if let Some(attempt) = next_attempt.get_mut(key) {
-                    *attempt += 1;
+            match config_failure(runs, constants.repetitions, constants.enforce_spread) {
+                None => passed.push(*key),
+                Some(reason) => {
+                    // Name the gate condition this attempt failed. Once the
+                    // budget is spent the caller reports the configuration
+                    // key alone, so without this line the operator has to
+                    // re-derive the verdict from the records themselves.
+                    eprintln!(
+                        "attempt {} of {:?} failed: {reason}",
+                        runs.first().map_or(0, |r| r.attempt),
+                        key
+                    );
+                    match next_attempt.get_mut(key).and_then(|a| a.checked_add(1)) {
+                        Some(n) => {
+                            if let Some(slot) = left.get_mut(key) {
+                                *slot = slot.saturating_sub(1);
+                            }
+                            if let Some(slot) = next_attempt.get_mut(key) {
+                                *slot = n;
+                            }
+                        }
+                        None => {
+                            if let Some(slot) = left.get_mut(key) {
+                                *slot = 0;
+                            }
+                        }
+                    }
+                    still_pending.push(*key);
                 }
-                still_pending.push(*key);
             }
         }
         pending_keys = still_pending;
@@ -538,24 +677,74 @@ pub fn run_configs<F: FnMut(&RunSpec) -> RunRecord>(
 }
 
 /// Persist one record as `out_dir/<file_name>`. The JSON is serialized
-/// into a sibling `.tmp` path and renamed only after a successful
-/// flush, so a write error or an interruption leaves no truncated
-/// `*.json` for the next `--resume` to reject in `read_records`.
+/// into a sibling `.tmp` path created with `create_new` — it never
+/// follows a symlink and never truncates — and `sync_all` brings its
+/// bytes onto disk before `hard_link` publishes the record; a planted
+/// `<name>.json.tmp` (file or symlink) or an existing `<name>.json`
+/// stops the write with a named error and is left untouched, and only
+/// the temporary file this call created itself is removed on failure.
 fn write_record(out_dir: &Path, record: &RunRecord) -> Result<(), String> {
     let name = record.file_name();
     let tmp = out_dir.join(format!("{name}.tmp"));
     let path = out_dir.join(&name);
-    let file =
-        fs::File::create(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                format!(
+                    "temporary record {} already exists; refusing to write through it",
+                    tmp.display()
+                )
+            } else {
+                format!("create {}: {e}", tmp.display())
+            }
+        })?;
     let mut writer = std::io::BufWriter::new(file);
-    serde_json::to_writer_pretty(&mut writer, record)
-        .map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    writer
-        .flush()
+    if let Err(e) = serde_json::to_writer_pretty(&mut writer, record) {
+        drop(writer);
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("write {}: {e}", tmp.display()));
+    }
+    if let Err(e) = writer.flush() {
+        drop(writer);
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("flush {}: {e}", tmp.display()));
+    }
+    let file = writer
+        .into_inner()
         .map_err(|e| format!("flush {}: {e}", tmp.display()))?;
-    fs::rename(&tmp, &path)
-        .map_err(|e| format!("rename {} to {}: {e}", tmp.display(), path.display()))?;
-    Ok(())
+    if let Err(e) = file.sync_all() {
+        drop(file);
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("sync {}: {e}", tmp.display()));
+    }
+    drop(file);
+    let linked = fs::hard_link(&tmp, &path);
+    let cleaned = fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => {
+            if let Err(e) = cleaned {
+                // The record is published: the hard link succeeded, so the
+                // write is not retried and the run's scratch evidence is
+                // not discarded. Only the temporary name stayed behind, and
+                // `attempt_in_use` reads a leftover `.tmp` as an occupied
+                // attempt number, so the operator has to hear about it.
+                eprintln!("remove {}: {e}", tmp.display());
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(format!(
+            "record {} already exists; refusing to overwrite it",
+            path.display()
+        )),
+        Err(e) => Err(format!(
+            "link {} to {}: {e}",
+            tmp.display(),
+            path.display()
+        )),
+    }
 }
 
 /// Drop the scratch directory of a run whose record could not be
@@ -566,10 +755,62 @@ fn write_record(out_dir: &Path, record: &RunRecord) -> Result<(), String> {
 /// forever. The raw evidence in there has no consumer without its
 /// record — `read_records` and `doc::load_records` only read `*.json` —
 /// so removing it is what keeps the attempt recoverable once the write
-/// error (a full filesystem, say) is repaired.
+/// error (a full filesystem, say) is repaired. The caller must prove
+/// the run owns that directory ([`created_own_scratch`]) first.
 fn discard_scratch(scratch_dir: &Path, record: &RunRecord) {
     let stem = record.file_name().replace(".json", "");
     let _ = fs::remove_dir_all(scratch_dir.join(stem));
+}
+
+/// `true` when `record`'s run created its own scratch directory, which
+/// is what licences [`discard_scratch`] to remove it. [`attempt_in_use`]
+/// skips an attempt number whose files are already there, but it cannot
+/// stop a second process that inspected the same empty output directory
+/// before either run created anything: both pass the check, one wins
+/// the exclusive `create_dir` in `runner::run_one`, and the loser's
+/// record carries [`SCRATCH_REUSED_PREFIX`]. That loser's own record
+/// write then collides with the winner's published one, so without this
+/// proof its cleanup would delete the winner's raw evidence.
+fn created_own_scratch(record: &RunRecord) -> bool {
+    !record
+        .harness_errors
+        .iter()
+        .any(|e| e.starts_with(SCRATCH_REUSED_PREFIX))
+}
+
+/// The first file any repetition of `spec`'s attempt already left
+/// behind: a record, a temporary record, or a scratch directory.
+/// `None` when the attempt number is free. Such an attempt number
+/// belongs to an earlier run — one cut short before its record was
+/// published, say — so dispatching it would collide with that run's
+/// files. The occupying path is returned rather than a bare `true` so
+/// the caller's skip diagnostic can name what pushed the attempt
+/// number on. `symlink_metadata` counts a dangling symlink as present;
+/// only `NotFound` counts as absent, and any other inspection error is
+/// returned, because unknown occupancy is no licence to dispatch.
+fn attempt_in_use(
+    spec: &RunSpec,
+    repetitions: u32,
+    out_dir: &Path,
+    scratch_dir: &Path,
+) -> Result<Option<PathBuf>, String> {
+    for rep in 1..=repetitions {
+        let mut planned = spec.clone();
+        planned.repetition = rep;
+        let stem = stem_for(&planned);
+        for path in [
+            out_dir.join(format!("{stem}.json")),
+            out_dir.join(format!("{stem}.json.tmp")),
+            scratch_dir.join(&stem),
+        ] {
+            match fs::symlink_metadata(&path) {
+                Ok(_) => return Ok(Some(path)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("inspect {}: {e}", path.display())),
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Drive the §9.1 matrix end to end. Each `(workers, qos)` pair runs
@@ -612,6 +853,13 @@ pub fn run_matrix_with<F: FnMut(&RunSpec) -> RunRecord>(
     } else {
         (HashMap::new(), Vec::new())
     };
+    let remaining: HashMap<ConfigKey, u32> = plan
+        .iter()
+        .filter_map(|(key, state)| match state {
+            ResumeState::NextAttempt { remaining, .. } => Some((*key, *remaining)),
+            ResumeState::Passed => None,
+        })
+        .collect();
 
     let mut outcome = MatrixOutcome::default();
 
@@ -645,6 +893,7 @@ pub fn run_matrix_with<F: FnMut(&RunSpec) -> RunRecord>(
             }
             let thr_outcome = run_configs(
                 &thr_specs,
+                &remaining,
                 &constants,
                 &spec.out_dir,
                 &host.scratch_dir,
@@ -752,6 +1001,7 @@ pub fn run_matrix_with<F: FnMut(&RunSpec) -> RunRecord>(
             }
             let lat_outcome = run_configs(
                 &lat_specs,
+                &remaining,
                 &constants,
                 &spec.out_dir,
                 &host.scratch_dir,
@@ -787,6 +1037,7 @@ pub fn run_matrix_with<F: FnMut(&RunSpec) -> RunRecord>(
         }
         let conn_outcome = run_configs(
             &conn_specs,
+            &remaining,
             &constants,
             &spec.out_dir,
             &host.scratch_dir,
@@ -819,12 +1070,13 @@ fn key_of(spec: &RunSpec) -> ConfigKey {
 /// not run: its highest attempt already passed, and running it again
 /// would reuse the scratch directory `run_one` refuses, so the invalid
 /// record it returned would overwrite the passing JSON under the same
-/// filename. A `NextAttempt(a)` config runs with `spec.attempt = a`.
+/// filename. A `NextAttempt { attempt, .. }` config runs with
+/// `spec.attempt = attempt`.
 fn plan_spec(plan: &HashMap<ConfigKey, ResumeState>, spec: &mut RunSpec) -> bool {
     match plan.get(&key_of(spec)) {
         Some(ResumeState::Passed) => false,
-        Some(ResumeState::NextAttempt(a)) => {
-            spec.attempt = *a;
+        Some(ResumeState::NextAttempt { attempt, .. }) => {
+            spec.attempt = *attempt;
             true
         }
         None => true,
@@ -848,12 +1100,14 @@ fn out_dir_has_json(dir: &Path) -> Result<bool, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(format!("read out dir: {e}")),
     };
-    for entry in entries.flatten() {
+    let mut has_json = false;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read out dir entry: {e}"))?;
         if entry.path().extension().and_then(|e| e.to_str()) == Some("json") {
-            return Ok(true);
+            has_json = true;
         }
     }
-    Ok(false)
+    Ok(has_json)
 }
 
 fn merge_records(a: Vec<RunRecord>, b: Vec<RunRecord>) -> Vec<RunRecord> {

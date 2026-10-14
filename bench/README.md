@@ -416,8 +416,10 @@ Exit codes:
 - `1` — refusal (missing `perf-bin`, missing `mosquitto-bin`, output
   directory already holds `*.json`, dirty / mismatched build when
   `--resume` is set, a `--perf-bin`/`--strace-bin` the selected
-  `--syscalls` does not use, missing provenance) or SIGINT/SIGTERM
-  during the preflight.
+  `--syscalls` does not use, missing provenance, a provenance
+  `git rev-parse` that fails or does not answer within
+  `GIT_HEAD_TIMEOUT_SECS` (5 s)) or SIGINT/SIGTERM during the
+  preflight.
 
 The recorded profile runs only the full fixed matrix; `check_request`
 refuses `--servers`/`--workers`/`--qos` subsets.
@@ -426,8 +428,35 @@ refuses `--servers`/`--workers`/`--qos` subsets.
 refuses records from another build or host (`check_resume` runs
 `analysis::recompute` on every existing file), skips configurations
 whose highest attempt passed, and continues attempt numbering for
-the rest. Interruptions during the preflight exit 1 with `cancelled`
-on stderr.
+the rest. Only a completed attempt — repetitions `1..=repetitions`
+each present once, none marked `"cancelled": true` — counts against
+`max_config_attempts`. An interrupted attempt (SIGINT/SIGTERM, or a
+record that could not be written) costs nothing: the records it wrote
+stay on disk, a run that returned after the signal is kept with
+`"cancelled": true`, and `--resume` continues the configuration at the
+next attempt number, so attempt numbers can exceed
+`max_config_attempts`. `--resume` needs at least one published record
+in `--out`; an interruption before the first record was published
+leaves none, and `--resume` then answers `nothing to resume`. The same
+answer comes when `--out` names the wrong directory (the recorded
+command's `$(date +%F)` part changes at midnight), so first check
+that `--out` names the interrupted run's directory, then start the
+run again there without `--resume`. Interruptions during the preflight
+exit 1 with `cancelled` on stderr.
+
+A record write never replaces a file. Before a run starts, an
+attempt number whose record, `<name>.json.tmp` or scratch directory
+already exists — left by a run that was killed, say — is skipped at
+no cost to the attempt budget, and those files stay untouched. A
+record or temporary record that appears while a run is in progress
+stops the run with exit 1 naming that path and leaves it untouched.
+The scratch directory of a run whose record could not be written is
+dropped only when that run created it itself, never one another run
+owns. The occupancy check reads the directory before a run starts, so
+it cannot order two runs started at the same time against the same
+`--out`: give every recorded session its own output directory. An
+output directory that cannot be listed completely is refused before
+anything runs.
 
 ## Document generation
 
@@ -459,13 +488,13 @@ exit 1:
   a blank version.
 - `InconsistentRecord(file: mismatches)` — `recompute` rejected at
   least one record.
-- `ProtocolViolation(text)` — recorded constants diverge, repetition
-  set is missing or non-`1..=5`, a counted run lacks a counter, a
-  latency run carries one, or a latency rate does not match the
-  throughput medians.
+- `ProtocolViolation(text)` — recorded constants diverge, a counted
+  run lacks a counter, a latency run carries one, or a latency rate
+  does not match the throughput medians.
 - `FailedConfigurations(names)` — the fixed matrix is missing or
-  failed configurations, listed by kebab-case label
-  (`uring-w1-q1-throughput`).
+  failed configurations (a highest attempt that is invalid, too
+  spread, missing a metric, or not exactly repetitions `1..=5`),
+  listed by kebab-case label (`uring-w1-q1-throughput`).
 
 The list is not `render`'s check order — some `ProtocolViolation`
 checks run before `FailedConfigurations` and the counter-evidence ones
@@ -581,7 +610,9 @@ number, so a configuration that succeeds on attempt 2 leaves both
 `bench run` is the committed raw artefact: the `*.json` files under
 `<out>/` are what `BENCHMARKS.md` is generated from. Do not delete
 them between runs; `--resume` reads them, and the owner sign-off
-cross-references them.
+cross-references them. `bench run --resume` and `bench doc` refuse a
+`*.json` whose name is not the name its record computes, so never
+rename or copy a record inside `<out>/`.
 
 ## Reading this file
 
