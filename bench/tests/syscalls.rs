@@ -11,8 +11,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+use bench::record::DeliveryReport;
 use bench::run_record::{
-    CounterExit, CpuSets, Profile, RunKind, RunRecord, ServerKind, SyscallMethod,
+    CounterExit, CpuSets, Profile, RunKind, RunRecord, ServerKind, SyscallMethod, Syscalls,
 };
 use bench::runner::{
     capture_env, run_one, HostSetup, RunSpec, COUNTER_BOUNDARY_TOLERANCE_NS,
@@ -78,18 +79,18 @@ fn window_deliveries(record: &RunRecord) -> u64 {
         .sum()
 }
 
-/// Smoke 80 % latency run: uring, 1 worker, QoS 1, offered_rate=2.
-/// The brief writes `Some(2000)`; on this WSL2 host the generator
-/// timer precision alone exceeds `GENERATOR_LATENESS_FRACTION × latency
-/// p99` for any rate whose inter-slot gap falls below ~5 ms, so a
-/// tiny rate keeps the test focused on the counter surface area.
-fn latency_spec() -> RunSpec {
+/// Smoke counted run: uring, 1 worker, QoS 1, offered_rate=2.
+/// On this WSL2 host the generator timer precision alone exceeds
+/// `GENERATOR_LATENESS_FRACTION × latency p99` for any rate whose inter-slot
+/// gap falls below ~5 ms, so a tiny rate keeps the test focused on the
+/// counter surface area.
+fn counted_spec() -> RunSpec {
     RunSpec {
         profile: Profile::Smoke,
         server: ServerKind::Uring,
         workers: 1,
         qos: Some(1),
-        kind: RunKind::Latency,
+        kind: RunKind::Counted,
         rate_fraction_pct: Some(80),
         offered_rate: Some(2),
         repetition: 1,
@@ -281,7 +282,7 @@ fn run_one_counts_syscalls_through_the_perf_control_protocol() {
     let dir = temp_dir("perf-success");
     let script = make_script(&dir, "fake-perf.sh", FAKE_PERF_SUCCESS);
     let host = make_host(&dir, SyscallMethod::Perf, Some(script));
-    let record = run_one(&latency_spec(), &host);
+    let record = run_one(&counted_spec(), &host);
 
     // The brief asks for `valid`; the recorded record here is the
     // counter surface area, not the run. On this WSL2 host the
@@ -357,7 +358,7 @@ fn run_one_kills_a_hung_syscall_counter_and_invalidates_the_run() {
     let script = make_script(&dir, "fake-perf.sh", &body);
     let host = make_host(&dir, SyscallMethod::Perf, Some(script));
     let start = std::time::Instant::now();
-    let record = run_one(&latency_spec(), &host);
+    let record = run_one(&counted_spec(), &host);
     let elapsed = start.elapsed();
     let budget = std::time::Duration::from_secs(
         2 + 5 + bench::runner::COUNTER_CONTROL_TIMEOUT_SECS + 30,
@@ -398,7 +399,7 @@ fn run_one_invalidates_a_run_whose_counter_exits_nonzero() {
     let dir = temp_dir("perf-nonzero");
     let script = make_script(&dir, "fake-perf.sh", FAKE_PERF_NONZERO_EXIT);
     let host = make_host(&dir, SyscallMethod::Perf, Some(script));
-    let record = run_one(&latency_spec(), &host);
+    let record = run_one(&counted_spec(), &host);
 
     assert!(!record.valid, "nonzero counter exit must invalidate the run");
     assert!(
@@ -421,7 +422,7 @@ fn run_one_invalidates_a_strace_run_with_partial_attachment() {
     let dir = temp_dir("strace-partial");
     let script = make_script(&dir, "fake-strace.sh", FAKE_STRACE_PARTIAL);
     let host = make_host(&dir, SyscallMethod::Strace, Some(script));
-    let record = run_one(&latency_spec(), &host);
+    let record = run_one(&counted_spec(), &host);
 
     assert!(!record.valid, "partial-attachment strace run must be invalid");
     assert!(
@@ -453,7 +454,7 @@ fn run_one_records_a_strace_count_and_its_confirmed_stop() {
     let dir = temp_dir("strace-success");
     let script = make_script(&dir, "fake-strace.sh", FAKE_STRACE_SUCCESS);
     let host = make_host(&dir, SyscallMethod::Strace, Some(script));
-    let record = run_one(&latency_spec(), &host);
+    let record = run_one(&counted_spec(), &host);
 
     assert_eq!(record.syscalls.method, SyscallMethod::Strace);
     assert_eq!(record.syscalls.count, Some(100));
@@ -489,7 +490,7 @@ fn run_one_invalidates_a_run_whose_counter_acknowledges_late() {
     let dir = temp_dir("perf-late");
     let script = make_script(&dir, "fake-perf.sh", FAKE_PERF_LATE_ACK);
     let host = make_host(&dir, SyscallMethod::Perf, Some(script));
-    let record = run_one(&latency_spec(), &host);
+    let record = run_one(&counted_spec(), &host);
 
     assert!(
         !record.valid,
@@ -506,4 +507,156 @@ fn run_one_invalidates_a_run_whose_counter_acknowledges_late() {
     );
 
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn run_one_attaches_no_counter_to_a_latency_run() {
+    for (method, body) in [
+        (SyscallMethod::Perf, FAKE_PERF_SUCCESS),
+        (SyscallMethod::Strace, FAKE_STRACE_SUCCESS),
+    ] {
+        for pct in [50, 80] {
+            let dir = temp_dir("latency-no-counter");
+            let marker = dir.join("counter-invoked");
+            let script = make_script(
+                &dir,
+                "fake-counter.sh",
+                // Quoted: a TMPDIR with a space must not split the path,
+                // or the marker stops proving the counter never started.
+                &format!("touch \"{}\"\n{body}", marker.display()),
+            );
+            let host = make_host(&dir, method, Some(script));
+            let mut spec = counted_spec();
+            spec.kind = RunKind::Latency;
+            spec.rate_fraction_pct = Some(pct);
+            let record = run_one(&spec, &host);
+
+            assert!(
+                !marker.exists(),
+                "counter executable must never start for a latency run (method {method:?}, pct {pct})"
+            );
+            assert_eq!(
+                record.syscalls,
+                Syscalls {
+                    method: SyscallMethod::None,
+                    count: None,
+                    per_msg: None,
+                    raw: None,
+                    enabled_ns: None,
+                    disabled_ns: None,
+                    exit: None,
+                    diagnostics: None,
+                },
+                "method {method:?}, pct {pct}"
+            );
+            assert!(
+                record.harness_errors.is_empty(),
+                "method {method:?}, pct {pct}: harness_errors {:?}",
+                record.harness_errors
+            );
+            assert!(
+                window_deliveries(&record) > 0,
+                "method {method:?}, pct {pct}: run must reach and measure its window"
+            );
+            assert!(
+                !record
+                    .invalid_reasons
+                    .iter()
+                    .any(|r| r.starts_with("syscall") || r.starts_with("counter")),
+                "method {method:?}, pct {pct}: unexpected counter-related invalid reason in {:?}",
+                record.invalid_reasons
+            );
+            let histogram = &record
+                .latency_ns
+                .as_ref()
+                .expect("latency_ns present on a latency run")
+                .histogram;
+            assert!(
+                !histogram.is_empty(),
+                "method {method:?}, pct {pct}: latency histogram must not be empty"
+            );
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+}
+
+#[test]
+fn run_one_keeps_the_latency_histogram_of_a_counted_run() {
+    let dir = temp_dir("counted-histogram");
+    let script = make_script(&dir, "fake-perf.sh", FAKE_PERF_SUCCESS);
+    let host = make_host(&dir, SyscallMethod::Perf, Some(script));
+    let record = run_one(&counted_spec(), &host);
+
+    let report_path = dir
+        .join("uring-w1-q1-counted-p80-a1-r1")
+        .join("endpoint.json");
+    let data = fs::read_to_string(&report_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", report_path.display()));
+    let report: DeliveryReport =
+        serde_json::from_str(&data).expect("parse endpoint report json");
+
+    let histogram = &record
+        .latency_ns
+        .as_ref()
+        .expect("latency_ns present on a counted run")
+        .histogram;
+    assert_eq!(histogram, &report.latency);
+    let total: u64 = report.latency.iter().map(|(_, count)| *count).sum();
+    assert!(
+        total > 0,
+        "endpoint report latency histogram must have counts; got {:?}",
+        report.latency
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn run_one_names_no_counter_on_a_latency_run_that_fails_before_its_window() {
+    for method in [SyscallMethod::Perf, SyscallMethod::Strace] {
+        let fake_body = match method {
+            SyscallMethod::Perf => FAKE_PERF_SUCCESS,
+            SyscallMethod::Strace => FAKE_STRACE_SUCCESS,
+            SyscallMethod::None => unreachable!("make_host is only called with Perf or Strace"),
+        };
+        let dir = temp_dir("reused-scratch");
+        let script = make_script(&dir, "fake-counter.sh", fake_body);
+        let host = make_host(&dir, method, Some(script));
+
+        let mut latency = counted_spec();
+        latency.kind = RunKind::Latency;
+        let latency_scratch = dir.join("uring-w1-q1-latency-p80-a1-r1");
+        fs::create_dir_all(&latency_scratch).expect("pre-create latency scratch dir");
+        let latency_record = run_one(&latency, &host);
+        assert_eq!(
+            latency_record.syscalls,
+            Syscalls {
+                method: SyscallMethod::None,
+                count: None,
+                per_msg: None,
+                raw: None,
+                enabled_ns: None,
+                disabled_ns: None,
+                exit: None,
+                diagnostics: None,
+            },
+            "method {method:?}: early-failing latency run must name no counter"
+        );
+
+        let counted = counted_spec();
+        let counted_scratch = dir.join("uring-w1-q1-counted-p80-a1-r1");
+        fs::create_dir_all(&counted_scratch).expect("pre-create counted scratch dir");
+        let counted_record = run_one(&counted, &host);
+        assert_eq!(counted_record.syscalls.method, method, "method {method:?}");
+        assert_eq!(counted_record.syscalls.count, None, "method {method:?}");
+        assert_eq!(counted_record.syscalls.per_msg, None, "method {method:?}");
+        assert_eq!(counted_record.syscalls.raw, None, "method {method:?}");
+        assert_eq!(counted_record.syscalls.enabled_ns, None, "method {method:?}");
+        assert_eq!(counted_record.syscalls.disabled_ns, None, "method {method:?}");
+        assert_eq!(counted_record.syscalls.exit, None, "method {method:?}");
+        assert_eq!(counted_record.syscalls.diagnostics, None, "method {method:?}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

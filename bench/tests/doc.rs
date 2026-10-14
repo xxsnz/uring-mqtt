@@ -17,7 +17,7 @@ use bench::matrix::{servers_for, RECORDED_QOS, RECORDED_SERVERS, RECORDED_WORKER
 use bench::record::{Timeline, Window};
 use bench::run_record::{
     Build, ConfigKey, CounterExit, Counts, CpuSets, CpuUsage, Env, GeneratorErrors,
-    LatencySummary, Profile, RunKind, RunRecord, ServerKind, Syscalls, SyscallMethod,
+    LatencySummary, Profile, RunKind, RunRecord, ServerKind, Syscalls, SyscallMethod, SCHEMA_VERSION,
 };
 
 const WARMUP_SECS: u64 = 10;
@@ -148,7 +148,7 @@ fn throughput_record(server: ServerKind, workers: u32, qos: u8, rep: u32) -> Run
         ServerKind::Mosquitto => None,
     };
     RunRecord {
-        schema: 1,
+        schema: SCHEMA_VERSION,
         profile: Profile::Recorded,
         server,
         workers,
@@ -215,19 +215,7 @@ fn latency_record(
     // Timeline = uniform `rate` per second across warmup + window seconds.
     let timeline_counts = vec![rate; usize::try_from(WARMUP_SECS + WINDOW_SECS).expect("fits")];
     let delivered = total_scheduled;
-    let mut syscalls = base_syscalls();
-    if pct == 80 {
-        syscalls = Syscalls {
-            method: SyscallMethod::Perf,
-            count: Some(PERF_COUNT),
-            per_msg: Some(PERF_COUNT as f64 / total_window as f64),
-            raw: Some(PERF_RAW.to_string()),
-            enabled_ns: Some(WINDOW_START_NS),
-            disabled_ns: Some(WINDOW_END_NS),
-            exit: Some(CounterExit::Signal(2)),
-            diagnostics: None,
-        };
-    }
+    let syscalls = base_syscalls();
     let driver = match server {
         ServerKind::Uring => Some(bench::run_record::DriverFds {
             io_uring_fds: workers,
@@ -240,7 +228,7 @@ fn latency_record(
         ServerKind::Mosquitto => None,
     };
     RunRecord {
-        schema: 1,
+        schema: SCHEMA_VERSION,
         profile: Profile::Recorded,
         server,
         workers,
@@ -297,6 +285,25 @@ fn latency_record(
     }
 }
 
+/// Counted run (§9.1): paced like the 80 % latency record, but under its
+/// own `RunKind::Counted` with the syscall-counter evidence the 80 %
+/// latency record used to carry.
+fn counted_record(server: ServerKind, workers: u32, qos: u8, rep: u32) -> RunRecord {
+    let mut rec = latency_record(server, workers, qos, 80, rep);
+    rec.kind = RunKind::Counted;
+    rec.syscalls = Syscalls {
+        method: SyscallMethod::Perf,
+        count: Some(PERF_COUNT),
+        per_msg: Some(PERF_COUNT as f64 / 4800.0),
+        raw: Some(PERF_RAW.to_string()),
+        enabled_ns: Some(WINDOW_START_NS),
+        disabled_ns: Some(WINDOW_END_NS),
+        exit: Some(CounterExit::Signal(2)),
+        diagnostics: None,
+    };
+    rec
+}
+
 #[allow(clippy::cast_precision_loss)]
 fn connections_record(server: ServerKind, workers: u32, rep: u32) -> RunRecord {
     let cycles = 60_000u64;
@@ -313,7 +320,7 @@ fn connections_record(server: ServerKind, workers: u32, rep: u32) -> RunRecord {
         ServerKind::Mosquitto => None,
     };
     RunRecord {
-        schema: 1,
+        schema: SCHEMA_VERSION,
         profile: Profile::Recorded,
         server,
         workers,
@@ -355,7 +362,7 @@ fn connections_record(server: ServerKind, workers: u32, rep: u32) -> RunRecord {
     }
 }
 
-/// All 35 configurations × 5 repetitions with the brief's recorded fixture.
+/// All 45 configurations × 5 repetitions with the brief's recorded fixture.
 #[allow(clippy::too_many_lines)]
 fn full_recorded_set() -> Vec<RunRecord> {
     let mut out: Vec<RunRecord> = Vec::new();
@@ -367,6 +374,7 @@ fn full_recorded_set() -> Vec<RunRecord> {
                     out.push(throughput_record(s, w, q, rep));
                     out.push(latency_record(s, w, q, 50, rep));
                     out.push(latency_record(s, w, q, 80, rep));
+                    out.push(counted_record(s, w, q, rep));
                 }
             }
         }
@@ -403,6 +411,13 @@ fn expected_configs() -> Vec<ConfigKey> {
                         rate_fraction_pct: pct,
                     });
                 }
+                out.push(ConfigKey {
+                    server: s,
+                    workers: w,
+                    qos: Some(q),
+                    kind: RunKind::Counted,
+                    rate_fraction_pct: Some(80u32),
+                });
             }
         }
         for &s in &servers {
@@ -457,9 +472,9 @@ fn render_refuses_a_matrix_missing_its_four_worker_rows() {
         .collect();
     match render(&records, false) {
         Err(DocError::FailedConfigurations(names)) => {
-            assert_eq!(names.len(), 14, "expected 14 failed names, got {names:?}");
+            assert_eq!(names.len(), 18, "expected 18 failed names, got {names:?}");
         }
-        other => panic!("expected FailedConfigurations with 14 names, got {other:?}"),
+        other => panic!("expected FailedConfigurations with 18 names, got {other:?}"),
     }
 }
 
@@ -612,14 +627,14 @@ fn render_keeps_a_record_string_inside_its_table_cell() {
 
 #[test]
 fn render_refuses_mixed_syscall_counter_methods() {
-    // One 80 % record resumed under strace after the others ran under
+    // One counted record resumed under strace after the others ran under
     // perf: the method label would read `perf, strace` and the figures
     // would be an unexplained mixed-method comparison.
     let mut records = full_recorded_set();
     let target = records
         .iter_mut()
-        .find(|r| r.kind == RunKind::Latency && r.rate_fraction_pct == Some(80))
-        .expect("an 80% latency record");
+        .find(|r| r.kind == RunKind::Counted)
+        .expect("a counted record");
     target.syscalls.method = SyscallMethod::Strace;
     target.syscalls.raw = Some(STRACE_RAW.to_string());
     match render(&records, false) {
@@ -698,10 +713,20 @@ fn render_refuses_an_inconsistent_record() {
 #[test]
 fn render_refuses_an_unsupported_schema() {
     let mut records = full_recorded_set();
-    records[0].schema = 2;
+    records[0].schema = SCHEMA_VERSION + 1;
     match render(&records, false) {
-        Err(DocError::UnsupportedSchema(2)) => {}
-        other => panic!("expected UnsupportedSchema(2), got {other:?}"),
+        Err(DocError::UnsupportedSchema(n)) if n == SCHEMA_VERSION + 1 => {}
+        other => panic!("expected UnsupportedSchema({}), got {other:?}", SCHEMA_VERSION + 1),
+    }
+}
+
+#[test]
+fn render_refuses_a_record_of_the_previous_schema() {
+    let mut records = full_recorded_set();
+    records[0].schema = 1;
+    match render(&records, false) {
+        Err(DocError::UnsupportedSchema(1)) => {}
+        other => panic!("expected UnsupportedSchema(1), got {other:?}"),
     }
 }
 
@@ -768,38 +793,11 @@ fn render_refuses_a_latency_rate_not_matched_to_throughput() {
         histogram: vec![(80_000, window_scheduled)],
     });
     target.lateness = vec![(1000, window_scheduled)];
-    target.syscalls.count = Some(PERF_COUNT);
-    target.syscalls.per_msg = Some(PERF_COUNT as f64 / window_scheduled as f64);
     match render(&records, false) {
         Err(DocError::ProtocolViolation(text)) => {
             assert!(text.contains("offered_rate"), "text = {text}");
         }
         other => panic!("expected ProtocolViolation(offered_rate), got {other:?}"),
-    }
-}
-
-#[test]
-fn render_refuses_an_eighty_percent_run_without_counter_evidence() {
-    let mut records = full_recorded_set();
-    let target = records
-        .iter_mut()
-        .find(|r| r.kind == RunKind::Latency && r.rate_fraction_pct == Some(80))
-        .expect("an 80% latency record");
-    target.syscalls = Syscalls {
-        method: SyscallMethod::None,
-        count: None,
-        per_msg: None,
-        raw: None,
-        enabled_ns: None,
-        disabled_ns: None,
-        exit: None,
-        diagnostics: None,
-    };
-    match render(&records, false) {
-        Err(DocError::ProtocolViolation(text)) => {
-            assert!(text.contains("counter"), "text = {text}");
-        }
-        other => panic!("expected ProtocolViolation(counter), got {other:?}"),
     }
 }
 
@@ -862,6 +860,34 @@ fn render_refuses_counter_evidence_on_a_row_the_matrix_does_not_count() {
             );
         }
         other => panic!("expected ProtocolViolation(counter method), got {other:?}"),
+    }
+
+    // (c) an 80 % latency record instrumented like the counted run: a
+    // latency record is never counted now that `RunKind::Counted` is its
+    // own row.
+    let mut records = full_recorded_set();
+    let target = records
+        .iter_mut()
+        .find(|r| r.kind == RunKind::Latency && r.rate_fraction_pct == Some(80))
+        .expect("an 80% latency record");
+    target.syscalls = Syscalls {
+        method: SyscallMethod::Perf,
+        count: Some(PERF_COUNT),
+        per_msg: Some(PERF_COUNT as f64 / 4800.0),
+        raw: Some(PERF_RAW.to_string()),
+        enabled_ns: Some(WINDOW_START_NS),
+        disabled_ns: Some(WINDOW_END_NS),
+        exit: Some(CounterExit::Signal(2)),
+        diagnostics: None,
+    };
+    match render(&records, false) {
+        Err(DocError::ProtocolViolation(text)) => {
+            assert!(
+                text.contains("counter evidence") && text.contains("does not count"),
+                "text = {text}"
+            );
+        }
+        other => panic!("expected ProtocolViolation(counter evidence), got {other:?}"),
     }
 }
 
@@ -1348,14 +1374,14 @@ fn render_accepts_environment_fields_that_render_a_non_blank_cell() {
 
 #[test]
 fn render_discloses_the_epic_strace_bias_for_strace_counts() {
-    // (a) every 80 % latency record resumed under strace: the method
+    // (a) every counted record resumed under strace: the method
     // label must carry §9.1's own ptrace caveat, not the stale
     // "inflates" wording.
     let mut records = full_recorded_set();
     let mut mutated = 0usize;
     for rec in records
         .iter_mut()
-        .filter(|r| r.kind == RunKind::Latency && r.rate_fraction_pct == Some(80))
+        .filter(|r| r.kind == RunKind::Counted)
     {
         assert_eq!(
             rec.syscalls.method,
@@ -1617,18 +1643,17 @@ fn render_refuses_a_configuration_outside_the_recorded_matrix() {
 
 #[test]
 fn render_refuses_a_failed_earlier_attempt_without_counter_evidence() {
-    // The uring 1-worker QoS 1 80 % configuration failed attempt 1 with
-    // no syscall counter and passed attempt 2 with perf. Counter
-    // evidence is required of every 80 % record, not only the published
-    // attempt.
+    // The uring 1-worker QoS 1 counted configuration failed attempt 1
+    // with no syscall counter and passed attempt 2 with perf. Counter
+    // evidence is required of every counted record, not only the
+    // published attempt.
     let mut records = full_recorded_set();
     let mut first_attempt: Vec<RunRecord> = Vec::new();
     for r in &mut records {
         if r.server == ServerKind::Uring
             && r.workers == 1
             && r.qos == Some(1)
-            && r.kind == RunKind::Latency
-            && r.rate_fraction_pct == Some(80)
+            && r.kind == RunKind::Counted
         {
             let mut failed = r.clone();
             failed.syscalls = Syscalls {
@@ -1643,7 +1668,7 @@ fn render_refuses_a_failed_earlier_attempt_without_counter_evidence() {
             };
             failed.generator_errors.stalled = 3;
             failed.valid = false;
-            failed.invalid_reasons = vec!["stalled connections 3".to_string()];
+            failed.invalid_reasons = bench::analysis::reconcile(&failed);
             first_attempt.push(failed);
             r.attempt = 2;
         }
@@ -1656,9 +1681,14 @@ fn render_refuses_a_failed_earlier_attempt_without_counter_evidence() {
     records.extend(first_attempt);
     match render(&records, false) {
         Err(DocError::ProtocolViolation(text)) => {
-            assert!(text.contains("counter"), "text = {text}");
+            assert!(
+                text.contains("counted record without counter evidence"),
+                "text = {text}"
+            );
         }
-        other => panic!("expected ProtocolViolation(counter), got {other:?}"),
+        other => panic!(
+            "expected ProtocolViolation(counted record without counter evidence), got {other:?}"
+        ),
     }
 }
 
@@ -1695,8 +1725,6 @@ fn render_refuses_a_failed_earlier_attempt_at_an_unmatched_rate() {
                 histogram: vec![(80_000, window_scheduled)],
             });
             failed.lateness = vec![(1000, window_scheduled)];
-            failed.syscalls.count = Some(PERF_COUNT);
-            failed.syscalls.per_msg = Some(PERF_COUNT as f64 / window_scheduled as f64);
             failed.generator_errors.stalled = 3;
             failed.valid = false;
             failed.invalid_reasons = vec!["stalled connections 3".to_string()];
@@ -1716,4 +1744,173 @@ fn render_refuses_a_failed_earlier_attempt_at_an_unmatched_rate() {
         }
         other => panic!("expected ProtocolViolation(offered_rate), got {other:?}"),
     }
+}
+
+#[test]
+fn render_refuses_a_recorded_set_missing_its_counted_runs() {
+    // Every `RunKind::Counted` record dropped: §9.1's `syscalls/msg`
+    // evidence is its own configuration, so a set without it is as
+    // incomplete as a set missing a worker row.
+    let records: Vec<RunRecord> = full_recorded_set()
+        .into_iter()
+        .filter(|r| r.kind != RunKind::Counted)
+        .collect();
+    match render(&records, false) {
+        Err(DocError::FailedConfigurations(names)) => {
+            assert_eq!(names.len(), 10, "expected 10 failed names, got {names:?}");
+            assert!(
+                names.iter().all(|n| n.ends_with("-counted")),
+                "expected every name to end with -counted, got {names:?}"
+            );
+        }
+        other => panic!("expected FailedConfigurations with 10 names, got {other:?}"),
+    }
+}
+
+#[test]
+fn render_reads_syscalls_from_the_counted_run_and_p99_from_the_uncounted_run() {
+    // The counted run's own count/raw/per_msg feed the table's
+    // `syscalls/msg` cell; its own p99 must never leak into the p99
+    // column, which stays the uncounted 80 % record's figure.
+    let mut records = full_recorded_set();
+    let mut mutated = 0usize;
+    for r in records.iter_mut().filter(|r| {
+        r.server == ServerKind::Uring
+            && r.workers == 1
+            && r.qos == Some(1)
+            && r.kind == RunKind::Counted
+    }) {
+        r.syscalls.count = Some(12000);
+        r.syscalls.raw = Some("12000,,raw_syscalls:sys_enter,60000000000,100.00,,\n".to_string());
+        r.syscalls.per_msg = Some(2.5);
+        r.latency_ns = Some(LatencySummary {
+            p50: 160_000,
+            p99: 160_000,
+            max: 160_000,
+            histogram: vec![(160_000, 4800)],
+        });
+        mutated += 1;
+    }
+    assert_eq!(
+        mutated,
+        usize::try_from(REPETITIONS).expect("fits"),
+        "expected one counted record per repetition"
+    );
+
+    let doc = render(&records, false).expect("render ok");
+    assert!(
+        doc.contains("| uring | 100 | 3.0 % | 95.0 | 40.0 | 40.0 | 80.0 | 2.50 | ok |"),
+        "missing the counted syscalls/msg row in:\n{doc}"
+    );
+    assert!(
+        !doc.contains("160.0"),
+        "the counted run's own p99 leaked into the table:\n{doc}"
+    );
+}
+
+#[test]
+fn render_refuses_a_counted_run_rate_not_matched_to_throughput() {
+    // Copy of `render_refuses_a_latency_rate_not_matched_to_throughput`
+    // targeting the first `Counted` record: the counted run is paced at
+    // the matched rate too, so an unmatched offered_rate refuses it the
+    // same way.
+    let mut records = full_recorded_set();
+    let target = records
+        .iter_mut()
+        .find(|r| r.kind == RunKind::Counted)
+        .expect("a counted record");
+    let rate = 81u64;
+    let (scheduled, window_scheduled) = slot_counts(rate, target.origin_ns, target.window);
+    target.offered_rate = Some(rate);
+    target.counts.scheduled = Some(scheduled);
+    target.counts.window_scheduled = Some(window_scheduled);
+    target.counts.offered = scheduled;
+    target.counts.delivered = scheduled;
+    target.counts.acked = Some(scheduled);
+    target.timeline.counts =
+        vec![rate; usize::try_from(WARMUP_SECS + WINDOW_SECS).expect("fits")];
+    target.latency_ns = Some(LatencySummary {
+        p50: 80_000,
+        p99: 80_000,
+        max: 80_000,
+        histogram: vec![(80_000, window_scheduled)],
+    });
+    target.lateness = vec![(1000, window_scheduled)];
+    target.syscalls.count = Some(PERF_COUNT);
+    target.syscalls.per_msg = Some(PERF_COUNT as f64 / (81 * WINDOW_SECS) as f64);
+    match render(&records, false) {
+        Err(DocError::ProtocolViolation(text)) => {
+            assert!(text.contains("offered_rate"), "text = {text}");
+        }
+        other => panic!("expected ProtocolViolation(offered_rate), got {other:?}"),
+    }
+}
+
+#[test]
+fn render_states_that_latency_and_syscalls_come_from_separate_runs() {
+    let records = full_recorded_set();
+    let doc = render(&records, false).expect("render ok");
+    let expected_line = "Both latency columns come from uncounted runs; `syscalls/msg` comes \
+                          from 5 separate counted repetitions at the same matched 80 % rate, \
+                          which qualify on `syscalls/msg` spread. The counted runs' p99 stays \
+                          in the raw JSON and is not published.";
+    assert!(
+        doc.lines().any(|l| l == expected_line),
+        "missing the counted Method line in:\n{doc}"
+    );
+}
+
+#[test]
+fn smoke_render_reads_syscalls_only_from_counted_runs() {
+    // A smoke set that holds no counted run: the syscalls/msg cell and
+    // the Method line both read `n/a`.
+    let mut records = vec![
+        throughput_record(ServerKind::Uring, 1, 1, 1),
+        throughput_record(ServerKind::Uring, 1, 1, 2),
+        latency_record(ServerKind::Uring, 1, 1, 50, 1),
+        latency_record(ServerKind::Uring, 1, 1, 50, 2),
+        latency_record(ServerKind::Uring, 1, 1, 80, 1),
+        latency_record(ServerKind::Uring, 1, 1, 80, 2),
+        connections_record(ServerKind::Uring, 1, 1),
+        connections_record(ServerKind::Uring, 1, 2),
+    ];
+    let doc = render(&records, true).expect("smoke render ok");
+    assert!(
+        doc.lines()
+            .any(|l| l.starts_with("| uring |") && l.ends_with("| 80.0 | n/a | ok |")),
+        "expected the uncounted uring row in:\n{doc}"
+    );
+    let expected_na_line = "Both latency columns come from uncounted runs; `syscalls/msg` is \
+                             `n/a` because this record set holds no counted run.";
+    assert!(
+        doc.lines().any(|l| l == expected_na_line),
+        "missing the n/a Method line in:\n{doc}"
+    );
+    assert!(
+        !doc.contains("separate counted repetitions"),
+        "unexpected counted Method line in:\n{doc}"
+    );
+
+    // Adding the counted run: the syscalls/msg cell and the Method line
+    // both switch to the counted figures.
+    records.push(counted_record(ServerKind::Uring, 1, 1, 1));
+    records.push(counted_record(ServerKind::Uring, 1, 1, 2));
+    let doc = render(&records, true).expect("smoke render ok");
+    assert!(
+        doc.lines()
+            .any(|l| l.starts_with("| uring |") && l.ends_with("| 80.0 | 1.25 | ok |")),
+        "expected the counted uring row in:\n{doc}"
+    );
+    let expected_counted_line = "Both latency columns come from uncounted runs; `syscalls/msg` \
+                                  comes from 2 separate counted repetitions at the same matched \
+                                  80 % rate, which qualify on `syscalls/msg` spread. The counted \
+                                  runs' p99 stays in the raw JSON and is not published.";
+    assert!(
+        doc.lines().any(|l| l == expected_counted_line),
+        "missing the counted Method line in:\n{doc}"
+    );
+    assert!(
+        !doc.contains("because this record set holds no counted run"),
+        "unexpected n/a Method line in:\n{doc}"
+    );
 }

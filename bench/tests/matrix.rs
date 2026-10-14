@@ -5,6 +5,7 @@
 //! comparison. The CLI tests for `bench run` itself live in `cli_run.rs`.
 
 #![allow(clippy::too_many_lines)] // test fixtures are dense on purpose
+#![allow(clippy::type_complexity)] // dispatch tuples mix five kinds of value on purpose
 
 use std::collections::HashMap;
 use std::fs;
@@ -12,10 +13,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use bench::analysis::matched_rates;
+use bench::analysis::{matched_rates, reconcile};
 use bench::matrix::{
-    check_request, check_resume, read_records, resume_plan, run_configs, servers_for, MatrixOutcome,
-    MatrixSpec, ResumeState, RECORDED_QOS, RECORDED_SERVERS, RECORDED_WORKERS,
+    check_request, check_resume, read_records, resume_plan, run_configs, run_matrix_with,
+    MatrixOutcome, MatrixSpec, ResumeState, servers_for, RECORDED_QOS, RECORDED_SERVERS,
+    RECORDED_WORKERS,
 };
 use bench::record::Timeline;
 use bench::record::Window;
@@ -23,7 +25,7 @@ use bench::run_record::{
     Build, ConfigKey, Counts, CpuSets, CpuUsage, DriverFds, Env, GeneratorErrors, LatencySummary,
     Profile, RunKind, RunRecord, ServerKind, SyscallMethod, Syscalls, SCHEMA_VERSION,
 };
-use bench::runner::{ProtocolConstants, RunSpec};
+use bench::runner::{HostSetup, ProtocolConstants, RunSpec};
 
 const ORIGIN_NS: u64 = 10_000_000_000;
 const WINDOW_START_NS: u64 = 12_000_000_000;
@@ -508,21 +510,21 @@ fn check_request_refuses_a_repeated_matrix_value() {
         out_dir: temp_dir("req-dup"),
         resume: false,
     };
-    let err = check_request(&spec, SyscallMethod::None, None, None)
+    let err = check_request(&spec, SyscallMethod::None, None, None, None)
         .expect_err("a repeated qos dispatches the same configuration twice");
     assert!(err.contains("--qos"), "{err}");
 
     let mut dup_workers = spec.clone();
     dup_workers.qos = vec![1];
     dup_workers.workers = vec![1, 1];
-    let err = check_request(&dup_workers, SyscallMethod::None, None, None)
+    let err = check_request(&dup_workers, SyscallMethod::None, None, None, None)
         .expect_err("a repeated worker count dispatches the same configuration twice");
     assert!(err.contains("--workers"), "{err}");
 
     let mut dup_servers = spec.clone();
     dup_servers.qos = vec![1];
     dup_servers.servers = vec![ServerKind::Uring, ServerKind::Uring];
-    let err = check_request(&dup_servers, SyscallMethod::None, None, None)
+    let err = check_request(&dup_servers, SyscallMethod::None, None, None, None)
         .expect_err("a repeated server dispatches the same configuration twice");
     assert!(err.contains("--servers"), "{err}");
 }
@@ -542,7 +544,7 @@ fn check_request_refuses_a_value_outside_the_measured_domain() {
         out_dir: temp_dir("req-domain"),
         resume: false,
     };
-    let err = check_request(&spec, SyscallMethod::None, None, None)
+    let err = check_request(&spec, SyscallMethod::None, None, None, None)
         .expect_err("qos 2 is not a measured QoS");
     assert!(err.contains("--qos"), "{err}");
     assert!(err.contains("0 or 1"), "{err}");
@@ -550,14 +552,14 @@ fn check_request_refuses_a_value_outside_the_measured_domain() {
     let mut zero_workers = spec.clone();
     zero_workers.qos = vec![1];
     zero_workers.workers = vec![0];
-    let err = check_request(&zero_workers, SyscallMethod::None, None, None)
+    let err = check_request(&zero_workers, SyscallMethod::None, None, None, None)
         .expect_err("a server runs at least one worker");
     assert!(err.contains("--workers"), "{err}");
 
     let mut valid = spec.clone();
     valid.qos = vec![1, 0];
     valid.workers = vec![1, 4];
-    check_request(&valid, SyscallMethod::None, None, None)
+    check_request(&valid, SyscallMethod::None, None, None, None)
         .expect("every measured value passes the domain check");
 }
 
@@ -914,7 +916,7 @@ fn check_request_smoke_does_not_require_tool_paths() {
         out_dir: temp_dir("req-smoke"),
         resume: false,
     };
-    check_request(&spec, SyscallMethod::None, None, None).expect("smoke check_request");
+    check_request(&spec, SyscallMethod::None, None, None, None).expect("smoke check_request");
 }
 
 #[test]
@@ -929,17 +931,17 @@ fn check_request_recorded_requires_tools() {
     };
     let tool = Some(Path::new("/bin/true"));
     // No syscalls -> err mentions --syscalls
-    let err = check_request(&spec, SyscallMethod::None, None, tool)
+    let err = check_request(&spec, SyscallMethod::None, None, None, tool)
         .expect_err("recorded refuses --syscalls none");
     assert!(err.contains("--syscalls"), "{err}");
     // No mosquitto -> err mentions --mosquitto-bin
-    let err = check_request(&spec, SyscallMethod::Perf, tool, None)
+    let err = check_request(&spec, SyscallMethod::Perf, tool, None, None)
         .expect_err("recorded refuses without --mosquitto-bin");
     assert!(err.contains("--mosquitto-bin"), "{err}");
     // Partial matrix -> err mentions full matrix
     let mut partial = spec.clone();
     partial.workers = vec![1];
-    let err = check_request(&partial, SyscallMethod::Perf, tool, tool)
+    let err = check_request(&partial, SyscallMethod::Perf, tool, None, tool)
         .expect_err("recorded refuses a partial matrix");
     assert!(err.contains("full matrix"), "{err}");
 }
@@ -957,14 +959,54 @@ fn check_request_requires_the_selected_counter_executable() {
         out_dir: temp_dir("req-counter"),
         resume: false,
     };
-    let err = check_request(&spec, SyscallMethod::Perf, None, None)
+    let err = check_request(&spec, SyscallMethod::Perf, None, None, None)
         .expect_err("--syscalls perf needs --perf-bin");
     assert!(err.contains("--perf-bin"), "{err}");
-    let err = check_request(&spec, SyscallMethod::Strace, None, None)
+    let err = check_request(&spec, SyscallMethod::Strace, None, None, None)
         .expect_err("--syscalls strace needs --strace-bin");
     assert!(err.contains("--strace-bin"), "{err}");
-    check_request(&spec, SyscallMethod::Perf, Some(Path::new("/bin/true")), None)
+    check_request(&spec, SyscallMethod::Perf, Some(Path::new("/bin/true")), None, None)
         .expect("a counter path satisfies the check");
+}
+
+/// A counter path for a counter `--syscalls` did not select is refused
+/// (AC-15): otherwise the unused path's tool-version probe runs for a
+/// flag the run never reads.
+#[test]
+fn check_request_refuses_a_counter_path_the_selected_method_does_not_use() {
+    let spec = MatrixSpec {
+        profile: Profile::Smoke,
+        servers: vec![ServerKind::Uring],
+        workers: vec![1],
+        qos: vec![1],
+        out_dir: temp_dir("req-counter-unused"),
+        resume: false,
+    };
+    let tool = Some(Path::new("/bin/true"));
+    let err = check_request(&spec, SyscallMethod::Perf, tool, tool, None)
+        .expect_err("perf does not use --strace-bin");
+    assert!(err.contains("does not use --strace-bin"), "{err}");
+    let err = check_request(&spec, SyscallMethod::None, tool, None, None)
+        .expect_err("none does not use --perf-bin");
+    assert!(
+        err.contains("--syscalls none does not use --perf-bin"),
+        "{err}"
+    );
+    let err = check_request(&spec, SyscallMethod::Strace, tool, tool, None)
+        .expect_err("strace does not use --perf-bin");
+    assert!(err.contains("does not use --perf-bin"), "{err}");
+    // The unused path is named even when the selected counter's own path
+    // is missing: both combinations satisfy AC-15's IF, and the missing
+    // path's refusal would ask for a second path instead of for the one
+    // the selection does not read.
+    let err = check_request(&spec, SyscallMethod::Perf, None, tool, None)
+        .expect_err("perf does not use --strace-bin");
+    assert!(err.contains("does not use --strace-bin"), "{err}");
+    let err = check_request(&spec, SyscallMethod::Strace, tool, None, None)
+        .expect_err("strace does not use --perf-bin");
+    assert!(err.contains("does not use --perf-bin"), "{err}");
+    check_request(&spec, SyscallMethod::Strace, None, tool, None)
+        .expect("strace with only --strace-bin passes");
 }
 
 #[test]
@@ -981,7 +1023,7 @@ fn check_request_refuses_a_matrix_no_server_can_run() {
         resume: false,
     };
     assert!(servers_for(4, &spec.servers).is_empty());
-    let err = check_request(&spec, SyscallMethod::None, None, None)
+    let err = check_request(&spec, SyscallMethod::None, None, None, None)
         .expect_err("a matrix with no runnable server measures nothing");
     assert!(err.contains("no server runs"), "{err}");
 
@@ -989,7 +1031,7 @@ fn check_request_refuses_a_matrix_no_server_can_run() {
     // that includes it is accepted.
     let mut with_one = spec.clone();
     with_one.workers = vec![1, 4];
-    check_request(&with_one, SyscallMethod::None, None, None)
+    check_request(&with_one, SyscallMethod::None, None, None, None)
         .expect("the 1-worker row runs mosquitto");
 }
 
@@ -1039,7 +1081,7 @@ fn check_request_refuses_non_empty_out_dir_without_resume() {
         resume: false,
     };
     let err =
-        check_request(&spec, SyscallMethod::None, None, None).expect_err("refuses non-empty");
+        check_request(&spec, SyscallMethod::None, None, None, None).expect_err("refuses non-empty");
     assert!(err.contains("not empty"), "{err}");
 }
 
@@ -1048,4 +1090,430 @@ fn outcome_default_has_empty_passed_and_failed() {
     let outcome = MatrixOutcome::default();
     assert!(outcome.passed.is_empty());
     assert!(outcome.failed.is_empty());
+}
+
+/// `HostSetup` whose every path is a placeholder so the stub runner is
+/// the only thing the matrix actually invokes. Mirrors the `cpu_sets` and
+/// `env` of `passing_record` so the dispatched records' environment
+/// matches what the test wrote; the runner is bypassed entirely.
+fn stub_host(dir: &Path, syscalls: SyscallMethod) -> HostSetup {
+    HostSetup {
+        bench_exe: PathBuf::from("/nonexistent/bench"),
+        mosquitto_bin: None,
+        syscalls,
+        perf_bin: None,
+        strace_bin: None,
+        cpu_sets: CpuSets {
+            server: "0,2,4,6".to_string(),
+            generator: "8-17".to_string(),
+        },
+        env: Env {
+            kernel: "test-kernel".to_string(),
+            cpu_model: "test-cpu".to_string(),
+            host: "test-host".to_string(),
+            git_sha: "abc1234".to_string(),
+            git_dirty: false,
+            tools: Vec::new(),
+        },
+        scratch_dir: dir.join(".scratch"),
+        cancel: std::sync::Arc::new(AtomicBool::new(false)),
+    }
+}
+
+#[test]
+fn run_matrix_with_dispatches_throughput_then_latency_then_connections() {
+    let dir = temp_dir("matrix-with-order");
+    let spec = MatrixSpec {
+        profile: Profile::Smoke,
+        servers: vec![ServerKind::Uring],
+        workers: vec![1],
+        qos: vec![1],
+        out_dir: dir.join("out"),
+        resume: false,
+    };
+    let host = stub_host(&dir, SyscallMethod::None);
+    let mut calls: Vec<(RunKind, Option<u32>, Option<u64>, u32)> = Vec::new();
+    let outcome = run_matrix_with(&spec, &host, |s| {
+        calls.push((s.kind, s.rate_fraction_pct, s.offered_rate, s.repetition));
+        passing_record(s, s.repetition, s.attempt, 100)
+    })
+    .expect("run_matrix_with");
+    assert!(
+        outcome.failed.is_empty(),
+        "no failures expected, got failed={:?}",
+        outcome.failed
+    );
+    assert_eq!(
+        calls,
+        vec![
+            (RunKind::Throughput, None, None, 1),
+            (RunKind::Throughput, None, None, 2),
+            (RunKind::Latency, Some(50), Some(50), 1),
+            (RunKind::Latency, Some(80), Some(80), 1),
+            (RunKind::Latency, Some(50), Some(50), 2),
+            (RunKind::Latency, Some(80), Some(80), 2),
+            (RunKind::Connections, None, None, 1),
+            (RunKind::Connections, None, None, 2),
+        ]
+    );
+}
+
+#[test]
+fn run_matrix_with_runs_each_worker_count_row_by_row() {
+    let dir = temp_dir("matrix-with-rows");
+    let spec = MatrixSpec {
+        profile: Profile::Smoke,
+        servers: vec![ServerKind::Uring],
+        workers: vec![1, 4],
+        qos: vec![1, 0],
+        out_dir: dir.join("out"),
+        resume: false,
+    };
+    let host = stub_host(&dir, SyscallMethod::None);
+    let mut calls: Vec<(u32, Option<u8>, RunKind)> = Vec::new();
+    run_matrix_with(&spec, &host, |s| {
+        calls.push((s.workers, s.qos, s.kind));
+        passing_record(s, s.repetition, s.attempt, 100)
+    })
+    .expect("run_matrix_with");
+    let mut collapsed: Vec<(u32, Option<u8>, &str)> = Vec::new();
+    for (w, qos, kind) in &calls {
+        let stage = match *kind {
+            RunKind::Throughput => "throughput",
+            RunKind::Latency | RunKind::Counted => "open-loop",
+            RunKind::Connections => "connections",
+        };
+        let triple = (*w, *qos, stage);
+        if collapsed.last() != Some(&triple) {
+            collapsed.push(triple);
+        }
+    }
+    assert_eq!(
+        collapsed,
+        vec![
+            (1, Some(1), "throughput"),
+            (1, Some(1), "open-loop"),
+            (1, Some(0), "throughput"),
+            (1, Some(0), "open-loop"),
+            (1, None, "connections"),
+            (4, Some(1), "throughput"),
+            (4, Some(1), "open-loop"),
+            (4, Some(0), "throughput"),
+            (4, Some(0), "open-loop"),
+            (4, None, "connections"),
+        ]
+    );
+}
+
+/// AC-12: a counted run joins the latency runs in the same interleaved
+/// round, paced at the matched 80 % rate — not a separate `run_configs`
+/// call, which would break the interleaving. Two syscall counters, two
+/// `(uring, tokio)` throughput medians each, so the hardcoded-rate and
+/// server-major-order failure modes the brief calls out both get caught.
+#[test]
+fn run_matrix_with_dispatches_a_counted_run_beside_the_latency_runs() {
+    for (method, uring_median, tokio_median, rate_50, rate_80) in [
+        (SyscallMethod::Perf, 101u64, 137u64, 50u64, 80u64),
+        (SyscallMethod::Strace, 151u64, 199u64, 75u64, 120u64),
+    ] {
+        let dir = temp_dir("matrix-with-counted");
+        let spec = MatrixSpec {
+            profile: Profile::Recorded,
+            servers: vec![ServerKind::Uring, ServerKind::Tokio],
+            workers: vec![1],
+            qos: vec![1],
+            out_dir: dir.join("out"),
+            resume: false,
+        };
+        let host = stub_host(&dir, method);
+        let mut calls: Vec<(u32, ServerKind, RunKind, Option<u32>, Option<u64>)> = Vec::new();
+        let outcome = run_matrix_with(&spec, &host, |s| {
+            if s.kind == RunKind::Latency || s.kind == RunKind::Counted {
+                calls.push((s.repetition, s.server, s.kind, s.rate_fraction_pct, s.offered_rate));
+            }
+            let median = if s.server == ServerKind::Uring {
+                uring_median
+            } else {
+                tokio_median
+            };
+            match s.kind {
+                RunKind::Counted => {
+                    let mut rec = passing_record(s, s.repetition, s.attempt, 100);
+                    rec.syscalls.per_msg = Some(5.0);
+                    rec
+                }
+                RunKind::Throughput => passing_record(s, s.repetition, s.attempt, median),
+                _ => passing_record(s, s.repetition, s.attempt, 100),
+            }
+        })
+        .expect("run_matrix_with");
+
+        let mut expected: Vec<(u32, ServerKind, RunKind, Option<u32>, Option<u64>)> = Vec::new();
+        for r in 1..=5u32 {
+            for &server in &[ServerKind::Uring, ServerKind::Tokio] {
+                expected.push((r, server, RunKind::Latency, Some(50), Some(rate_50)));
+                expected.push((r, server, RunKind::Latency, Some(80), Some(rate_80)));
+                expected.push((r, server, RunKind::Counted, Some(80), Some(rate_80)));
+            }
+        }
+        assert_eq!(calls, expected, "method {method:?}: dispatch order/rates");
+        assert!(
+            outcome.failed.is_empty(),
+            "method {method:?}: no failures expected, got {:?}",
+            outcome.failed
+        );
+    }
+}
+
+/// AC-13: without a syscall counter selected, no counted run is ever
+/// dispatched.
+#[test]
+fn run_matrix_with_dispatches_no_counted_run_without_a_counter() {
+    let dir = temp_dir("matrix-with-no-counter");
+    let spec = MatrixSpec {
+        profile: Profile::Smoke,
+        servers: vec![ServerKind::Uring],
+        workers: vec![1],
+        qos: vec![1],
+        out_dir: dir.join("out"),
+        resume: false,
+    };
+    let host = stub_host(&dir, SyscallMethod::None);
+    let mut kinds: Vec<RunKind> = Vec::new();
+    let outcome = run_matrix_with(&spec, &host, |s| {
+        kinds.push(s.kind);
+        passing_record(s, s.repetition, s.attempt, 100)
+    })
+    .expect("run_matrix_with");
+    assert!(
+        !kinds.contains(&RunKind::Counted),
+        "no counted run without a counter, got {kinds:?}"
+    );
+    assert!(outcome.failed.is_empty());
+}
+
+/// AC-14: a failed throughput row marks the row's counted run (and its
+/// latency runs) failed without ever dispatching them.
+#[test]
+fn run_matrix_with_fails_the_counted_run_of_a_row_whose_throughput_failed() {
+    let dir = temp_dir("matrix-with-counted-failed-row");
+    let spec = MatrixSpec {
+        profile: Profile::Smoke,
+        servers: vec![ServerKind::Uring],
+        workers: vec![1],
+        qos: vec![1],
+        out_dir: dir.join("out"),
+        resume: false,
+    };
+    let host = stub_host(&dir, SyscallMethod::Perf);
+    let mut dispatched_kinds: Vec<RunKind> = Vec::new();
+    let outcome = run_matrix_with(&spec, &host, |s| {
+        dispatched_kinds.push(s.kind);
+        let mut rec = passing_record(s, s.repetition, s.attempt, 100);
+        if s.kind == RunKind::Throughput {
+            rec.valid = false;
+            rec.invalid_reasons.push("test-marker".to_string());
+        }
+        rec
+    })
+    .expect("run_matrix_with");
+
+    assert!(
+        !dispatched_kinds.contains(&RunKind::Latency) && !dispatched_kinds.contains(&RunKind::Counted),
+        "a failed throughput row must not dispatch its latency or counted runs, got {dispatched_kinds:?}"
+    );
+    assert!(
+        outcome.failed.contains(&ConfigKey {
+            server: ServerKind::Uring,
+            workers: 1,
+            qos: Some(1),
+            kind: RunKind::Counted,
+            rate_fraction_pct: Some(80),
+        }),
+        "the counted run of a failed throughput row must be marked failed, got {:?}",
+        outcome.failed
+    );
+}
+
+/// AC-12: one counted configuration per (server, workers, qos) — each
+/// row of the matrix gets its own counted run at that row's matched
+/// 80 % rate, and the row's counted configuration lands in
+/// `MatrixOutcome.passed`. A counted run scheduled once per worker
+/// count, or once per server, fails the expected list.
+#[test]
+fn run_matrix_with_counts_every_worker_and_qos_row() {
+    let dir = temp_dir("matrix-with-counted-rows");
+    let spec = MatrixSpec {
+        profile: Profile::Smoke,
+        servers: vec![ServerKind::Uring],
+        workers: vec![1, 4],
+        qos: vec![1, 0],
+        out_dir: dir.join("out"),
+        resume: false,
+    };
+    let host = stub_host(&dir, SyscallMethod::Perf);
+    let mut counted: Vec<(u32, Option<u8>, Option<u32>, Option<u64>, u32)> = Vec::new();
+    let outcome = run_matrix_with(&spec, &host, |s| {
+        if s.kind == RunKind::Counted {
+            counted.push((
+                s.workers,
+                s.qos,
+                s.rate_fraction_pct,
+                s.offered_rate,
+                s.repetition,
+            ));
+        }
+        let mut rec = passing_record(s, s.repetition, s.attempt, 100);
+        if s.kind == RunKind::Counted {
+            rec.syscalls.per_msg = Some(5.0);
+        }
+        rec
+    })
+    .expect("run_matrix_with");
+
+    let mut expected: Vec<(u32, Option<u8>, Option<u32>, Option<u64>, u32)> = Vec::new();
+    for w in [1u32, 4] {
+        for q in [Some(1u8), Some(0)] {
+            for rep in 1..=2u32 {
+                expected.push((w, q, Some(80), Some(80), rep));
+            }
+        }
+    }
+    assert_eq!(counted, expected, "one counted run per (workers, qos) row");
+    assert!(
+        outcome.failed.is_empty(),
+        "no failures expected, got {:?}",
+        outcome.failed
+    );
+    for w in [1u32, 4] {
+        for q in [Some(1u8), Some(0)] {
+            let key = ConfigKey {
+                server: ServerKind::Uring,
+                workers: w,
+                qos: q,
+                kind: RunKind::Counted,
+                rate_fraction_pct: Some(80),
+            };
+            assert!(
+                outcome.passed.contains(&key),
+                "counted configuration {key:?} missing from passed={:?}",
+                outcome.passed
+            );
+        }
+    }
+}
+
+/// A `--resume` continues a counted configuration's own attempt number,
+/// like every other kind: the records of its failed attempt 1 are on
+/// disk, so the resumed session dispatches attempt 2 at the matched
+/// 80 % rate and passes the configuration. `check_resume` accepts those
+/// records, so the counted key reaching `resume_plan` is also covered.
+#[test]
+fn run_matrix_with_resumes_a_counted_configuration_at_its_next_attempt() {
+    let dir = temp_dir("matrix-with-counted-resume");
+    let out_dir = dir.join("out");
+    fs::create_dir_all(&out_dir).expect("create out dir");
+    for rep in 1..=5u32 {
+        let mut rec = make_record(
+            Profile::Recorded,
+            ServerKind::Uring,
+            1,
+            Some(1),
+            RunKind::Counted,
+            Some(80),
+            1,
+            rep,
+            false,
+            "abc1234",
+        );
+        // `check_resume` recomputes every record it reads, so the stored
+        // verdict has to be the one `reconcile` reports for it.
+        rec.invalid_reasons = reconcile(&rec);
+        rec.valid = rec.invalid_reasons.is_empty();
+        assert!(
+            !rec.valid,
+            "fixture must be a failed attempt, reasons {:?}",
+            rec.invalid_reasons
+        );
+        write_record(&out_dir, &rec);
+    }
+
+    let spec = MatrixSpec {
+        profile: Profile::Recorded,
+        servers: vec![ServerKind::Uring],
+        workers: vec![1],
+        qos: vec![1],
+        out_dir,
+        resume: true,
+    };
+    let host = stub_host(&dir, SyscallMethod::Perf);
+    let mut counted: Vec<(u32, u32, Option<u64>)> = Vec::new();
+    let outcome = run_matrix_with(&spec, &host, |s| {
+        if s.kind == RunKind::Counted {
+            counted.push((s.attempt, s.repetition, s.offered_rate));
+        }
+        let mut rec = passing_record(s, s.repetition, s.attempt, 100);
+        if s.kind == RunKind::Counted {
+            rec.syscalls.per_msg = Some(5.0);
+        }
+        rec
+    })
+    .expect("run_matrix_with");
+
+    assert_eq!(
+        counted,
+        (1..=5u32).map(|rep| (2, rep, Some(80))).collect::<Vec<_>>(),
+        "the resumed counted configuration runs attempt 2 at the matched 80 % rate"
+    );
+    let key = ConfigKey {
+        server: ServerKind::Uring,
+        workers: 1,
+        qos: Some(1),
+        kind: RunKind::Counted,
+        rate_fraction_pct: Some(80),
+    };
+    assert!(
+        outcome.passed.contains(&key),
+        "the resumed counted configuration must pass, passed={:?} failed={:?}",
+        outcome.passed,
+        outcome.failed
+    );
+}
+
+/// The on-disk form of a counted record (PLAN.md ## Data Model):
+/// `"kind": "counted"` at the current schema, read back as
+/// `RunKind::Counted`. The records the matrix writes are what `--resume`
+/// and `bench doc` read, so the label is a persisted contract.
+#[test]
+fn a_counted_record_round_trips_through_its_json_form() {
+    let dir = temp_dir("counted-json");
+    let rec = make_record(
+        Profile::Recorded,
+        ServerKind::Uring,
+        1,
+        Some(1),
+        RunKind::Counted,
+        Some(80),
+        1,
+        1,
+        true,
+        "abc1234",
+    );
+    write_record(&dir, &rec);
+
+    let text = fs::read_to_string(dir.join("uring-w1-q1-counted-p80-a1-r1.json"))
+        .expect("read the counted record");
+    assert!(
+        text.contains("\"kind\": \"counted\""),
+        "the counted kind serializes lowercase, got {text}"
+    );
+    assert!(
+        text.contains(&format!("\"schema\": {SCHEMA_VERSION}")),
+        "the record carries the current schema, got {text}"
+    );
+
+    let records = read_records(&dir).expect("read_records");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].kind, RunKind::Counted);
+    assert_eq!(records[0].rate_fraction_pct, Some(80));
 }

@@ -17,7 +17,7 @@ use bench::gen::slot_counts;
 use bench::record::{Timeline, Window, LATENCY_BUCKET_MAX_NS};
 use bench::run_record::{
     Build, ConfigKey, CounterExit, Counts, CpuSets, CpuUsage, DriverFds, Env, GeneratorErrors,
-    LatencySummary, Profile, RunKind, RunRecord, ServerKind, SyscallMethod, Syscalls,
+    LatencySummary, Profile, RunKind, RunRecord, ServerKind, SyscallMethod, Syscalls, SCHEMA_VERSION,
 };
 
 /// Smoke-protocol window: 2 s warm-up + 5 s window (PLAN.md ## Data Model).
@@ -53,7 +53,7 @@ fn baseline_record(kind: RunKind, server: ServerKind) -> RunRecord {
                 let delivered = 100 * (WARMUP_SECS + WINDOW_SECS);
                 (counts, delivered, delivered, Some(delivered), None, None, None)
             }
-            RunKind::Latency => {
+            RunKind::Latency | RunKind::Counted => {
                 let (scheduled, window_scheduled) =
                     slot_counts(200, ORIGIN_NS, window_obj());
                 // The slot grid ends `SLOT_GRID_END_LEAD_NS` before the window
@@ -80,7 +80,7 @@ fn baseline_record(kind: RunKind, server: ServerKind) -> RunRecord {
             }
         };
 
-    let latency_ns = if kind == RunKind::Latency {
+    let latency_ns = if kind.is_open_loop() {
         Some(LatencySummary {
             p50: 40_000,
             p99: 80_000,
@@ -93,12 +93,12 @@ fn baseline_record(kind: RunKind, server: ServerKind) -> RunRecord {
     } else {
         None
     };
-    let lateness = if kind == RunKind::Latency {
+    let lateness = if kind.is_open_loop() {
         vec![(1_000, 998)]
     } else {
         Vec::new()
     };
-    let lateness_p99_ns = if kind == RunKind::Latency {
+    let lateness_p99_ns = if kind.is_open_loop() {
         Some(1_000)
     } else {
         None
@@ -119,9 +119,9 @@ fn baseline_record(kind: RunKind, server: ServerKind) -> RunRecord {
     let (qos, rate_fraction_pct, offered_rate) = match kind {
         RunKind::Connections => (None, None, None),
         RunKind::Throughput => (Some(1u8), None, None),
-        RunKind::Latency => (Some(1u8), Some(SYSCALL_FRACTION_PCT), Some(200)),
+        RunKind::Latency | RunKind::Counted => (Some(1u8), Some(SYSCALL_FRACTION_PCT), Some(200)),
     };
-    let (syscalls_method, syscalls_count, syscalls_raw, syscalls_per_msg) = if kind == RunKind::Latency
+    let (syscalls_method, syscalls_count, syscalls_raw, syscalls_per_msg) = if kind == RunKind::Counted
     {
         (
             SyscallMethod::Perf,
@@ -145,7 +145,7 @@ fn baseline_record(kind: RunKind, server: ServerKind) -> RunRecord {
     };
 
     RunRecord {
-        schema: 1,
+        schema: SCHEMA_VERSION,
         profile: Profile::Smoke,
         server,
         workers: 1,
@@ -201,17 +201,17 @@ fn baseline_record(kind: RunKind, server: ServerKind) -> RunRecord {
             count: syscalls_count,
             per_msg: syscalls_per_msg,
             raw: syscalls_raw,
-            enabled_ns: if kind == RunKind::Latency {
+            enabled_ns: if kind == RunKind::Counted {
                 Some(WINDOW_START_NS)
             } else {
                 None
             },
-            disabled_ns: if kind == RunKind::Latency {
+            disabled_ns: if kind == RunKind::Counted {
                 Some(WINDOW_END_NS)
             } else {
                 None
             },
-            exit: if kind == RunKind::Latency {
+            exit: if kind == RunKind::Counted {
                 Some(CounterExit::Signal(2))
             } else {
                 None
@@ -246,6 +246,55 @@ fn baseline_record(kind: RunKind, server: ServerKind) -> RunRecord {
 
 fn valid_record(kind: RunKind) -> RunRecord {
     baseline_record(kind, ServerKind::Uring)
+}
+
+fn counted_run_record() -> RunRecord {
+    valid_record(RunKind::Counted)
+}
+
+#[test]
+fn a_counted_run_record_is_named_by_its_kind() {
+    let record = counted_run_record();
+    assert_eq!(record.file_name(), "uring-w1-q1-counted-p80-a1-r1.json");
+}
+
+#[test]
+fn metric_reads_syscalls_per_message_for_a_counted_run() {
+    let record = counted_run_record();
+    assert_eq!(metric(&record), Some(5.0));
+
+    // The counted spread ignores p99: these per_msg values are tight
+    // (within SPREAD_LIMIT) while their p99s span a 16x range, far
+    // above SPREAD_LIMIT, so a p99-based spread would fail this set.
+    let per_msg = [5.0, 5.1, 4.9, 5.0, 5.0];
+    let p99 = [40_000u64, 80_000, 160_000, 320_000, 640_000];
+    let tight_records: Vec<RunRecord> = per_msg
+        .iter()
+        .zip(p99.iter())
+        .map(|(&pm, &p)| {
+            let mut r = counted_run_record();
+            r.syscalls.per_msg = Some(pm);
+            r.latency_ns = Some(LatencySummary {
+                p50: p / 2,
+                p99: p,
+                max: p,
+                histogram: vec![(p, 1)],
+            });
+            r
+        })
+        .collect();
+    assert!(config_passes(&tight_records, 5, true));
+
+    let wide_per_msg = [5.0, 6.0, 5.0, 5.0, 5.0];
+    let wide_records: Vec<RunRecord> = wide_per_msg
+        .iter()
+        .map(|&pm| {
+            let mut r = counted_run_record();
+            r.syscalls.per_msg = Some(pm);
+            r
+        })
+        .collect();
+    assert!(!config_passes(&wide_records, 5, true));
 }
 
 #[test]
@@ -420,7 +469,7 @@ fn reconcile_reports_one_reason_per_violated_rule() {
         // Row 19 — counted syscall run: count must exist.
         (
             "row 19",
-            RunKind::Latency,
+            RunKind::Counted,
             Box::new(|r| r.syscalls.count = None),
             "syscall count missing".to_string(),
         ),
@@ -446,7 +495,7 @@ fn reconcile_reports_one_reason_per_violated_rule() {
         // Row 22 — counted syscall run: boundary times within tolerance.
         (
             "row 22",
-            RunKind::Latency,
+            RunKind::Counted,
             Box::new(|r| {
                 r.syscalls.enabled_ns = Some(WINDOW_START_NS + COUNTER_BOUNDARY_TOLERANCE_NS + 1);
             }),
@@ -459,7 +508,7 @@ fn reconcile_reports_one_reason_per_violated_rule() {
         // Row 23 — counted syscall run: exit = Code(0) or Signal(SIGINT).
         (
             "row 23",
-            RunKind::Latency,
+            RunKind::Counted,
             Box::new(|r| r.syscalls.exit = Some(CounterExit::Code(1))),
             "syscall counter ended with Some(Code(1))".to_string(),
         ),
@@ -512,7 +561,7 @@ fn reconcile_reports_one_reason_per_violated_rule() {
         // sees the stored `delivered` and only row 30 fires.
         (
             "row 30",
-            RunKind::Latency,
+            RunKind::Counted,
             Box::new(|r| r.timeline.counts = vec![700, 698, 0, 0, 0, 0, 0]),
             "no deliveries in the window to divide the syscall count by".to_string(),
         ),
@@ -530,6 +579,203 @@ fn reconcile_reports_one_reason_per_violated_rule() {
             "case {label} produced reasons {reasons:?}, expected [{expected:?}]"
         );
     }
+}
+
+#[test]
+fn reconcile_accepts_a_valid_counted_run() {
+    assert_eq!(reconcile(&valid_record(RunKind::Counted)), Vec::<String>::new());
+}
+
+#[test]
+fn reconcile_applies_every_open_loop_row_to_a_counted_run() {
+    type Mutator = Box<dyn Fn(&mut RunRecord)>;
+    let cases: Vec<(&str, Mutator, String)> = vec![
+        // Row 1 — scheduled must equal offered.
+        (
+            "row 1",
+            Box::new(|r| {
+                r.counts.offered = 1397;
+                r.counts.delivered = 1397;
+                r.counts.acked = Some(1397);
+                r.timeline.counts[0] -= 1;
+            }),
+            "scheduled Some(1398) != offered 1397".to_string(),
+        ),
+        // Row 2 — delivered + dropped must not exceed offered.
+        (
+            "row 2",
+            Box::new(|r| {
+                r.counts.delivered = r.counts.offered + 1;
+                r.timeline.counts[0] += 1;
+            }),
+            "delivered + dropped exceeds offered".to_string(),
+        ),
+        // Row 3 — unresolved must be zero.
+        (
+            "row 3",
+            Box::new(|r| r.counts.unresolved = 1),
+            "unresolved 1".to_string(),
+        ),
+        // Row 6 — non-zero dropped invalidates.
+        (
+            "row 6",
+            Box::new(|r| {
+                r.counts.delivered -= 1;
+                r.counts.dropped = Some(1);
+                r.timeline.counts[0] -= 1;
+            }),
+            "dropped 1 in a counted run".to_string(),
+        ),
+        // Row 11 — no missed slots.
+        (
+            "row 11",
+            Box::new(|r| r.generator_errors.missed_slots = 1),
+            "missed slots 1".to_string(),
+        ),
+        // Row 13 — QoS 1: every offered must be acked.
+        (
+            "row 13",
+            Box::new(|r| r.counts.acked = Some(0)),
+            "unacknowledged QoS 1 publishes: acked Some(0) of 1398".to_string(),
+        ),
+        // Row 14 — latency_ns must be present.
+        (
+            "row 14",
+            Box::new(|r| r.latency_ns = None),
+            "no latency samples in the window".to_string(),
+        ),
+        // Row 15 — histogram total must equal window_scheduled.
+        (
+            "row 15",
+            Box::new(|r| {
+                r.latency_ns = Some(LatencySummary {
+                    p50: 40_000,
+                    p99: 80_000,
+                    max: 80_000,
+                    histogram: vec![(40_000, 986), (80_000, 13)],
+                });
+            }),
+            "latency samples 999 != window slots Some(998)".to_string(),
+        ),
+        // Row 18 — lateness p99 within GENERATOR_LATENESS_FRACTION of latency p99.
+        (
+            "row 18",
+            Box::new(|r| r.lateness_p99_ns = Some(20_000)),
+            format!(
+                "generator lateness p99 Some(20000) ns exceeds {GENERATOR_LATENESS_FRACTION} of latency p99 80000"
+            ),
+        ),
+        // Row 21 — no lateness over-range.
+        (
+            "row 21",
+            Box::new(|r| {
+                r.lateness = vec![(1_000, 997)];
+                r.generator_errors.lateness_over_range = 1;
+            }),
+            "generator lateness over range 1".to_string(),
+        ),
+        // Row 24 — last_write_start_ns must be Some(t < window.end_ns).
+        (
+            "row 24",
+            Box::new(|r| r.last_write_start_ns = Some(WINDOW_END_NS)),
+            format!("publish write began at or after the window end: {WINDOW_END_NS}"),
+        ),
+        // Row 25 — Σ lateness counts + lateness_over_range must equal window_scheduled.
+        (
+            "row 25",
+            Box::new(|r| r.lateness = vec![(1_000, 997)]),
+            "lateness samples 997 != window slots Some(998)".to_string(),
+        ),
+        // Row 27 — scheduled counts must equal slot_counts(offered_rate, origin, window).
+        (
+            "row 27",
+            Box::new(|r| r.offered_rate = Some(201)),
+            "scheduled counts inconsistent with rate Some(201)".to_string(),
+        ),
+    ];
+
+    for (label, mutate, expected) in cases {
+        let mut rec = valid_record(RunKind::Counted);
+        mutate(&mut rec);
+        let reasons = reconcile(&rec);
+        assert_eq!(
+            reasons,
+            vec![expected.clone()],
+            "case {label} produced reasons {reasons:?}, expected [{expected:?}]"
+        );
+    }
+}
+
+#[test]
+fn reconcile_requires_a_counter_only_on_a_counted_run() {
+    assert_eq!(
+        reconcile(&valid_record(RunKind::Latency)),
+        Vec::<String>::new()
+    );
+
+    let mut rec = valid_record(RunKind::Counted);
+    rec.syscalls = Syscalls {
+        method: SyscallMethod::None,
+        count: None,
+        per_msg: None,
+        raw: None,
+        enabled_ns: None,
+        disabled_ns: None,
+        exit: None,
+        diagnostics: None,
+    };
+    assert_eq!(
+        reconcile(&rec),
+        vec![
+            "syscall count missing".to_string(),
+            "counter boundaries outside tolerance: enabled None disabled None".to_string(),
+            "syscall counter ended with None".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn derive_keeps_the_latency_summary_of_a_counted_run() {
+    let d = derive(&valid_record(RunKind::Counted));
+    assert_eq!(
+        d.latency_ns,
+        Some(LatencySummary {
+            p50: 40_000,
+            p99: 80_000,
+            max: 80_000,
+            histogram: vec![(40_000, 987), (80_000, 11)],
+        })
+    );
+}
+
+/// AC-10: the counted run's latency summary is computed from its
+/// histogram, not copied from the stored percentiles. The stored values
+/// here disagree with the histogram, so a `derive` that returned them
+/// would pass `derive_keeps_the_latency_summary_of_a_counted_run` and
+/// fail this test. The same record's `syscalls/msg` is derived from the
+/// raw counter line over the window deliveries (5000 / 1000).
+#[test]
+fn derive_recomputes_a_counted_runs_latency_from_its_histogram() {
+    let mut rec = valid_record(RunKind::Counted);
+    rec.latency_ns = Some(LatencySummary {
+        p50: 1,
+        p99: 2,
+        max: 3,
+        histogram: vec![(40_000, 987), (80_000, 11)],
+    });
+
+    let d = derive(&rec);
+
+    assert_eq!(
+        d.latency_ns,
+        Some(LatencySummary {
+            p50: 40_000,
+            p99: 80_000,
+            max: 80_000,
+            histogram: vec![(40_000, 987), (80_000, 11)],
+        })
+    );
+    assert_eq!(d.syscalls_per_msg, Some(5.0));
 }
 
 #[test]

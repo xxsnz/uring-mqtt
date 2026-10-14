@@ -404,12 +404,13 @@ fn dispatch_run(
     };
 
     // Phase 1: refusal checks. No process is spawned until these pass.
-    let counter_bin = match syscalls {
-        SyscallMethod::Perf => perf_bin.as_deref(),
-        SyscallMethod::Strace => strace_bin.as_deref(),
-        SyscallMethod::None => None,
-    };
-    if let Err(e) = matrix::check_request(&spec, syscalls, counter_bin, mosquitto_bin.as_deref()) {
+    if let Err(e) = matrix::check_request(
+        &spec,
+        syscalls,
+        perf_bin.as_deref(),
+        strace_bin.as_deref(),
+        mosquitto_bin.as_deref(),
+    ) {
         eprintln!("{e}");
         return 1;
     }

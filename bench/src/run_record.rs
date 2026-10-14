@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::record::{Timeline, Window};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -31,6 +31,17 @@ pub enum RunKind {
     Throughput,
     Latency,
     Connections,
+    /// The counted run (spec §9.1): open-loop at the matched 80 % rate
+    /// with the syscall counter attached; it supplies only `syscalls/msg`.
+    Counted,
+}
+
+impl RunKind {
+    /// `Latency` and `Counted`: the kinds the generator paces open-loop
+    /// from a slot grid, so every open-loop reconciliation row applies.
+    pub fn is_open_loop(self) -> bool {
+        matches!(self, RunKind::Latency | RunKind::Counted)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,6 +209,7 @@ fn kind_lower(kind: RunKind) -> &'static str {
         RunKind::Throughput => "throughput",
         RunKind::Latency => "latency",
         RunKind::Connections => "connections",
+        RunKind::Counted => "counted",
     }
 }
 

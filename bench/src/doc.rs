@@ -75,7 +75,7 @@ pub enum DocError {
     InconsistentRecord(String),
     /// A recorded-mode protocol invariant was violated: timing
     /// constants, the cpu-set pair, the repetition set, the
-    /// matched-rate, or the 80 % counter evidence.
+    /// matched-rate, or the counted counter evidence.
     ProtocolViolation(String),
     /// A fixed-matrix configuration is missing or its highest attempt
     /// failed `config_passes(runs, 5, true)`.
@@ -376,19 +376,17 @@ pub fn render(records: &[RunRecord], smoke: bool) -> Result<String, DocError> {
                         repetitions
                     )));
                 }
-                // Counter evidence is a property of every 80 % latency
+                // Counter evidence is a property of every counted
                 // record, not only of the attempt the table publishes:
                 // a recorded session counts syscalls in all of them, so
                 // an attempt without a counter is a record made under
                 // another harness configuration.
-                if key.kind == RunKind::Latency
-                    && key.rate_fraction_pct == Some(SYSCALL_FRACTION_PCT)
-                {
+                if key.kind == RunKind::Counted {
                     if let Some(bad) = runs.iter().find(|r| {
                         !matches!(r.syscalls.method, SyscallMethod::Perf | SyscallMethod::Strace)
                     }) {
                         return Err(DocError::ProtocolViolation(format!(
-                            "{}: {SYSCALL_FRACTION_PCT}% latency record without counter evidence ({})",
+                            "{}: counted record without counter evidence ({})",
                             config_label(key),
                             bad.file_name()
                         )));
@@ -451,12 +449,16 @@ pub fn render(records: &[RunRecord], smoke: bool) -> Result<String, DocError> {
                     continue;
                 };
                 for &s in &servers {
-                    for &pct in &LATENCY_FRACTIONS_PCT {
+                    for (kind, pct) in LATENCY_FRACTIONS_PCT
+                        .iter()
+                        .map(|&pct| (RunKind::Latency, pct))
+                        .chain(std::iter::once((RunKind::Counted, SYSCALL_FRACTION_PCT)))
+                    {
                         let key = ConfigKey {
                             server: s,
                             workers: w,
                             qos: Some(q),
-                            kind: RunKind::Latency,
+                            kind,
                             rate_fraction_pct: Some(pct),
                         };
                         let Some(runs) = by_key.get(&key) else { continue };
@@ -485,6 +487,7 @@ pub fn render(records: &[RunRecord], smoke: bool) -> Result<String, DocError> {
     }
 
     // Build the document.
+    let any_counted = records.iter().any(|r| r.kind == RunKind::Counted);
     let mut out = String::new();
     writeln!(out, "# Benchmarks").unwrap();
     writeln!(out).unwrap();
@@ -567,6 +570,24 @@ pub fn render(records: &[RunRecord], smoke: bool) -> Result<String, DocError> {
     )
     .unwrap();
     writeln!(out).unwrap();
+    if any_counted {
+        writeln!(
+            out,
+            "Both latency columns come from uncounted runs; `syscalls/msg` comes \
+             from {repetitions} separate counted repetitions at the same matched \
+             {SYSCALL_FRACTION_PCT} % rate, which qualify on `syscalls/msg` spread. \
+             The counted runs' p99 stays in the raw JSON and is not published.",
+        )
+        .unwrap();
+    } else {
+        writeln!(
+            out,
+            "Both latency columns come from uncounted runs; `syscalls/msg` is `n/a` \
+             because this record set holds no counted run.",
+        )
+        .unwrap();
+    }
+    writeln!(out).unwrap();
 
     // Per (w, q) results
     for w in RECORDED_WORKERS {
@@ -586,7 +607,7 @@ pub fn render(records: &[RunRecord], smoke: bool) -> Result<String, DocError> {
             .unwrap();
             writeln!(out, "|---|---|---|---|---|---|---|---|---|").unwrap();
             for &s in &servers {
-                let row = results_row(&passing_by_key, s, w, q);
+                let row = results_row(&passing_by_key, s, w, q, any_counted);
                 writeln!(out, "{row}").unwrap();
             }
             writeln!(out).unwrap();
@@ -649,6 +670,7 @@ fn results_row(
     server: ServerKind,
     workers: u32,
     qos: u8,
+    any_counted: bool,
 ) -> String {
     let thr_key = ConfigKey {
         server,
@@ -670,6 +692,13 @@ fn results_row(
         qos: Some(qos),
         kind: RunKind::Latency,
         rate_fraction_pct: Some(80u32),
+    };
+    let counted_key = ConfigKey {
+        server,
+        workers,
+        qos: Some(qos),
+        kind: RunKind::Counted,
+        rate_fraction_pct: Some(SYSCALL_FRACTION_PCT),
     };
 
     // msgs/s, spread, the CPU shares and the driver proof all describe
@@ -701,7 +730,7 @@ fn results_row(
         server = if server == ServerKind::Mosquitto { MOSQUITTO_RESULTS_LABEL } else { server_label(server) },
         p50 = latency_p99_us(passing, &lat50_key),
         p80 = latency_p99_us(passing, &lat80_key),
-        sys = syscalls_per_msg(passing, &lat80_key),
+        sys = syscalls_per_msg(passing, &counted_key, any_counted),
     )
 }
 
@@ -782,9 +811,18 @@ fn latency_p99_us(passing: &HashMap<ConfigKey, Vec<RunRecord>>, key: &ConfigKey)
 }
 
 /// Median syscalls/message of the passing highest attempt of `key`.
-/// `FAILED` when that configuration has no passing attempt; `n/a` when
-/// it passed with no counter (the smoke profile runs `--syscalls none`).
-fn syscalls_per_msg(passing: &HashMap<ConfigKey, Vec<RunRecord>>, key: &ConfigKey) -> String {
+/// `n/a` first when no record in `records` was a counted run (a smoke
+/// set, or a recorded set the completeness check has already refused);
+/// `FAILED` when the counted configuration has no passing attempt;
+/// `n/a` when that attempt passed with no per-message figure.
+fn syscalls_per_msg(
+    passing: &HashMap<ConfigKey, Vec<RunRecord>>,
+    key: &ConfigKey,
+    any_counted: bool,
+) -> String {
+    if !any_counted {
+        return "n/a".to_string();
+    }
     let Some(runs) = passing.get(key) else {
         return FAILED.to_string();
     };
@@ -851,21 +889,21 @@ fn server_label(server: ServerKind) -> &'static str {
 /// Why `record` must not be published on a row the matrix does not
 /// count, or `None` when it carries no counter.
 ///
-/// `runner::should_count` attaches a counter to the
-/// [`SYSCALL_FRACTION_PCT`] latency run only, so every run that reaches
-/// its window end on any other row stores `SyscallMethod::None` with an
-/// empty block. `analysis::derive` reads the count back out of
-/// `syscalls.raw` for any kind, so a record of another row whose raw
-/// output, count and per-message figure agree passes `recompute`: its
-/// server ran under a syscall tracer while the rest of the matrix did
-/// not, and the document would publish its p99 beside figures measured
-/// without that instrument.
+/// `runner::should_count` attaches a counter to the counted run only,
+/// so every run that reaches its window end on any other row stores
+/// `SyscallMethod::None` with an empty block. `analysis::derive` reads
+/// the count back out of `syscalls.raw` for any kind, so a record of
+/// another row whose raw output, count and per-message figure agree
+/// passes `recompute`: its server ran under a syscall tracer while the
+/// rest of the matrix did not, and the document would publish its p99
+/// beside figures measured without that instrument.
 ///
-/// A run that failed before its window keeps `host.syscalls` as the
-/// method with every field empty (`runner::finalize_record`), which is
-/// not evidence of a counter. Such a record is invalid and only ever
-/// published as a failed earlier attempt, so the method is checked on
-/// valid records and the empty block is accepted.
+/// Only a counted run that failed before its window keeps
+/// `host.syscalls` as the method with every field empty
+/// (`runner::finalize_record`), which is not evidence of a counter.
+/// Such a record is invalid and only ever published as a failed earlier
+/// attempt, so the method is checked on valid records and the empty
+/// block is accepted; every other run records `SyscallMethod::None`.
 fn counter_on_uncounted_row(record: &RunRecord) -> Option<&'static str> {
     let s = &record.syscalls;
     if s.count.is_some()
@@ -885,14 +923,14 @@ fn counter_on_uncounted_row(record: &RunRecord) -> Option<&'static str> {
 }
 
 /// Methods behind the published `syscalls/msg @80 %` figures: the
-/// counter methods of the passing 80 % latency attempts, which are the
-/// only records the table reads those figures from.
+/// counter methods of the passing counted attempts, which are the only
+/// records the table reads those figures from.
 fn published_syscall_methods(
     passing: &HashMap<ConfigKey, Vec<RunRecord>>,
 ) -> BTreeSet<&'static str> {
     let mut methods: BTreeSet<&'static str> = BTreeSet::new();
     for (key, runs) in passing {
-        if key.kind != RunKind::Latency || key.rate_fraction_pct != Some(SYSCALL_FRACTION_PCT) {
+        if key.kind != RunKind::Counted {
             continue;
         }
         for r in runs {
@@ -907,8 +945,8 @@ fn published_syscall_methods(
 }
 
 /// `| Syscall method |` cell of `## Environment`. `n/a` when no passing
-/// 80 % attempt carries a figure. The strace bias disclosure follows the
-/// label whenever strace produced any published figure; recorded mode
+/// counted attempt carries a figure. The strace bias disclosure follows
+/// the label whenever strace produced any published figure; recorded mode
 /// has already refused a mixed-method matrix, so a smoke document is the
 /// only place the label can name more than one method.
 fn syscalls_method_label(passing: &HashMap<ConfigKey, Vec<RunRecord>>) -> String {
@@ -953,6 +991,13 @@ fn expected_configs() -> Vec<ConfigKey> {
                     kind: RunKind::Latency,
                     rate_fraction_pct: Some(80),
                 });
+                out.push(ConfigKey {
+                    server: s,
+                    workers: w,
+                    qos: Some(q),
+                    kind: RunKind::Counted,
+                    rate_fraction_pct: Some(SYSCALL_FRACTION_PCT),
+                });
             }
         }
         for &s in &servers {
@@ -980,6 +1025,7 @@ fn config_label(key: &ConfigKey) -> String {
             None => "latency".to_string(),
         },
         RunKind::Connections => "connections".to_string(),
+        RunKind::Counted => "counted".to_string(),
     };
     let qos = key
         .qos

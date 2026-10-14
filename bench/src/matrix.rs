@@ -21,7 +21,7 @@ use crate::analysis::{config_passes, interleave, median, matched_rates, recomput
 use crate::run_record::{
     ConfigKey, CpuSets, Env, Profile, RunKind, RunRecord, ServerKind, SyscallMethod, SCHEMA_VERSION,
 };
-use crate::runner::{HostSetup, LATENCY_FRACTIONS_PCT, ProtocolConstants, RunSpec};
+use crate::runner::{HostSetup, LATENCY_FRACTIONS_PCT, ProtocolConstants, RunSpec, SYSCALL_FRACTION_PCT};
 
 /// The full server set §9.1 records. A `bench run --profile recorded`
 /// refuses any other combination (AC-42).
@@ -86,16 +86,17 @@ pub fn servers_for(workers: u32, servers: &[ServerKind]) -> Vec<ServerKind> {
 /// Refuse a `bench run` request before any process is spawned. Every
 /// profile requires distinct matrix values inside the domains the
 /// harness runs, at least one runnable configuration, an executable for
-/// the counter it selected and an out_dir consistent with `--resume`;
-/// recorded runs also require a syscall counter, a mosquitto binary, and
-/// the full §9.1 matrix; nothing the rejection fires is a tool-version
-/// probe, so the marker-tool test can prove the refusal happened before
-/// any subprocess started. `counter_bin` is the path of the counter
-/// `syscalls` names (`--perf-bin` or `--strace-bin`).
+/// the counter it selected and no path for a counter it did not, and an
+/// out_dir consistent with `--resume`; recorded runs also require a
+/// syscall counter, a mosquitto binary, and the full §9.1 matrix;
+/// nothing the rejection fires is a tool-version probe, so the
+/// marker-tool test can prove the refusal happened before any
+/// subprocess started (AC-15).
 pub fn check_request(
     spec: &MatrixSpec,
     syscalls: SyscallMethod,
-    counter_bin: Option<&Path>,
+    perf_bin: Option<&Path>,
+    strace_bin: Option<&Path>,
     mosquitto_bin: Option<&Path>,
 ) -> Result<(), String> {
     check_distinct("servers", &spec.servers)?;
@@ -103,7 +104,7 @@ pub fn check_request(
     check_distinct("qos", &spec.qos)?;
     check_domains(spec)?;
     check_runnable(spec)?;
-    check_counter_bin(syscalls, counter_bin)?;
+    check_counter_bin(syscalls, perf_bin, strace_bin)?;
     if spec.profile == Profile::Recorded {
         if syscalls == SyscallMethod::None {
             return Err("recorded profile requires --syscalls perf|strace".to_string());
@@ -187,24 +188,50 @@ fn check_runnable(spec: &MatrixSpec) -> Result<(), String> {
     Ok(())
 }
 
-/// Refuse a selected syscall counter that has no executable. `run_one`
-/// reports a missing counter path only once a counted run reaches the
-/// counter (`bench/src/runner.rs`, `no perf_bin`/`no strace_bin`), so
-/// without this check the matrix runs every earlier configuration and
-/// then invalidates every counted one through all of its attempts.
+/// Refuse a selected syscall counter that has no executable, and refuse
+/// an executable for a counter the selection did not pick (AC-15).
+/// `run_one` reports a missing counter path only once a counted run
+/// reaches the counter (`bench/src/runner.rs`, `no perf_bin`/`no
+/// strace_bin`), so without the missing-check half the matrix runs
+/// every earlier configuration and then invalidates every counted one
+/// through all of its attempts. Without the unused-check half a
+/// `capture_env` probe runs `tool --version` for a flag the run never
+/// reads, so a `--syscalls strace` request that names `--perf-bin`
+/// spends a subprocess on its first refusal only.
+///
+/// The unused path is reported first: AC-15 names the `does not use`
+/// refusal for every request that carries an unused counter path, and
+/// `--syscalls perf --strace-bin <path>` with no `--perf-bin` carries
+/// one. Naming the missing path first would answer that request with
+/// `--syscalls perf requires --perf-bin`, which sends the operator to
+/// add a second path rather than to drop the one the selection does not
+/// read.
 fn check_counter_bin(
     syscalls: SyscallMethod,
-    counter_bin: Option<&Path>,
+    perf_bin: Option<&Path>,
+    strace_bin: Option<&Path>,
 ) -> Result<(), String> {
-    let (name, flag) = match syscalls {
-        SyscallMethod::Perf => ("perf", "--perf-bin"),
-        SyscallMethod::Strace => ("strace", "--strace-bin"),
-        SyscallMethod::None => return Ok(()),
-    };
-    if counter_bin.is_none() {
-        return Err(format!("--syscalls {name} requires {flag}"));
+    if perf_bin.is_some() && syscalls != SyscallMethod::Perf {
+        return Err(format!(
+            "--syscalls {} does not use --perf-bin; pass only the selected counter's path",
+            method_label(syscalls)
+        ));
     }
-    Ok(())
+    if strace_bin.is_some() && syscalls != SyscallMethod::Strace {
+        return Err(format!(
+            "--syscalls {} does not use --strace-bin; pass only the selected counter's path",
+            method_label(syscalls)
+        ));
+    }
+    match syscalls {
+        SyscallMethod::Perf if perf_bin.is_none() => {
+            Err("--syscalls perf requires --perf-bin".to_string())
+        }
+        SyscallMethod::Strace if strace_bin.is_none() => {
+            Err("--syscalls strace requires --strace-bin".to_string())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Read every `*.json` directly in `out_dir` as a `RunRecord`.
@@ -548,13 +575,21 @@ fn discard_scratch(scratch_dir: &Path, record: &RunRecord) {
 /// Drive the §9.1 matrix end to end. Each `(workers, qos)` pair runs
 /// its throughput configurations first, then latency configurations at
 /// 50 % and 80 % of the slowest passing throughput rate, then (after
-/// every QoS of one `w`) connections configurations. If any throughput
-/// configuration fails, every latency configuration of the same
-/// `(w, q)` is marked `failed` without running. SIGINT/SIGTERM
-/// cancellation is observed before every `run_one` call: once set,
-/// `run_matrix` returns `Err("cancelled")` after the current run
-/// finishes.
-pub fn run_matrix(spec: &MatrixSpec, host: &HostSetup) -> Result<MatrixOutcome, String> {
+/// every QoS of one `w`) connections configurations. When a syscall
+/// counter is selected, the open-loop stage also dispatches the counted
+/// configuration at the matched 80 % rate, interleaved with the latency
+/// runs. A failed throughput row marks all of them failed without
+/// running. SIGINT/SIGTERM cancellation is observed before every `run`
+/// call: once set, `run_matrix_with` returns `Err("cancelled")` after
+/// the current run finishes. `run` is the one-run executor; the
+/// production caller passes `|s| crate::runner::run_one(s, host)` and
+/// the tests pass a stub that observes the dispatched specs without
+/// spawning a runner.
+pub fn run_matrix_with<F: FnMut(&RunSpec) -> RunRecord>(
+    spec: &MatrixSpec,
+    host: &HostSetup,
+    mut run: F,
+) -> Result<MatrixOutcome, String> {
     let constants = ProtocolConstants::for_profile(spec.profile);
     fs::create_dir_all(&spec.out_dir)
         .map_err(|e| format!("create out dir: {e}"))?;
@@ -614,7 +649,7 @@ pub fn run_matrix(spec: &MatrixSpec, host: &HostSetup) -> Result<MatrixOutcome, 
                 &spec.out_dir,
                 &host.scratch_dir,
                 &host.cancel,
-                |s| crate::runner::run_one(s, host),
+                &mut run,
             )?;
             let thr_failed_keys = thr_outcome.failed;
             // A config the resume plan skipped already passed, so its
@@ -646,6 +681,15 @@ pub fn run_matrix(spec: &MatrixSpec, host: &HostSetup) -> Result<MatrixOutcome, 
                             qos: Some(q),
                             kind: RunKind::Latency,
                             rate_fraction_pct: Some(pct),
+                        });
+                    }
+                    if host.syscalls != SyscallMethod::None {
+                        outcome.failed.push(ConfigKey {
+                            server,
+                            workers: w,
+                            qos: Some(q),
+                            kind: RunKind::Counted,
+                            rate_fraction_pct: Some(SYSCALL_FRACTION_PCT),
                         });
                     }
                 }
@@ -687,6 +731,24 @@ pub fn run_matrix(spec: &MatrixSpec, host: &HostSetup) -> Result<MatrixOutcome, 
                         outcome.passed.push(key_of(&s));
                     }
                 }
+                if host.syscalls != SyscallMethod::None {
+                    let mut s = RunSpec {
+                        profile: spec.profile,
+                        server,
+                        workers: w,
+                        qos: Some(q),
+                        kind: RunKind::Counted,
+                        rate_fraction_pct: Some(SYSCALL_FRACTION_PCT),
+                        offered_rate: Some(rate_80),
+                        repetition: 0,
+                        attempt: 1,
+                    };
+                    if plan_spec(&plan, &mut s) {
+                        lat_specs.push(s);
+                    } else {
+                        outcome.passed.push(key_of(&s));
+                    }
+                }
             }
             let lat_outcome = run_configs(
                 &lat_specs,
@@ -694,7 +756,7 @@ pub fn run_matrix(spec: &MatrixSpec, host: &HostSetup) -> Result<MatrixOutcome, 
                 &spec.out_dir,
                 &host.scratch_dir,
                 &host.cancel,
-                |s| crate::runner::run_one(s, host),
+                &mut run,
             )?;
             outcome.passed.extend(lat_outcome.passed);
             outcome.failed.extend(lat_outcome.failed);
@@ -729,13 +791,18 @@ pub fn run_matrix(spec: &MatrixSpec, host: &HostSetup) -> Result<MatrixOutcome, 
             &spec.out_dir,
             &host.scratch_dir,
             &host.cancel,
-            |s| crate::runner::run_one(s, host),
+            &mut run,
         )?;
         outcome.passed.extend(conn_outcome.passed);
         outcome.failed.extend(conn_outcome.failed);
     }
 
     Ok(outcome)
+}
+
+/// [`run_matrix_with`] over [`runner::run_one`](crate::runner::run_one).
+pub fn run_matrix(spec: &MatrixSpec, host: &HostSetup) -> Result<MatrixOutcome, String> {
+    run_matrix_with(spec, host, |s| crate::runner::run_one(s, host))
 }
 
 fn key_of(spec: &RunSpec) -> ConfigKey {

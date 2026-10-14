@@ -88,7 +88,14 @@ drops it from the four-worker rows automatically.
 
 ## Preflight
 
-Each check below is a gate — stop and report on failure.
+Checks 1 (mosquitto) and 4 (env probe) are gates — stop and report on
+failure. Checks 2 (perf) and 3 (strace) select the syscall counter
+(spec §9.1 Counter selection): run check 2; if it prints `OK`, record
+with `--syscalls perf --perf-bin <path>`. Otherwise run check 3; if it
+prints `OK`, record with `--syscalls strace --strace-bin <path>`. If
+neither prints `OK`, stop. Only the selected counter's check blocks
+recording, and `bench run` refuses the path of a counter `--syscalls`
+did not select, so pass only the selected counter's `--*-bin`.
 
 1. **Mosquitto** — start the broker on the exact config the runner
    renders (`bench::runner::mosquitto_conf`, seven lines) and confirm
@@ -127,31 +134,79 @@ Each check below is a gate — stop and report on failure.
    perf_bin=/usr/local/bin/perf
    dir=$(mktemp -d)
    mkfifo "$dir/ctl" "$dir/ack"
-   sleep 30 &
+   # 60 s > COUNTER_CONTROL_TIMEOUT_SECS + CHILD_EXIT_SLACK_SECS: the probe
+   # target has to outlive the supervisor's SIGKILL deadline, and is killed
+   # below only after the verdict's inputs are read. `reap_counter` waits for
+   # the counter with the server still running, so a perf that ignores SIGINT
+   # and exits only when its target exits must fail here too — a target that
+   # died inside the slack would let that perf write `exit 0`.
+   sleep 60 &
    pid=$!
-   "$perf_bin" stat --delay=-1 --control=fifo:"$dir/ctl","$dir/ack" \
+   # The supervisor starts perf with SIGINT at its default disposition, as
+   # `bench run` does, forwards this check's SIGINT to it, and writes how
+   # perf ended to perf.end: `exit N` or `signal N`. A shell `wait` reports
+   # 130 both for a death by SIGINT and for a plain `exit 130`, and reconcile
+   # row 23 accepts only the first. 30 s after the SIGINT
+   # (CHILD_EXIT_SLACK_SECS) it SIGKILLs perf, so the `wait` below is bounded.
+   python3 -c '
+   import signal, subprocess, sys, time
+   deadline = []
+   def forward(signum, frame):
+       perf.send_signal(signal.SIGINT)
+       deadline.append(time.monotonic() + 30)
+   signal.signal(signal.SIGINT, forward)
+   perf = subprocess.Popen(sys.argv[2:])
+   while True:
+       try:
+           code = perf.wait(timeout=0.1)
+           break
+       except subprocess.TimeoutExpired:
+           if deadline and time.monotonic() > deadline[0]:
+               perf.kill()
+               code = perf.wait()
+               break
+   with open(sys.argv[1], "w") as end:
+       end.write(f"signal {-code}\n" if code < 0 else f"exit {code}\n")
+   ' "$dir/perf.end" "$perf_bin" stat --delay=-1 \
+     --control=fifo:"$dir/ctl","$dir/ack" \
      -x , -e raw_syscalls:sys_enter -p "$pid" 2>"$dir/perf.out" &
    perf_pid=$!
    exec 3<>"$dir/ctl" 4<>"$dir/ack"
-   echo enable >&3
-   read -r ack <&4
-   sleep 0.2
-   echo disable >&3
-   read -r ack <&4
-   kill -INT "$perf_pid"; wait "$perf_pid" || true
-   kill "$pid" 2>/dev/null || true
+   # 5 s = COUNTER_CONTROL_TIMEOUT_SECS: a perf that is missing or never
+   # acknowledges fails this check instead of hanging it.
+   # Both responses must contain `ack`: `wait_for_ack` accepts only those
+   # bytes, so an empty or error line fails here as it fails a counted run.
+   acked=0
+   if echo enable >&3 && read -r -t 5 ack <&4 && [ "${ack#*ack}" != "$ack" ]; then
+     sleep 0.2
+     if echo disable >&3 && read -r -t 5 ack <&4 && [ "${ack#*ack}" != "$ack" ]; then
+       acked=1
+     fi
+   fi
+   kill -INT "$perf_pid" 2>/dev/null
+   wait "$perf_pid"
+   perf_end=$(cat "$dir/perf.end" 2>/dev/null)
+   kill "$pid" 2>/dev/null
+   wait "$pid" 2>/dev/null
    exec 3>&- 4>&-
-   # `parse_perf_count`'s own acceptance: field 3 names the event and
-   # field 1 must be a count. A `<not supported>` or `<not counted>`
-   # field 1 is an unopened counter, not a zero count, and every counted
-   # run of the matrix would fail on it.
-   awk -F, '$3 == "raw_syscalls:sys_enter" && $1 ~ /^[0-9]+$/ { ok = 1 }
-            END { exit !ok }' "$dir/perf.out"
-   status=$?
+   # Reconcile row 23: perf must end by exit 0 or by SIGINT.
+   status=1
+   if [ "$acked" -eq 1 ] && { [ "$perf_end" = "exit 0" ] || [ "$perf_end" = "signal 2" ]; }; then
+     # `parse_perf_count`'s own acceptance: field 3 names the event and
+     # field 1 must be a count. A `<not supported>` or `<not counted>`
+     # field 1 is an unopened counter, not a zero count, and every counted
+     # run of the matrix would fail on it. Only the first matching line
+     # counts, because that is the one the parser returns.
+     awk -F, 'seen == 0 && $3 == "raw_syscalls:sys_enter" {
+                seen = 1; ok = ($1 ~ /^[0-9]+$/)
+              }
+              END { exit !ok }' "$dir/perf.out"
+     status=$?
+   fi
    if [ "$status" -eq 0 ]; then
      echo OK
    else
-     echo 'FAIL: no counted raw_syscalls:sys_enter line'
+     echo "FAIL: acked=$acked, perf ended '$perf_end', or no counted raw_syscalls:sys_enter line"
      cat "$dir/perf.out"
    fi
    rm -rf "$dir"
@@ -164,33 +219,161 @@ Each check below is a gate — stop and report on failure.
    counter the recorded runs cannot use. The line ends in
    `enable`/`disable` ack-exchange only and exits by SIGINT (or 0) after
    printing its counts — anything else fails the recorded profile's
-   exit-status rule.
+   exit-status rule. Every wait is bounded, and the check fails on a
+   missing perf, a missing acknowledgement, a perf that ignores SIGINT,
+   a perf that exits only when its target exits, and any ending but exit
+   0 or death by SIGINT. It needs `python3` for the supervisor that
+   tells those endings apart.
 
 3. **strace** — equivalent preflight for the fallback:
 
    ```sh
    strace_bin=strace
-   sleep 30 &
+   dir=$(mktemp -d)
+   # A multithreaded probe, because every counted run traces a
+   # multithreaded server. `check_strace_attachment` compares the thread
+   # count strace reports with the server's own `/proc/<pid>/task` count and
+   # invalidates the counted run on a shortfall, and a per-thread attach
+   # failure is otherwise silent. A single-threaded probe cannot tell a host
+   # that attaches to every thread from one that attaches to the main thread
+   # alone, so it would select a strace the recorded runs reject.
+   # The 60 s lifetime is check 2's: 60 s > COUNTER_CONTROL_TIMEOUT_SECS +
+   # CHILD_EXIT_SLACK_SECS, so the probe target outlives the supervisor's
+   # SIGKILL deadline and a tracer that ignores SIGINT and exits only with
+   # its target fails here as it fails a counted run. The probe is killed
+   # below only after the verdict's inputs are read.
+   probe_threads_expected=4   # the main thread plus the 3 started below
+   python3 -c '
+   import sys, threading, time
+   idle = threading.Event()
+   for _ in range(3):
+       threading.Thread(target=idle.wait, daemon=True).start()
+   open(sys.argv[1], "w").close()
+   time.sleep(60)
+   ' "$dir/probe.ready" &
    pid=$!
-   "$strace_bin" -c -f -p "$pid" -o /tmp/strace.out 2>/tmp/strace.err &
+   # `spawn_strace_counter` reads the thread count before it spawns strace,
+   # off a server whose threads all exist by `READY`. Wait for the probe's
+   # own ready file for the same reason — bounded, so a missing python3
+   # fails this check instead of hanging it.
+   ready_deadline=$((SECONDS + 5))   # 5 s = COUNTER_CONTROL_TIMEOUT_SECS
+   while [ ! -e "$dir/probe.ready" ] && [ "$SECONDS" -lt "$ready_deadline" ]; do
+     sleep 0.1
+   done
+   # `read_thread_count`'s own source: one `/proc/<pid>/task` entry per
+   # thread. A probe that never reached its thread count fails the verdict
+   # below, so this check never approves strace off a single-threaded trace.
+   probe_threads=$(ls "/proc/$pid/task" 2>/dev/null | wc -l)
+   # The same supervisor check 2 uses: it starts strace with SIGINT at its
+   # default disposition, as `bench run` does, forwards this check's SIGINT to
+   # it, and writes how strace ended to strace.end: `exit N` or `signal N`. A
+   # shell `wait` reports 130 both for a death by SIGINT and for a plain
+   # `exit 130`, and reconcile row 23 accepts only the first. 30 s after the
+   # SIGINT (CHILD_EXIT_SLACK_SECS) it SIGKILLs strace, so the `wait` below is
+   # bounded and a tracer that ignores SIGINT fails this check instead of
+   # hanging it.
+   python3 -c '
+   import signal, subprocess, sys, time
+   deadline = []
+   def forward(signum, frame):
+       strace.send_signal(signal.SIGINT)
+       deadline.append(time.monotonic() + 30)
+   signal.signal(signal.SIGINT, forward)
+   strace = subprocess.Popen(sys.argv[2:])
+   while True:
+       try:
+           code = strace.wait(timeout=0.1)
+           break
+       except subprocess.TimeoutExpired:
+           if deadline and time.monotonic() > deadline[0]:
+               strace.kill()
+               code = strace.wait()
+               break
+   with open(sys.argv[1], "w") as end:
+       end.write(f"signal {-code}\n" if code < 0 else f"exit {code}\n")
+   ' "$dir/strace.end" "$strace_bin" -c -f -p "$pid" \
+     -o "$dir/strace.out" 2>"$dir/strace.err" &
    strace_pid=$!
-   sleep 1
-   kill -INT "$strace_pid"; wait "$strace_pid" || true
-   grep -q ' total' /tmp/strace.out
-   status=$?
+   # `arm_counter` waits for strace's `attached` stderr marker and gives up
+   # after COUNTER_CONTROL_TIMEOUT_SECS, so wait for the same marker on the
+   # same deadline instead of a fixed sleep: a tracer that counts but never
+   # announces the attachment fails every counted run. The marker carries
+   # the attachment count, so the line also has to be complete — the
+   # `tail -c 1` test below is empty only when the file ends on a newline.
+   attach_deadline=$((SECONDS + 5))   # 5 s = COUNTER_CONTROL_TIMEOUT_SECS
+   attached=0
+   while [ "$SECONDS" -lt "$attach_deadline" ]; do
+     if grep -q attached "$dir/strace.err" 2>/dev/null \
+        && [ -z "$(tail -c 1 "$dir/strace.err")" ]; then
+       # `parse_strace_attached_threads`'s own reading: the first line
+       # carrying the marker, the number after `attached with `, and 1 for
+       # the short `attached` wording — which is what strace prints both for
+       # a single thread and when every sibling thread's attach failed.
+       attached=$(awk '/attached/ {
+                         n = 1
+                         if (match($0, /attached with [0-9]+/)) {
+                           n = substr($0, RSTART + 14, RLENGTH - 14)
+                         }
+                         print n
+                         exit
+                       }' "$dir/strace.err")
+       break
+     fi
+     sleep 0.1
+   done
+   kill -INT "$strace_pid" 2>/dev/null
+   wait "$strace_pid"
+   strace_end=$(cat "$dir/strace.end" 2>/dev/null)
+   kill "$pid" 2>/dev/null
+   wait "$pid" 2>/dev/null
+   # Reconcile row 23: strace must end by exit 0 or by SIGINT. The summary
+   # goes to a fresh file, so no earlier run's ` total` row can pass this
+   # check. The thread test is `check_strace_attachment`'s own: the reported
+   # count must not fall below the traced process's thread count, and the
+   # probe must have reached its own thread count for that test to mean
+   # anything.
+   status=1
+   if [ "$probe_threads" -eq "$probe_threads_expected" ] \
+      && [ "$attached" -ge "$probe_threads" ] \
+      && { [ "$strace_end" = "exit 0" ] || [ "$strace_end" = "signal 2" ]; }; then
+     # `parse_strace_total`'s own acceptance: the row's last field is
+     # `total` and its fourth field is the call count. A ` total` row whose
+     # calls field is not a number carries no count, and every counted run
+     # of the matrix would fail on it.
+     awk '$NF == "total" && $4 ~ /^[0-9]+$/ { ok = 1 }
+          END { exit !ok }' "$dir/strace.out"
+     status=$?
+   fi
    if [ "$status" -eq 0 ]; then
      echo OK
    else
-     echo 'FAIL: no total row in the strace summary'
-     cat /tmp/strace.out /tmp/strace.err
+     echo "FAIL: attached=$attached of $probe_threads probe threads" \
+          "(expected $probe_threads_expected), strace ended '$strace_end'," \
+          "or no counted total row in the summary"
+     cat "$dir/strace.out" "$dir/strace.err" 2>/dev/null
    fi
-   kill "$pid" 2>/dev/null || true
+   rm -rf "$dir"
    ( exit "$status" )   # gate status: 0 passes, nonzero stops the preflight
    ```
 
-   `analysis::parse_strace_total` reads the call count from the ` total`
-   row, so a summary without that row fails every counted run. An
-   attach refusal (`ptrace(`) lands in `/tmp/strace.err`.
+   `analysis::parse_strace_total` reads the call count from the fourth
+   field of the ` total` row, so a summary without that row, or with a
+   nonnumeric calls field, fails every counted run — the gate requires a
+   numeric count for the same reason check 2 does. An attach refusal
+   (`ptrace(`) lands in `$dir/strace.err`, which this check prints on
+   failure. The probe is multithreaded and the gate compares the reported
+   attachment count with its thread count, because
+   `runner::check_strace_attachment` does the same against the server's
+   `/proc/<pid>/task` count: a host that attaches to the main thread but
+   misses a sibling thread passes a single-threaded probe and then
+   invalidates every counted run, after the counted attempts are spent.
+   Every wait is bounded, and the check fails on a missing strace, a probe
+   that never reached its thread count, a tracer that never prints the
+   `attached` marker within `COUNTER_CONTROL_TIMEOUT_SECS`, an attachment
+   short of the probe's threads, a strace that ignores SIGINT, a strace
+   that exits only when its target exits, and any ending but exit 0 or
+   death by SIGINT. Like check 2, it needs `python3`
+   for the supervisor that tells those endings apart, and for the probe.
 
 4. **Env probe** — a smoke record's `Env.tools` lists each supplied
    tool's first non-blank `--version` line:
@@ -213,6 +396,18 @@ Each check below is a gate — stop and report on failure.
   --mosquitto-bin /usr/sbin/mosquitto
 ```
 
+For a strace counted run, swap the two perf lines for `--syscalls strace --strace-bin "$(command -v strace)"`.
+
+### Counted runs
+
+`syscalls/msg` comes from a dedicated counted run per server, worker count and QoS: open-loop at the matched 80 % rate, 5 repetitions interleaved with the latency runs (spec §9.1 Counted run). No latency run carries the counter, so both published latency columns are uncounted. The counted runs add 10 configurations — about 50 runs, roughly an hour — to a recorded session.
+
+### Strace exhaustion recovery
+
+A strace counted run that cannot reconcile at the matched rate is re-run at that same rate, never a lower one. When a counted configuration still fails after its last attempt (`bench run` exits 2 naming a `Counted` key), the strace session cannot be published: repair the perf build, pass preflight check 2, and record a fresh dataset into a new `--out` directory with `--syscalls perf`. Do not `--resume` the strace directory — `check_resume` refuses the changed method and tool set — and do not copy, commit or publish any of its records, counted or not: one document carries one method and one environment.
+
+Before every `--resume`, run the selected counter's preflight check again (check 2 for perf, check 3 for strace) and stop if it does not print `OK`. The `perf_event_paranoid` and tracefs settings it relies on do not survive a WSL restart, and `check_resume` does not re-test them, so a resumed session without them uses up its counted attempts.
+
 Exit codes:
 
 - `0` — every configuration passed; `bench doc` can render.
@@ -220,8 +415,9 @@ Exit codes:
   failed keys are named on stderr.
 - `1` — refusal (missing `perf-bin`, missing `mosquitto-bin`, output
   directory already holds `*.json`, dirty / mismatched build when
-  `--resume` is set, missing provenance) or SIGINT/SIGTERM during the
-  preflight.
+  `--resume` is set, a `--perf-bin`/`--strace-bin` the selected
+  `--syscalls` does not use, missing provenance) or SIGINT/SIGTERM
+  during the preflight.
 
 The recorded profile runs only the full fixed matrix; `check_request`
 refuses `--servers`/`--workers`/`--qos` subsets.
@@ -264,11 +460,21 @@ exit 1:
 - `InconsistentRecord(file: mismatches)` — `recompute` rejected at
   least one record.
 - `ProtocolViolation(text)` — recorded constants diverge, repetition
-  set is missing or non-`1..=5`, an 80 % latency run lacks a counter,
-  or a latency rate does not match the throughput medians.
+  set is missing or non-`1..=5`, a counted run lacks a counter, a
+  latency run carries one, or a latency rate does not match the
+  throughput medians.
 - `FailedConfigurations(names)` — the fixed matrix is missing or
   failed configurations, listed by kebab-case label
   (`uring-w1-q1-throughput`).
+
+The list is not `render`'s check order — some `ProtocolViolation`
+checks run before `FailedConfigurations` and the counter-evidence ones
+after it. What the order decides is which error a counted run without
+a counter prints: a record `recompute` rejects comes out as
+`InconsistentRecord` first, a counted configuration whose highest
+attempt failed comes out as `FailedConfigurations`, and
+`ProtocolViolation` is left for a counted key whose published attempt
+passed while an earlier attempt carries no counter.
 
 The document ends with five sign-off items that the operator ticks
 by hand after checking each one.
@@ -361,12 +567,14 @@ Examples:
 
 - `uring-w1-q1-throughput-a1-r1.json`
 - `tokio-w4-q0-latency-p80-a2-r3.json`
+- `uring-w1-q1-counted-p80-a1-r1.json`
 - `mosquitto-w1-connections-a1-r1.json`
 
-Worker is mandatory; QoS appears only on throughput and latency;
-`rate_fraction_pct` appears only on latency. The runner writes failed
-attempts under their own attempt number, so a configuration that
-succeeds on attempt 2 leaves both `…-a1-…` and `…-a2-…` on disk.
+Worker is mandatory; QoS appears only on throughput, latency and
+counted runs; `rate_fraction_pct` appears only on latency and counted
+runs. The runner writes failed attempts under their own attempt
+number, so a configuration that succeeds on attempt 2 leaves both
+`…-a1-…` and `…-a2-…` on disk.
 
 ## Recorded raw JSON
 

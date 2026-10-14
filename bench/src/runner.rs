@@ -5,11 +5,12 @@
 //! Signatures and the constants here match `features/benchmark-harness/PLAN.md`
 //! `## Data Model` and `## Interface Contracts`.
 //!
-//! Syscall counting (task 10) is wired here for the one counted run of a
-//! configuration — the 80 % latency run. `run_one` preps perf right after
-//! `READY`, spawns strace at `window.start_ns`, and stops, reaps and
-//! finalizes either kind at `window.end_ns`. The selected
-//! [`SyscallMethod`] and the tool paths come from [`HostSetup`].
+//! Syscall counting (task 10) is wired here for the counted run
+//! (`RunKind::Counted`, §9.1), open-loop at the matched 80 % rate.
+//! `run_one` preps perf right after `READY`, spawns strace at
+//! `window.start_ns`, and stops, reaps and finalizes either kind at
+//! `window.end_ns`. The selected [`SyscallMethod`] and the tool paths
+//! come from [`HostSetup`].
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::{AsFd, OwnedFd};
@@ -95,8 +96,8 @@ pub const DEFAULT_GENERATOR_CPUS: &str = "8-17";
 /// 50 % and 80 % (§9.1).
 pub const LATENCY_FRACTIONS_PCT: [u32; 2] = [50, 80];
 
-/// Latency fraction at which the runner counts syscalls (§9.1: the 80 %
-/// run is the counted one).
+/// Rate fraction the counted run is paced at (§9.1: the matched 80 %
+/// rate).
 pub const SYSCALL_FRACTION_PCT: u32 = 80;
 
 /// One second in nanoseconds, used to round origin / window boundaries.
@@ -908,7 +909,9 @@ fn spawn_generator(
     let qos = spec.qos.unwrap_or(0);
     let (mode_str, rate) = match spec.kind {
         RunKind::Throughput => ("throughput".to_string(), 0u64),
-        RunKind::Latency => ("latency".to_string(), spec.offered_rate.unwrap_or(0)),
+        RunKind::Latency | RunKind::Counted => {
+            ("latency".to_string(), spec.offered_rate.unwrap_or(0))
+        }
         RunKind::Connections => ("connections".to_string(), 0u64),
     };
     let report_path = scratch.join("gen.json");
@@ -1130,12 +1133,10 @@ impl Counter {
     }
 }
 
-/// True when this spec should run a counter and `host.syscalls` names one.
-/// A counted run is the 80 % latency run (the only one the matrix counts
-/// syscalls for) and the tool must be perf or strace.
+/// True when `spec` is the counted run and `host.syscalls` names a
+/// counter: the published latency runs never carry one (§9.1 Counted run).
 fn should_count(spec: &RunSpec, host: &HostSetup) -> bool {
-    spec.kind == RunKind::Latency
-        && spec.rate_fraction_pct == Some(SYSCALL_FRACTION_PCT)
+    spec.kind == RunKind::Counted
         && matches!(host.syscalls, SyscallMethod::Perf | SyscallMethod::Strace)
 }
 
@@ -2212,7 +2213,7 @@ pub fn run_one(spec: &RunSpec, host: &HostSetup) -> RunRecord {
 
     // Finalize the counter: parse the raw output the stop at the window
     // end left behind, and build the `Syscalls` block. A run with no
-    // counter — every kind but the 80 % latency run — records method
+    // counter — every kind but the counted run — records method
     // `None`, because `host.syscalls` names the tool the matrix would use
     // and this record carries no evidence from it.
     let syscalls = if let Some(c) = counter.as_mut() {
@@ -2380,7 +2381,7 @@ fn finalize_record(
     // The endpoint's raw histogram is the record's only latency
     // observation, and `derive` reads it back out of the record to compute
     // the percentiles, so it has to be installed before that call.
-    let latency_ns = if spec.kind == RunKind::Latency {
+    let latency_ns = if spec.kind.is_open_loop() {
         Some(LatencySummary {
             p50: 0,
             p99: 0,
@@ -2422,7 +2423,11 @@ fn finalize_record(
         connections_per_sec: None,
         generator_errors: gen_errors,
         syscalls: syscalls.unwrap_or(Syscalls {
-            method: host.syscalls,
+            method: if should_count(spec, host) {
+                host.syscalls
+            } else {
+                SyscallMethod::None
+            },
             count: None,
             per_msg: None,
             raw: None,

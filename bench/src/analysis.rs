@@ -100,7 +100,7 @@ pub fn derive(record: &RunRecord) -> Derived {
         None
     };
 
-    let latency_ns = if record.kind == RunKind::Latency {
+    let latency_ns = if record.kind.is_open_loop() {
         let histogram = record.latency_ns.as_ref().map(|l| l.histogram.clone());
         histogram.map(|histogram| LatencySummary {
             p50: percentile(&histogram, 0.5).unwrap_or(0),
@@ -152,13 +152,14 @@ pub fn derive(record: &RunRecord) -> Derived {
 /// order rows appear in PLAN.md, so a record that violates several rows is
 /// reported in a stable, reviewable order.
 #[allow(clippy::too_many_lines)] // 30 rows of the spec §9.1 contract; splitting them buys nothing
+#[allow(unused_parens)] // Row 13 chains `&& (Throughput || open_loop) && ...`; the same shape is kept on rows 2, 3 and 6 so the open-loop/throughput boundary is uniform
 pub fn reconcile(record: &RunRecord) -> Vec<String> {
     let mut reasons: Vec<String> = Vec::new();
 
     let dropped = record.counts.dropped.unwrap_or(0);
 
     // Row 1 — latency: scheduled count must equal offered.
-    if record.kind == RunKind::Latency
+    if record.kind.is_open_loop()
         && record.counts.scheduled != Some(record.counts.offered)
     {
         reasons.push(format!(
@@ -168,7 +169,7 @@ pub fn reconcile(record: &RunRecord) -> Vec<String> {
     }
 
     // Row 2 — throughput/latency: delivered + dropped must not exceed offered.
-    if matches!(record.kind, RunKind::Throughput | RunKind::Latency)
+    if (record.kind == RunKind::Throughput || record.kind.is_open_loop())
         && record
             .counts
             .delivered
@@ -179,7 +180,7 @@ pub fn reconcile(record: &RunRecord) -> Vec<String> {
     }
 
     // Row 3 — throughput/latency: unresolved must be zero.
-    if matches!(record.kind, RunKind::Throughput | RunKind::Latency)
+    if (record.kind == RunKind::Throughput || record.kind.is_open_loop())
         && record.counts.unresolved != 0
     {
         reasons.push(format!("unresolved {}", record.counts.unresolved));
@@ -196,7 +197,7 @@ pub fn reconcile(record: &RunRecord) -> Vec<String> {
     }
 
     // Row 6 — throughput/latency: non-zero dropped invalidates.
-    if matches!(record.kind, RunKind::Throughput | RunKind::Latency) {
+    if (record.kind == RunKind::Throughput || record.kind.is_open_loop()) {
         if let Some(n) = record.counts.dropped {
             if n != 0 {
                 let kind = kind_label(record.kind);
@@ -248,7 +249,7 @@ pub fn reconcile(record: &RunRecord) -> Vec<String> {
     }
 
     // Row 11 — latency: no missed slots.
-    if record.kind == RunKind::Latency && record.generator_errors.missed_slots != 0 {
+    if record.kind.is_open_loop() && record.generator_errors.missed_slots != 0 {
         reasons.push(format!(
             "missed slots {}",
             record.generator_errors.missed_slots
@@ -265,7 +266,7 @@ pub fn reconcile(record: &RunRecord) -> Vec<String> {
 
     // Row 13 — QoS 1 throughput/latency: every offered must be acked.
     if record.qos == Some(1)
-        && matches!(record.kind, RunKind::Throughput | RunKind::Latency)
+        && (record.kind == RunKind::Throughput || record.kind.is_open_loop())
         && record.counts.acked != Some(record.counts.offered)
     {
         reasons.push(format!(
@@ -275,14 +276,14 @@ pub fn reconcile(record: &RunRecord) -> Vec<String> {
     }
 
     // Row 14 — latency: latency_ns must be present.
-    if record.kind == RunKind::Latency && record.latency_ns.is_none() {
+    if record.kind.is_open_loop() && record.latency_ns.is_none() {
         reasons.push("no latency samples in the window".to_string());
     }
 
     // Row 15 — latency: histogram total must equal window_scheduled. Guarded
     // by `latency_ns.is_some()` so a missing latency record reports row 14
     // alone rather than also this count mismatch.
-    if record.kind == RunKind::Latency {
+    if record.kind.is_open_loop() {
         if let Some(latency_ns) = record.latency_ns.as_ref() {
             match histogram_total(&latency_ns.histogram) {
                 Err(reason) => reasons.push(format!("latency histogram {reason}")),
@@ -316,7 +317,7 @@ pub fn reconcile(record: &RunRecord) -> Vec<String> {
     // Row 18 — latency: lateness p99 within GENERATOR_LATENESS_FRACTION of latency
     // p99. Guarded by `latency_ns.is_some()` so a missing latency record
     // reports row 14 alone rather than also this mismatch against a zero p99.
-    if record.kind == RunKind::Latency {
+    if record.kind.is_open_loop() {
         if let Some(latency_ns) = record.latency_ns.as_ref() {
             let latency_p99 = latency_ns.p99;
             // Compare against the exact fraction of the p99, not a bound
@@ -338,7 +339,7 @@ pub fn reconcile(record: &RunRecord) -> Vec<String> {
         }
     }
 
-    // Row 19 — latency at SYSCALL_FRACTION_PCT with method perf/strace: count must exist.
+    // Row 19 — counted run: count must exist.
     if is_counted_syscall_run(record) && record.syscalls.count.is_none() {
         reasons.push("syscall count missing".to_string());
     }
@@ -352,14 +353,14 @@ pub fn reconcile(record: &RunRecord) -> Vec<String> {
     }
 
     // Row 21 — latency: no lateness over-range.
-    if record.kind == RunKind::Latency && record.generator_errors.lateness_over_range != 0 {
+    if record.kind.is_open_loop() && record.generator_errors.lateness_over_range != 0 {
         reasons.push(format!(
             "generator lateness over range {}",
             record.generator_errors.lateness_over_range
         ));
     }
 
-    // Row 22 — counted syscall run: boundary times within tolerance.
+    // Row 22 — counted run: boundary times within tolerance.
     if is_counted_syscall_run(record) {
         let start = record.window.start_ns;
         let end = record.window.end_ns;
@@ -379,7 +380,7 @@ pub fn reconcile(record: &RunRecord) -> Vec<String> {
         }
     }
 
-    // Row 23 — counted syscall run: exit must be Code(0) or Signal(SIGINT).
+    // Row 23 — counted run: exit must be Code(0) or Signal(SIGINT).
     if is_counted_syscall_run(record) {
         let ok = match record.syscalls.exit {
             Some(CounterExit::Code(0)) => true,
@@ -395,7 +396,7 @@ pub fn reconcile(record: &RunRecord) -> Vec<String> {
     }
 
     // Row 24 — latency: last_write_start_ns must be Some(t < window.end_ns).
-    if record.kind == RunKind::Latency {
+    if record.kind.is_open_loop() {
         match record.last_write_start_ns {
             None => reasons
                 .push("publish write began at or after the window end: None".to_string()),
@@ -407,7 +408,7 @@ pub fn reconcile(record: &RunRecord) -> Vec<String> {
     }
 
     // Row 25 — latency: Σ lateness counts + lateness_over_range must equal window_scheduled.
-    if record.kind == RunKind::Latency {
+    if record.kind.is_open_loop() {
         match histogram_total(&record.lateness) {
             Err(reason) => reasons.push(format!("lateness histogram {reason}")),
             Ok(lateness_total) => {
@@ -458,7 +459,7 @@ pub fn reconcile(record: &RunRecord) -> Vec<String> {
     // slots follow an offered rate, a window whose start follows its end has
     // no slot span at all, and a rate whose schedule does not fit a `u64`
     // cannot be checked; all three invalidate the run rather than skip the row.
-    if record.kind == RunKind::Latency {
+    if record.kind.is_open_loop() {
         match record.offered_rate {
             None => reasons.push("no offered rate for a latency run".to_string()),
             Some(_) if record.window.start_ns > record.window.end_ns => {
@@ -510,7 +511,7 @@ pub fn reconcile(record: &RunRecord) -> Vec<String> {
         Some(_) => {}
     }
 
-    // Row 30 — counted syscall run: the window must hold deliveries. The
+    // Row 30 — counted run: the window must hold deliveries. The
     // syscalls/message denominator is the window's delivery count, so a run
     // whose publishes all arrive outside the window carries a syscall count
     // with nothing to divide it by, and `derive` reports no syscalls/message
@@ -690,12 +691,13 @@ pub fn spread(values: &[f64]) -> Option<f64> {
 }
 
 /// Primary metric of `record`: throughput → msgs/s, latency → p99 ns,
-/// connections → conn/s.
+/// connections → conn/s, counted → syscalls/msg.
 pub fn metric(record: &RunRecord) -> Option<f64> {
     match record.kind {
         RunKind::Throughput => record.throughput_msgs_per_sec,
         RunKind::Latency => record.latency_ns.as_ref().map(|l| l.p99 as f64),
         RunKind::Connections => record.connections_per_sec,
+        RunKind::Counted => record.syscalls.per_msg,
     }
 }
 
@@ -882,14 +884,11 @@ fn kind_label(kind: RunKind) -> &'static str {
         RunKind::Throughput => "throughput",
         RunKind::Latency => "latency",
         RunKind::Connections => "connections",
+        RunKind::Counted => "counted",
     }
 }
 
+/// The counted run (`RunKind::Counted`) is the only run that carries a syscall counter.
 fn is_counted_syscall_run(record: &RunRecord) -> bool {
-    record.kind == RunKind::Latency
-        && record.rate_fraction_pct == Some(SYSCALL_FRACTION_PCT)
-        && matches!(
-            record.syscalls.method,
-            SyscallMethod::Perf | SyscallMethod::Strace
-        )
+    record.kind == RunKind::Counted
 }

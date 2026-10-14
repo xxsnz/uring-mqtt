@@ -215,7 +215,7 @@ fn wait_for_children(parent_pid: u32, want: usize, timeout: Duration) -> Vec<u32
 #[test]
 fn recorded_run_refuses_without_syscall_counting() {
     let work = temp_dir("refuse-syscalls");
-    let marker = make_marker(&work, "marker.sh", "touch $(dirname $0)/invoked\n");
+    let marker = make_marker(&work, "marker.sh", "touch \"$(dirname \"$0\")/invoked\"\n");
     let out_dir = work.join("out");
     fs::create_dir_all(&out_dir).unwrap();
 
@@ -250,7 +250,7 @@ fn recorded_run_refuses_without_syscall_counting() {
 #[test]
 fn recorded_run_refuses_without_mosquitto() {
     let work = temp_dir("refuse-mosq");
-    let marker = make_marker(&work, "marker.sh", "touch $(dirname $0)/invoked\n");
+    let marker = make_marker(&work, "marker.sh", "touch \"$(dirname \"$0\")/invoked\"\n");
     let out_dir = work.join("out");
     fs::create_dir_all(&out_dir).unwrap();
 
@@ -276,7 +276,7 @@ fn recorded_run_refuses_without_mosquitto() {
 #[test]
 fn recorded_run_refuses_a_partial_matrix() {
     let work = temp_dir("refuse-partial");
-    let marker = make_marker(&work, "marker.sh", "touch $(dirname $0)/invoked\n");
+    let marker = make_marker(&work, "marker.sh", "touch \"$(dirname \"$0\")/invoked\"\n");
     let out_dir = work.join("out");
     fs::create_dir_all(&out_dir).unwrap();
 
@@ -384,6 +384,46 @@ fn run_refuses_a_value_outside_the_measured_domain() {
         "stderr must name --workers, got: {stderr_text}"
     );
 
+    let count = count_json(&out_dir);
+    assert_eq!(count, 0, "no .json must be written on refusal, got {count}");
+}
+
+/// A counter path for a counter `--syscalls` did not select is refused
+/// before any probe (AC-15): otherwise the unused path's tool-version
+/// probe runs and spends a subprocess on a flag the run never reads.
+#[test]
+fn run_refuses_a_counter_path_the_selected_method_does_not_use() {
+    let work = temp_dir("refuse-counter-unused");
+    let marker = make_marker(&work, "marker.sh", "touch \"$(dirname \"$0\")/invoked\"\n");
+    let out_dir = work.join("out");
+    fs::create_dir_all(&out_dir).unwrap();
+
+    let mut run = RunChild::spawn(&[
+        "--profile",
+        "smoke",
+        "--out",
+        out_dir.to_str().unwrap(),
+        "--syscalls",
+        "none",
+        "--perf-bin",
+        marker.to_str().unwrap(),
+        "--servers",
+        "uring",
+        "--workers",
+        "1",
+        "--qos",
+        "1",
+    ]);
+    assert_exited_with(&mut run, 1, SIGTERM_EXIT_TIMEOUT, "counter path unused");
+    let stderr_text = run.collect_stderr(Duration::from_secs(2)).join("\n");
+    assert!(
+        stderr_text.contains("--syscalls none does not use --perf-bin"),
+        "stderr must name the unused counter flag, got: {stderr_text}"
+    );
+    assert!(
+        !work.join("invoked").exists(),
+        "marker must not have been invoked"
+    );
     let count = count_json(&out_dir);
     assert_eq!(count, 0, "no .json must be written on refusal, got {count}");
 }
