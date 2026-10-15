@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
@@ -26,8 +27,9 @@ use bench::record::Timeline;
 use bench::record::Window;
 
 use bench::runner::{
-    capture_env, check_provenance, head_sha, head_sha_with, mosquitto_conf, run_one, HostSetup,
-    RunSpec, GIT_HEAD_TIMEOUT_SECS,
+    capture_env, capture_env_with, check_provenance, head_sha, head_sha_with, mosquitto_conf,
+    run_one, run_one_with, HostSetup, RunSpec, CLEANUP_SURVIVOR_PREFIX,
+    GIT_HEAD_TIMEOUT_SECS, TOOL_VERSION_TIMEOUT_SECS,
 };
 
 /// `bench/build.rs`, compiled into this test so its probe can be driven with
@@ -50,6 +52,9 @@ const PROBE_POLL: Duration = Duration::from_millis(20);
 /// own.
 const DESCENDANT_SLEEP_SECS: u64 = GIT_HEAD_TIMEOUT_SECS * 10;
 
+/// Slack a reap assertion grants the host's scheduling.
+const REAP_SLACK_SECS: u64 = 2;
+
 /// How often a fixture of [`wait_while_kept`] looks at the keep-alive file
 /// the test ends it with.
 const FIXTURE_KEEP_POLL_SECS: u64 = 1;
@@ -64,9 +69,19 @@ const FIXTURE_EXIT_SLACK_SECS: u64 = PROBE_RETURN_SLACK_SECS;
 /// SHA behind more bytes than this.
 const GIT_HEAD_STDOUT_CAP_BYTES: usize = 4096;
 
-/// The reap bound of `head_sha_with`'s cleanup, mirrored here because the
+/// The stdout read cap of `capture_env`'s `--version` probe, mirrored
+/// because the runner keeps it private.
+const TOOL_VERSION_STDOUT_CAP_BYTES: usize = 4096;
+
+/// A version line as the fixtures print it, newline included.
+const VERSION_LINE: &str = "faketool version 1.0\n";
+
+/// The reap bound after a cleanup SIGKILL, mirrored here because the
 /// runner keeps it private.
-const GIT_HEAD_REAP_TIMEOUT_SECS: u64 = 1;
+const SIGKILL_REAP_TIMEOUT_SECS: u64 = 1;
+
+/// Mirror of the runner's private guard reap bound (`GUARD_SIGKILL_REAP_TIMEOUT_SECS`).
+const GUARD_SIGKILL_REAP_TIMEOUT_SECS: u64 = 10;
 
 /// The probe bound of `bench/build.rs`, mirrored because the build script
 /// keeps it private.
@@ -119,7 +134,7 @@ fn real_host_setup(scratch_dir: PathBuf, cancel: Arc<AtomicBool>) -> HostSetup {
             server: bench::runner::DEFAULT_SERVER_CPUS.to_string(),
             generator: bench::runner::DEFAULT_GENERATOR_CPUS.to_string(),
         },
-        env: capture_env(&[]).expect("capture_env"),
+        env: capture_env(&[], &AtomicBool::new(false)).expect("capture_env"),
         scratch_dir,
         cancel,
     }
@@ -582,7 +597,7 @@ fn run_one_invalidates_a_run_whose_children_write_no_reports() {
             server: bench::runner::DEFAULT_SERVER_CPUS.to_string(),
             generator: bench::runner::DEFAULT_GENERATOR_CPUS.to_string(),
         },
-        env: capture_env(&[]).expect("capture_env"),
+        env: capture_env(&[], &AtomicBool::new(false)).expect("capture_env"),
         scratch_dir: dir.clone(),
         cancel,
     };
@@ -629,6 +644,139 @@ fn run_one_invalidates_a_run_whose_children_write_no_reports() {
 }
 
 #[test]
+fn run_one_with_records_a_child_its_cleanup_could_not_end() {
+    let dir = temp_dir("survivor");
+    let cancel = Arc::new(AtomicBool::new(false));
+
+    // A fake endpoint: it prints its pid so the test can pin its identity,
+    // closes stdout without writing `READY`, and then waits on the
+    // keep-alive file this test ends it with. `run_guarded` therefore takes
+    // its READY early return while the endpoint is still in the guard, and a
+    // stand-in SIGKILL refuses its cleanup.
+    let pid_file = dir.join("endpoint.pid");
+    let keep = dir.join("keep");
+    fs::write(&keep, b"").expect("create the fixture's keep-alive file");
+    let script_body = format!(
+        "echo $$ > {pid}\nexec >/dev/null\n{wait}",
+        pid = shell_word(&pid_file),
+        wait = wait_while_kept(&keep),
+    );
+    let script = make_script(&dir, "stalled-bench.sh", &script_body);
+
+    let host = HostSetup {
+        bench_exe: script.clone(),
+        mosquitto_bin: None,
+        syscalls: SyscallMethod::None,
+        perf_bin: None,
+        strace_bin: None,
+        cpu_sets: CpuSets {
+            server: bench::runner::DEFAULT_SERVER_CPUS.to_string(),
+            generator: bench::runner::DEFAULT_GENERATOR_CPUS.to_string(),
+        },
+        env: capture_env(&[], &AtomicBool::new(false)).expect("capture_env"),
+        scratch_dir: dir.clone(),
+        cancel,
+    };
+    let spec = RunSpec {
+        profile: Profile::Smoke,
+        server: ServerKind::Uring,
+        workers: 1,
+        qos: Some(1),
+        kind: RunKind::Throughput,
+        rate_fraction_pct: None,
+        offered_rate: None,
+        repetition: 1,
+        attempt: 1,
+    };
+
+    // Retry when another test's open descriptor turns `exec` into `ETXTBSY`.
+    let mut record;
+    let deadline = Instant::now() + Duration::from_secs(SCRIPT_BUSY_RETRY_SECS);
+    let mut attempt = 0_u32;
+    loop {
+        attempt += 1;
+        let mut host_attempt = host.clone();
+        host_attempt.scratch_dir = dir.join(format!("scratch-{attempt}"));
+        record = run_one_with(&spec, &host_attempt, |_, _| Err(Errno::EPERM));
+        let busy = record.harness_errors.iter().any(|e| e.contains(SCRIPT_BUSY));
+        if !busy {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "SCRIPT_BUSY retry budget exhausted"
+        );
+        sleep(PROBE_POLL);
+    }
+
+    // Captured while the survivor is certainly still running, so the pid
+    // names the fixture and not a later owner of that number. The guard's
+    // whole bound has already passed, so the pid file is there.
+    let fixture = await_fixture(&pid_file, Duration::from_secs(GUARD_SIGKILL_REAP_TIMEOUT_SECS))
+        .expect("the fake endpoint must record its pid");
+    let pid = fixture.pid.as_raw();
+    let start = fixture.started;
+
+    // Release the fixture and wait for its reap before any assertion, so a
+    // failed assertion below cannot leave it running. The exit is asked for
+    // through the keep-alive file and the pid is never signalled: the reaper
+    // thread the guard left behind owns the survivor's one `wait` and is free
+    // to free that pid number for another process.
+    let ended = end_fixture(
+        &keep,
+        fixture,
+        Duration::from_secs(FIXTURE_KEEP_POLL_SECS + FIXTURE_EXIT_SLACK_SECS),
+    );
+    let reap_deadline = Instant::now() + Duration::from_secs(REAP_SLACK_SECS);
+    let reaped = loop {
+        if proc_start_time(fixture.pid.as_raw()) != Some(fixture.started) {
+            break true;
+        }
+        if Instant::now() >= reap_deadline {
+            break false;
+        }
+        sleep(PROBE_POLL);
+    };
+    let _ = fs::remove_dir_all(&dir);
+
+    let any_ready = record
+        .harness_errors
+        .iter()
+        .any(|e| e.starts_with("endpoint startup failed: READY"));
+    assert!(
+        any_ready,
+        "expected a READY startup error in {:?}",
+        record.harness_errors
+    );
+    let expected = format!(
+        "{CLEANUP_SURVIVOR_PREFIX}endpoint cleanup: pid {pid} (start {start}) still running {GUARD_SIGKILL_REAP_TIMEOUT_SECS}s after SIGKILL"
+    );
+    let survivor_entry = record
+        .harness_errors
+        .iter()
+        .find(|e| e.starts_with(&expected))
+        .unwrap_or_else(|| panic!("expected survivor error starting with `{expected}` in {:?}", record.harness_errors));
+    assert!(
+        survivor_entry.contains("SIGKILL: EPERM"),
+        "the survivor must carry the refused SIGKILL: {survivor_entry}"
+    );
+    assert!(
+        record.invalid_reasons.contains(survivor_entry),
+        "the survivor must reach `invalid_reasons`"
+    );
+    assert!(!record.valid, "a record with a survivor must be invalid");
+    assert!(
+        ended,
+        "the survivor must exit once the test stops keeping it alive, \
+         leaving nothing of this test running"
+    );
+    assert!(
+        reaped,
+        "the reaper thread the guard left behind must reap the survivor"
+    );
+}
+
+#[test]
 fn run_one_succeeds_when_the_endpoint_starts_slower_than_the_lead() {
     let dir = temp_dir("slow-startup");
     let real_bench = env!("CARGO_BIN_EXE_bench");
@@ -650,7 +798,7 @@ fn run_one_succeeds_when_the_endpoint_starts_slower_than_the_lead() {
             server: bench::runner::DEFAULT_SERVER_CPUS.to_string(),
             generator: bench::runner::DEFAULT_GENERATOR_CPUS.to_string(),
         },
-        env: capture_env(&[]).expect("capture_env"),
+        env: capture_env(&[], &AtomicBool::new(false)).expect("capture_env"),
         scratch_dir: dir.clone(),
         cancel: Arc::new(AtomicBool::new(false)),
     };
@@ -1131,7 +1279,7 @@ fn head_sha_bounds_reports_and_later_reaps_a_probe_its_sigkill_cannot_reach() {
     });
 
     let outcome = rx.recv_timeout(Duration::from_secs(
-        GIT_HEAD_TIMEOUT_SECS + GIT_HEAD_REAP_TIMEOUT_SECS + PROBE_RETURN_SLACK_SECS,
+        GIT_HEAD_TIMEOUT_SECS + SIGKILL_REAP_TIMEOUT_SECS + PROBE_RETURN_SLACK_SECS,
     ));
     let probe_pid = watcher
         .join()
@@ -1158,7 +1306,7 @@ fn head_sha_bounds_reports_and_later_reaps_a_probe_its_sigkill_cannot_reach() {
         "err must name the refused pid signal: {err}"
     );
     assert!(
-        elapsed < Duration::from_secs(GIT_HEAD_REAP_TIMEOUT_SECS + PROBE_RETURN_SLACK_SECS),
+        elapsed < Duration::from_secs(SIGKILL_REAP_TIMEOUT_SECS + PROBE_RETURN_SLACK_SECS),
         "the reap must return within its own bound: {elapsed:?}"
     );
 
@@ -1218,7 +1366,7 @@ fn head_sha_reports_its_deadline_before_a_cleanup_it_could_not_complete() {
     // names the fixture and not a later owner of that number.
     let fixture = await_fixture(&pid_file, Duration::from_secs(GIT_HEAD_TIMEOUT_SECS));
     let outcome = rx.recv_timeout(Duration::from_secs(
-        GIT_HEAD_TIMEOUT_SECS + GIT_HEAD_REAP_TIMEOUT_SECS + PROBE_RETURN_SLACK_SECS,
+        GIT_HEAD_TIMEOUT_SECS + SIGKILL_REAP_TIMEOUT_SECS + PROBE_RETURN_SLACK_SECS,
     ));
     // The injected signal refused both SIGKILLs, so only this cleanup ends
     // the fixture. It asks for that exit through the keep-alive file and
@@ -1247,7 +1395,7 @@ fn head_sha_reports_its_deadline_before_a_cleanup_it_could_not_complete() {
     assert!(
         elapsed
             < Duration::from_secs(
-                GIT_HEAD_TIMEOUT_SECS + GIT_HEAD_REAP_TIMEOUT_SECS + PROBE_RETURN_SLACK_SECS
+                GIT_HEAD_TIMEOUT_SECS + SIGKILL_REAP_TIMEOUT_SECS + PROBE_RETURN_SLACK_SECS
             ),
         "the deadline and the reap bound must both hold: {elapsed:?}"
     );
@@ -1315,7 +1463,7 @@ fn head_sha_names_only_the_cleanup_signal_that_failed() {
 
     let fixture = await_fixture(&pid_file, Duration::from_secs(GIT_HEAD_TIMEOUT_SECS));
     let outcome = rx.recv_timeout(Duration::from_secs(
-        GIT_HEAD_TIMEOUT_SECS + GIT_HEAD_REAP_TIMEOUT_SECS + PROBE_RETURN_SLACK_SECS,
+        GIT_HEAD_TIMEOUT_SECS + SIGKILL_REAP_TIMEOUT_SECS + PROBE_RETURN_SLACK_SECS,
     ));
     watcher.join().expect("watcher thread");
     // Neither injected signal reached the fixture, so only this cleanup
@@ -1412,7 +1560,7 @@ fn bench_build_embeds_the_checkout_sha() {
     // same repository whose state `bench/build.rs` embeds.
     let expected = head_sha(std::path::Path::new("git"), &AtomicBool::new(false))
         .expect("the checkout's git must answer");
-    let observed = capture_env(&[]).expect("capture_env").git_sha;
+    let observed = capture_env(&[], &AtomicBool::new(false)).expect("capture_env").git_sha;
     assert_eq!(
         observed, expected,
         "the build-time probe must embed the same SHA the runtime probe reads"
@@ -1697,7 +1845,7 @@ fn mosquitto_conf_renders_the_approved_options() {
 fn capture_env_refuses_a_tool_that_prints_no_version() {
     let dir = temp_dir("blank-version");
     let tool = make_script(&dir, "blank-version.sh", "printf '\\n   \\n'\n");
-    let err = capture_env(std::slice::from_ref(&tool))
+    let err = capture_env(std::slice::from_ref(&tool), &AtomicBool::new(false))
         .expect_err("a probe that prints no version must fail the capture");
     assert!(err.contains(&tool.display().to_string()), "err must name the tool: {err}");
     assert!(
@@ -1716,7 +1864,7 @@ fn capture_env_records_the_first_non_blank_version_line() {
         "printf '\\n  \\nfaketool version 1.2.3  \\nsecond line\\n'\n",
     );
     let env =
-        capture_env(std::slice::from_ref(&tool)).expect("a probe that prints a version must pass");
+        capture_env(std::slice::from_ref(&tool), &AtomicBool::new(false)).expect("a probe that prints a version must pass");
     assert_eq!(
         env.tools,
         vec![(
@@ -1729,22 +1877,131 @@ fn capture_env_records_the_first_non_blank_version_line() {
 
 #[test]
 fn capture_env_times_out_a_tool_that_prints_only_blank_lines() {
-    // Blank lines with no pause for ~10 s, well past the 5 s probe
-    // deadline, then EOF. The reader drops every one of them, so the
-    // probe must stop at its deadline: a probe that waited for EOF
-    // instead would report the wrong cause, and one whose reader
-    // queued the lines would grow that queue for 10 s.
+    // Three blank lines and then silence with stdout still open: the reader
+    // drops every blank line, so only the deadline can end the probe. A probe
+    // that waited for EOF instead would hang, and one that recorded a blank
+    // line would pass with an empty version.
     let dir = temp_dir("blank-flood-version");
     let tool = make_script(
         &dir,
         "blank-flood-version.sh",
-        "end=$(($(date +%s) + 10))\nwhile [ \"$(date +%s)\" -lt \"$end\" ]; do echo; done\n",
+        &format!("printf '\\n \\n\\t\\n'\nexec sleep {DESCENDANT_SLEEP_SECS}\n"),
     );
-    let err = capture_env(std::slice::from_ref(&tool))
-        .expect_err("a probe that never prints a version must fail the capture");
+    let err = retry_busy(|| {
+        capture_env(std::slice::from_ref(&tool), &AtomicBool::new(false))
+            .map(|env| env.tools[0].1.clone())
+    })
+    .0
+    .expect_err("a probe that never prints a version must fail the capture");
     assert!(
         err.contains("--version did not answer within"),
         "err must name the deadline: {err}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn capture_env_refuses_unterminated_version_flood_before_its_deadline() {
+    // A tool that floods stdout with more bytes than the cap and never
+    // stops must be refused as soon as the cap's EOF is reached, well
+    // before the probe's deadline — not held until the deadline fires.
+    let dir = temp_dir("version-flood-unterminated");
+    let tool = make_script(
+        &dir,
+        "version-flood-unterminated.sh",
+        &format!(
+            "head -c {} /dev/zero | tr '\\000' x\nexec sleep {DESCENDANT_SLEEP_SECS}\n",
+            2 * TOOL_VERSION_STDOUT_CAP_BYTES
+        ),
+    );
+    let (result, elapsed) = retry_busy(|| {
+        capture_env(std::slice::from_ref(&tool), &AtomicBool::new(false))
+            .map(|env| env.tools[0].1.clone())
+    });
+    let err = result.expect_err("a flood that never ends its line must be refused");
+    assert!(
+        err.contains(&format!(
+            "--version printed a line with no newline within {TOOL_VERSION_STDOUT_CAP_BYTES} bytes"
+        )),
+        "err must name the cause: {err}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(TOOL_VERSION_TIMEOUT_SECS),
+        "the refusal must arrive before the deadline: {elapsed:?}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn capture_env_refuses_unterminated_version_line_at_eof() {
+    // A tool that exits right after printing a version with no trailing
+    // newline reaches EOF mid-line; that line must be refused, not
+    // recorded as the version.
+    let dir = temp_dir("version-unterminated-eof");
+    let tool = make_script(
+        &dir,
+        "version-unterminated-eof.sh",
+        "printf 'faketool version 1.0'\n",
+    );
+    let err = retry_busy(|| {
+        capture_env(std::slice::from_ref(&tool), &AtomicBool::new(false))
+            .map(|env| env.tools[0].1.clone())
+    })
+    .0
+    .expect_err("a line left unterminated at EOF must be refused");
+    assert!(
+        err.contains(&format!(
+            "--version printed a line with no newline within {TOOL_VERSION_STDOUT_CAP_BYTES} bytes"
+        )),
+        "err must name the cause: {err}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn capture_env_records_a_version_line_that_ends_exactly_at_its_stdout_cap() {
+    // The version line's own newline lands on the last byte the capped
+    // reader reads, so the line is whole and the probe records it in
+    // full. Regression guard on the cap's boundary: passes before and
+    // after the cap is added.
+    let dir = temp_dir("version-exact-fit");
+    let pad = TOOL_VERSION_STDOUT_CAP_BYTES - VERSION_LINE.len();
+    let tool = make_script(
+        &dir,
+        "version-exact-fit.sh",
+        &format!("printf '%{pad}s' ''\nprintf '{VERSION_LINE}'"),
+    );
+    let version = retry_busy(|| {
+        capture_env(std::slice::from_ref(&tool), &AtomicBool::new(false))
+            .map(|env| env.tools[0].1.clone())
+    })
+    .0
+    .expect("a version line that ends exactly at the cap must be recorded");
+    assert_eq!(version, "faketool version 1.0");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn capture_env_refuses_unterminated_version_character_its_cap_cuts() {
+    // Padding that leaves the cap room for only the first byte of a
+    // two-byte UTF-8 character cuts the stream mid-character; the reader
+    // must refuse that as a read failure, not answer with a cut version.
+    let dir = temp_dir("version-utf8-cut");
+    let pad = TOOL_VERSION_STDOUT_CAP_BYTES - 1;
+    let tool = make_script(
+        &dir,
+        "version-utf8-cut.sh",
+        &format!("printf '%{pad}s' ''\nprintf '\\303\\251\\n'\n"),
+    );
+    let err = retry_busy(|| {
+        capture_env(std::slice::from_ref(&tool), &AtomicBool::new(false))
+            .map(|env| env.tools[0].1.clone())
+    })
+    .0
+    .expect_err("a character the cap cuts must not be read");
+    assert!(
+        err.contains("read --version stdout:"),
+        "err must name the read failure: {err}"
     );
     let _ = fs::remove_dir_all(&dir);
 }
@@ -1756,7 +2013,7 @@ fn capture_env_refuses_a_tool_whose_version_stdout_is_empty() {
     // no-version cause as a probe that printed only blank lines.
     let dir = temp_dir("silent-version");
     let tool = make_script(&dir, "silent-version.sh", "exit 0\n");
-    let err = capture_env(std::slice::from_ref(&tool))
+    let err = capture_env(std::slice::from_ref(&tool), &AtomicBool::new(false))
         .expect_err("a probe that prints nothing must fail the capture");
     assert!(err.contains(&tool.display().to_string()), "err must name the tool: {err}");
     assert!(
@@ -1777,7 +2034,7 @@ fn capture_env_skips_tab_only_lines_and_trims_the_version() {
         "printf '\\t\\n \\t \\n\\tfaketool version 4.5\\t\\n'\n",
     );
     let env =
-        capture_env(std::slice::from_ref(&tool)).expect("a probe that prints a version must pass");
+        capture_env(std::slice::from_ref(&tool), &AtomicBool::new(false)).expect("a probe that prints a version must pass");
     assert_eq!(
         env.tools,
         vec![(
@@ -1800,7 +2057,7 @@ fn capture_env_probes_every_supplied_tool_in_order() {
         "printf '\\n\\nfirsttool version 1.0\\n'\n",
     );
     let second = make_script(&dir, "second-version.sh", "printf 'secondtool version 2.0\\n'\n");
-    let env = capture_env(&[first.clone(), second.clone()]).expect("both probes must pass");
+    let env = capture_env(&[first.clone(), second.clone()], &AtomicBool::new(false)).expect("both probes must pass");
     assert_eq!(
         env.tools,
         vec![
@@ -1814,6 +2071,152 @@ fn capture_env_probes_every_supplied_tool_in_order() {
             )
         ]
     );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn capture_env_with_bounds_reports_and_later_reaps_a_probe_its_sigkill_cannot_reach() {
+    // AC-1/AC-2's refused-cleanup path for a `--version` probe, mirroring
+    // `head_sha_reports_its_deadline_before_a_cleanup_it_could_not_complete`
+    // (`head_sha_with`), except the probe is ended by cancellation rather
+    // than by its deadline.
+    let dir = temp_dir("capture-env-with-unkillable");
+    let pid_file = dir.join("probe.pid");
+    let keep = dir.join("keep");
+    fs::write(&keep, b"").expect("create the fixture's keep-alive file");
+    let tool = make_script(
+        &dir,
+        "unkillable-version.sh",
+        &format!(
+            "printf '%s\\n' \"$$\" > {}\n{}",
+            shell_word(&pid_file),
+            wait_while_kept(&keep)
+        ),
+    );
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let probe_cancel = Arc::clone(&cancel);
+    let probe_tool = tool.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let prober = std::thread::spawn(move || {
+        let _ = tx.send(retry_busy(|| {
+            capture_env_with(std::slice::from_ref(&probe_tool), &probe_cancel, |_, _| {
+                Err(Errno::EPERM)
+            })
+            .map(|_| String::new())
+        }));
+    });
+
+    // Captured while the fixture is certainly still sleeping, so the pid
+    // names the fixture and not a later owner of that number.
+    let fixture = await_fixture(&pid_file, Duration::from_secs(TOOL_VERSION_TIMEOUT_SECS))
+        .expect("the fixture must record its pid");
+    cancel.store(true, Ordering::SeqCst);
+    let cancelled_at = Instant::now();
+    let outcome = rx.recv_timeout(Duration::from_secs(
+        SIGKILL_REAP_TIMEOUT_SECS + PROBE_RETURN_SLACK_SECS,
+    ));
+    let returned_after = cancelled_at.elapsed();
+
+    // Release the fixture and wait for its reap before any assertion, so a
+    // failed assertion below cannot leave it running.
+    let ended = end_fixture(
+        &keep,
+        fixture,
+        Duration::from_secs(FIXTURE_KEEP_POLL_SECS + FIXTURE_EXIT_SLACK_SECS),
+    );
+    let reap_deadline = Instant::now() + Duration::from_secs(PROBE_RETURN_SLACK_SECS);
+    let reaped: bool = loop {
+        if proc_start_time(fixture.pid.as_raw()) != Some(fixture.started) {
+            break true;
+        }
+        if Instant::now() >= reap_deadline {
+            break false;
+        }
+        std::thread::sleep(PROBE_POLL);
+    };
+    let _ = fs::remove_dir_all(&dir);
+    prober.join().expect("probe thread");
+
+    let (result, _) = outcome.expect("the probe must return within its bound");
+    assert!(
+        returned_after < Duration::from_secs(SIGKILL_REAP_TIMEOUT_SECS + PROBE_RETURN_SLACK_SECS),
+        "the probe must answer within its reap bound once cancelled: {returned_after:?}"
+    );
+    let err = result.expect_err("a cancelled and unkillable probe must fail");
+    let pid = fixture.pid;
+    assert!(
+        err.starts_with(&format!(
+            "{} --version: cancelled; --version cleanup: probe {pid} still running \
+             {SIGKILL_REAP_TIMEOUT_SECS}s after SIGKILL",
+            tool.display()
+        )),
+        "cancellation must lead the combined error: {err}"
+    );
+    assert!(
+        err.contains("group SIGKILL: EPERM"),
+        "err must name the refused group signal: {err}"
+    );
+    assert!(
+        err.contains("pid SIGKILL: EPERM"),
+        "err must name the refused pid signal: {err}"
+    );
+    assert!(
+        ended,
+        "the fixture must exit once the test stops keeping it alive"
+    );
+    assert!(reaped, "the fixture's pid must be reaped once it exits");
+}
+
+#[test]
+fn capture_env_kills_the_descendant_a_version_wrapper_leaves_running() {
+    // A `--version` wrapper can leave a background process behind, just as
+    // a `git` wrapper can
+    // (`head_sha_kills_the_descendant_of_a_refused_git_wrapper`). The
+    // descendant inherits the probe's stdout pipe, so a probe that killed
+    // only the wrapper's pid would report success while the descendant
+    // kept that pipe open.
+    let dir = temp_dir("capture-env-descendant");
+    let pid_file = dir.join("descendant.pid");
+    let tool = make_script(
+        &dir,
+        "fake-version-wrapper.sh",
+        &format!(
+            "sleep {DESCENDANT_SLEEP_SECS} &\nprintf '%s\\n' \"$!\" > {}\n\
+             printf 'faketool version 9.9\\n'\nwait\n",
+            shell_word(&pid_file)
+        ),
+    );
+
+    let (result, _) = retry_busy(|| {
+        capture_env(std::slice::from_ref(&tool), &AtomicBool::new(false))
+            .map(|env| env.tools[0].1.clone())
+    });
+    assert_eq!(
+        result,
+        Ok("faketool version 9.9".to_string()),
+        "the version line must survive the descendant cleanup"
+    );
+
+    let descendant = read_pid_file(&pid_file).expect("the wrapper must record its descendant pid");
+    let deadline = Instant::now() + Duration::from_secs(PROBE_RETURN_SLACK_SECS);
+    loop {
+        match kill(Pid::from_raw(descendant), None) {
+            Err(Errno::ESRCH) => break,
+            Ok(()) => {
+                if is_zombie(descendant) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "descendant pid {descendant} outlived the probe"
+                );
+            }
+            Err(e) => panic!("kill({descendant}, None) -> unexpected errno {e}"),
+        }
+        std::thread::sleep(PROBE_POLL);
+    }
+
     let _ = fs::remove_dir_all(&dir);
 }
 

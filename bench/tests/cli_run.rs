@@ -16,6 +16,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use bench::run_record::{Profile, RunKind, RunRecord, SCHEMA_VERSION, ServerKind};
+use bench::runner::TOOL_VERSION_TIMEOUT_SECS;
 use nix::sys::signal::{kill, Signal};
 use nix::sys::wait::waitpid;
 use nix::unistd::Pid;
@@ -693,6 +694,73 @@ fn sigterm_during_a_tool_probe_reaps_it_and_runs_nothing() {
     assert!(
         stderr_text.contains("cancelled"),
         "stderr must report the cancellation, got: {stderr_text}"
+    );
+    for child_pid in &pids {
+        let cpid = i32::try_from(*child_pid).expect("fits in i32");
+        match kill(Pid::from_raw(cpid), None) {
+            Err(nix::errno::Errno::ESRCH) => {}
+            Ok(()) => panic!("probe pid {cpid} still alive after runner SIGTERM"),
+            Err(e) => panic!("kill({cpid}, None) -> unexpected errno {e}"),
+        }
+    }
+    let count = count_json(&out_dir);
+    assert_eq!(count, 0, "a cancelled preflight runs nothing, got {count}");
+}
+
+/// A `--version` probe that never prints anything must be refused with
+/// `cancelled` as soon as SIGTERM sets the flag, instead of being left to
+/// run out its own `TOOL_VERSION_TIMEOUT_SECS` deadline (AC-3).
+#[test]
+fn sigterm_during_a_silent_tool_probe_cancels_it_before_its_deadline() {
+    let work = temp_dir("sigterm-silent-probe");
+    let tool = make_marker(&work, "silent-version.sh", "exec sleep 30\n");
+    let out_dir = work.join("out");
+    fs::create_dir_all(&out_dir).unwrap();
+    let mut run = RunChild::spawn(&[
+        "--profile",
+        "smoke",
+        "--out",
+        out_dir.to_str().unwrap(),
+        "--servers",
+        "uring",
+        "--workers",
+        "1",
+        "--qos",
+        "1",
+        "--syscalls",
+        "none",
+        "--mosquitto-bin",
+        tool.to_str().unwrap(),
+    ]);
+    let parent = run.pid();
+    // The probe is the runner's first child, so one child means the
+    // handler is already installed.
+    let pids = wait_for_children(parent, 1, CHILDREN_POLL_TIMEOUT);
+    assert!(
+        !pids.is_empty(),
+        "expected the --version probe under runner pid {parent}"
+    );
+    let pid = i32::try_from(parent).expect("fits in i32");
+    kill(Pid::from_raw(pid), Signal::SIGTERM).expect("sigterm");
+    let signalled = Instant::now();
+    let status = run.wait_exit_code(SIGTERM_EXIT_TIMEOUT);
+    assert!(
+        signalled.elapsed() < Duration::from_secs(TOOL_VERSION_TIMEOUT_SECS),
+        "the cancelled probe must return well before its own deadline"
+    );
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "the runner must report the cancellation itself, got {status:?}"
+    );
+    let stderr_text = run.collect_stderr(Duration::from_secs(2)).join("\n");
+    assert!(
+        stderr_text.contains("--version: cancelled"),
+        "stderr must report the cancellation, got: {stderr_text}"
+    );
+    assert!(
+        !stderr_text.contains("did not answer"),
+        "a cancelled probe must not also report a deadline timeout, got: {stderr_text}"
     );
     for child_pid in &pids {
         let cpid = i32::try_from(*child_pid).expect("fits in i32");

@@ -24,8 +24,8 @@ use crate::run_record::{
     ConfigKey, CpuSets, Env, Profile, RunKind, RunRecord, ServerKind, SyscallMethod, SCHEMA_VERSION,
 };
 use crate::runner::{
-    HostSetup, stem_for, LATENCY_FRACTIONS_PCT, ProtocolConstants, RunSpec, SCRATCH_REUSED_PREFIX,
-    SYSCALL_FRACTION_PCT,
+    survivor_resume_refusal, CLEANUP_SURVIVOR_PREFIX, HostSetup, stem_for, LATENCY_FRACTIONS_PCT,
+    ProtocolConstants, RunSpec, SCRATCH_REUSED_PREFIX, SYSCALL_FRACTION_PCT,
 };
 
 /// The full server set §9.1 records. A `bench run --profile recorded`
@@ -275,6 +275,10 @@ pub fn read_records(dir: &Path) -> Result<Vec<RunRecord>, String> {
     Ok(out)
 }
 
+/// A record naming a child that survived its cleanup refuses the resume
+/// while that child still runs, and while its identity cannot be read
+/// ([`survivor_resume_refusal`]).
+///
 /// Refuse a `--resume` whose existing records do not match the new
 /// run's environment (AC-63). The comparison is exactly the fields the
 /// `check_resume` test lists: `schema`, `profile`, `git_sha`, `kernel`,
@@ -311,6 +315,18 @@ pub fn check_resume(
 ) -> Result<(), String> {
     for rec in existing {
         let file = rec.file_name();
+        // A child an earlier run could not end may still be running, and
+        // every resumed run would be measured beside it.
+        if let Some((survivor, refusal)) = rec
+            .harness_errors
+            .iter()
+            .filter(|e| e.starts_with(CLEANUP_SURVIVOR_PREFIX))
+            .find_map(|e| survivor_resume_refusal(e).map(|refusal| (e, refusal)))
+        {
+            return Err(format!(
+                "{file}: {survivor}; {refusal} — end it before --resume"
+            ));
+        }
         if rec.schema != SCHEMA_VERSION {
             return Err(format!(
                 "{file}: record schema {} != {}",
@@ -505,7 +521,8 @@ pub fn resume_plan(
 /// exist ([`attempt_in_use`]) is skipped at no cost, and the scratch
 /// directory is dropped only when the run created it itself
 /// ([`created_own_scratch`]), so a run never removes another run's
-/// evidence.
+/// evidence. A run that left a child running after cleanup stops scheduling the same
+/// way, with that child's report as the error.
 pub fn run_configs<F: FnMut(&RunSpec) -> RunRecord, S: ::std::hash::BuildHasher>(
     specs: &[RunSpec],
     remaining: &HashMap<ConfigKey, u32, S>,
@@ -612,11 +629,32 @@ pub fn run_configs<F: FnMut(&RunSpec) -> RunRecord, S: ::std::hash::BuildHasher>
             // cut it short: mark it, keep it on disk, and stop scheduling.
             let cancelled = cancel.load(Ordering::SeqCst);
             record.cancelled = cancelled;
+            // A child the run could not end is still running: any later run
+            // would be measured beside it. This stop outranks the cancellation
+            // and survives a failed write, which would otherwise drop the
+            // only report of every such child. The attempt it cuts is incomplete
+            // ([`attempt_complete`]), so `--resume` continues once the operator
+            // has ended that process.
+            let survivors: Vec<&str> = record
+                .harness_errors
+                .iter()
+                .filter(|e| e.starts_with(CLEANUP_SURVIVOR_PREFIX))
+                .map(String::as_str)
+                .collect();
+            let survivor = (!survivors.is_empty()).then(|| {
+                format!("{}; no further run is scheduled beside it", survivors.join("; "))
+            });
             if let Err(e) = write_record(out_dir, &record) {
                 if created_own_scratch(&record) {
                     discard_scratch(scratch_dir, &record);
                 }
-                return Err(e);
+                return Err(match survivor {
+                    Some(stop) => format!("{stop}; {e}"),
+                    None => e,
+                });
+            }
+            if let Some(stop) = survivor {
+                return Err(stop);
             }
             if cancelled {
                 return Err("cancelled".to_string());

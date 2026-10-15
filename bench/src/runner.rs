@@ -88,14 +88,45 @@ pub const COUNTER_CONTROL_TIMEOUT_SECS: u64 = 5;
 /// as the failure it was once this deadline passes.
 pub const TOOL_VERSION_TIMEOUT_SECS: u64 = 5;
 
+/// Cap on the stdout bytes one `--version` probe in [`capture_env`] is read
+/// for. A version is one short line, so everything past this cap is noise;
+/// reading it would let a tool that prints without a newline grow the
+/// reader's line buffer for as long as [`TOOL_VERSION_TIMEOUT_SECS`] lasts.
+/// The capped reader reports EOF at the cap, so a line the cap cuts arrives
+/// without its newline and [`recv_version_line`] refuses it rather than
+/// recording a cut version.
+const TOOL_VERSION_STDOUT_BYTES_MAX: u64 = 4096;
+
+/// Upper bound `ChildGuard::drop` waits for its survivor lines to be written
+/// ([`report_within`]); past it the lines are best effort.
+const GUARD_REPORT_TIMEOUT_SECS: u64 = 1;
+
 /// Upper bound on the recorded-run provenance probe [`head_sha`]: a `git`
 /// that never answers must not hold the runner before any record exists.
 pub const GIT_HEAD_TIMEOUT_SECS: u64 = 5;
 
-/// Upper bound on the reap after [`head_sha_with`]'s cleanup SIGKILLs. Either
-/// signal can be refused, so the reap waits this long for the probe to exit
+/// Upper bound on the reap after a cleanup SIGKILL ([`cleanup_probe`]). The
+/// signal can be refused, so the reap waits this long for the child to exit
 /// and then gives up with a named error instead of blocking.
-const GIT_HEAD_REAP_TIMEOUT_SECS: u64 = 1;
+const SIGKILL_REAP_TIMEOUT_SECS: u64 = 1;
+
+/// Upper bound on the reap after a guard child's cleanup SIGKILL
+/// ([`kill_within_bound`]). Longer than a probe's [`SIGKILL_REAP_TIMEOUT_SECS`]:
+/// a run child is a multi-threaded server or generator whose io_uring
+/// teardown, a tracer still holding its zombie, or a stalled vCPU can delay a
+/// healthy exit past a second, and a slow exit reported as a survivor would
+/// stop the matrix.
+const GUARD_SIGKILL_REAP_TIMEOUT_SECS: u64 = 10;
+
+/// Index of the start-time field of `/proc/<pid>/stat` among the fields after
+/// `comm`: the kernel documents it as field 22, and the first field after the
+/// parenthesised `comm` is field 3.
+const PROC_STAT_START_TIME_FIELD: usize = 19;
+
+/// Start time a survivor entry carries when the child's own start time could
+/// not be read ([`kill_within_bound`]). [`survivor_resume_refusal`] then
+/// counts any holder of the pid as that child.
+const SURVIVOR_START_UNKNOWN: &str = "?";
 
 /// Cap on the stdout bytes [`head_sha`] reads from its `git`. The probe
 /// wants one short SHA, so everything past this cap is noise; reading it
@@ -107,17 +138,22 @@ const GIT_HEAD_REAP_TIMEOUT_SECS: u64 = 1;
 /// cut SHA; the deadline still bounds the child.
 const GIT_HEAD_STDOUT_BYTES_MAX: u64 = 4096;
 
-/// `process_group` argument that puts [`head_sha`]'s probe in a group of
-/// its own, led by the probe: the group id is then the probe's pid, and
-/// one signal reaches the probe and the descendants that stayed in its
-/// group (a descendant that starts a group of its own leaves it).
-const GIT_HEAD_OWN_PROCESS_GROUP: i32 = 0;
+/// `process_group` argument that puts a probe in a group of its own, led
+/// by the probe: the group id is then the probe's pid, and one signal
+/// reaches the probe and the descendants that stayed in its group (a
+/// descendant that starts a group of its own leaves it).
+const PROBE_OWN_PROCESS_GROUP: i32 = 0;
 
 /// Prefix of the harness error [`run_one`] records when the scratch
 /// directory of its spec already exists. It is the proof that this run
 /// did not create that directory: `matrix::run_configs` reads it to
 /// keep its hands off another run's raw evidence.
 pub const SCRATCH_REUSED_PREFIX: &str = "scratch directory reused: ";
+
+/// Prefix of the harness error [`run_one`] records for a child its guard
+/// could not end. `matrix::run_configs` reads it to stop scheduling: a run
+/// measured beside that child would not measure what it claims.
+pub const CLEANUP_SURVIVOR_PREFIX: &str = "child survived cleanup: ";
 
 /// Taskset CPU set used when the caller does not override `HostSetup.cpu_sets.server`.
 pub const DEFAULT_SERVER_CPUS: &str = "0,2,4,6";
@@ -156,6 +192,32 @@ const TOOL_VERSION_LABEL: &str = "version-probe";
 
 /// Reader-thread label of one `git rev-parse` probe in [`head_sha`].
 const GIT_HEAD_LABEL: &str = "git-head";
+
+/// What one bounded child-process probe is called: in the errors it returns
+/// and in the names of the threads it starts.
+#[derive(Clone, Copy)]
+struct Probe {
+    /// Leads every error the probe returns: `git rev-parse` or `--version`.
+    command: &'static str,
+    /// Names its threads `bench-runner-<label>-…`.
+    label: &'static str,
+    /// The probe's deadline, named in its `did not answer within` refusal.
+    timeout_secs: u64,
+}
+
+/// The recorded-run provenance probe [`head_sha`] runs.
+const GIT_HEAD_PROBE: Probe = Probe {
+    command: "git rev-parse",
+    label: GIT_HEAD_LABEL,
+    timeout_secs: GIT_HEAD_TIMEOUT_SECS,
+};
+
+/// One `--version` probe [`capture_env`] runs per supplied tool.
+const TOOL_VERSION_PROBE: Probe = Probe {
+    command: "--version",
+    label: TOOL_VERSION_LABEL,
+    timeout_secs: TOOL_VERSION_TIMEOUT_SECS,
+};
 
 /// Reader-thread label of the strace counter's stderr.
 const COUNTER_STDERR_LABEL: &str = "counter-stderr";
@@ -304,7 +366,15 @@ pub fn mosquitto_conf(port: u16) -> String {
 /// run starts against an environment whose tools were never identified.
 /// `git_sha` and `git_dirty` are read from the build-time env vars the
 /// build.rs sets so the record names the source the binary was built from.
-pub fn capture_env(tools: &[PathBuf]) -> Result<Env, String> {
+/// `cancel` is the flag SIGINT/SIGTERM set: a probe running when it is set
+/// is refused with `cancelled`. `signal` sends each probe's cleanup
+/// SIGKILLs ([`cleanup_probe`]): nix `kill` in production ([`capture_env`]);
+/// a test hands in a stand-in to drive a refused signal.
+pub fn capture_env_with<K: FnMut(Pid, Signal) -> nix::Result<()> + Clone + Send + 'static>(
+    tools: &[PathBuf],
+    cancel: &AtomicBool,
+    signal: K,
+) -> Result<Env, String> {
     let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
         .map_err(|e| format!("read osrelease: {e}"))?;
     let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
@@ -324,7 +394,7 @@ pub fn capture_env(tools: &[PathBuf]) -> Result<Env, String> {
         // produced its numbers, so a run must not start with a placeholder
         // there: the caller gets the cause and rejects the environment
         // instead of recording a version nobody read.
-        let version = tool_version(tool)
+        let version = tool_version(tool, cancel, signal.clone())
             .map_err(|e| format!("{} --version: {e}", tool.display()))?;
         tool_pairs.push((tool.to_string_lossy().into_owned(), version));
     }
@@ -341,38 +411,46 @@ pub fn capture_env(tools: &[PathBuf]) -> Result<Env, String> {
     })
 }
 
-/// The first non-blank `--version` line of one tool, or the cause when the probe
-/// could not produce one. Nothing here waits on the child without a
-/// deadline: `Command::output` has none, and reading the pipe after the
-/// child exits has none either, because a background process the probe
-/// started inherits stdout and holds the write end open after its parent
-/// is reaped. The line therefore arrives over a reader thread
-/// ([`spawn_stdout_reader`]) bounded by [`TOOL_VERSION_TIMEOUT_SECS`], and
-/// the child is killed and reaped on every path. A probe whose inherited
-/// pipe never closes leaves its reader thread blocked — one per probed
-/// tool, which is bounded by `tools`, and the run itself goes on.
-fn tool_version(tool: &Path) -> Result<String, String> {
-    let mut child = Command::new(tool)
+/// [`capture_env_with`] with nix `kill` as each probe's cleanup signal.
+pub fn capture_env(tools: &[PathBuf], cancel: &AtomicBool) -> Result<Env, String> {
+    capture_env_with(tools, cancel, kill::<Signal>)
+}
+
+/// The first non-blank `--version` line of one tool, or the cause when the
+/// probe could not produce one. The probe runs the way [`head_sha_with`]'s
+/// does: started inside [`TOOL_VERSION_TIMEOUT_SECS`] by [`start_probe`],
+/// in a process group of its own, refused with `cancelled` as soon as
+/// `cancel` is set, and on every path ended by [`cleanup_probe`], whose
+/// reap is bounded by [`SIGKILL_REAP_TIMEOUT_SECS`] — a probe still running
+/// after that is reported with its pid and left to a reaper thread. Its
+/// stdout is read through a [`TOOL_VERSION_STDOUT_BYTES_MAX`] cap. The
+/// group kill also ends a background process the tool left holding its
+/// stdout, so the reader thread ([`spawn_stdout_reader`]) reaches EOF. The
+/// exit status is not read: a version is recorded from what the tool prints.
+fn tool_version<K: FnMut(Pid, Signal) -> nix::Result<()> + Clone + Send + 'static>(
+    tool: &Path,
+    cancel: &AtomicBool,
+    mut signal: K,
+) -> Result<String, String> {
+    let deadline = Instant::now() + Duration::from_secs(TOOL_VERSION_PROBE.timeout_secs);
+    let mut command = Command::new(tool);
+    command
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    let deadline = Instant::now() + Duration::from_secs(TOOL_VERSION_TIMEOUT_SECS);
-    let first = match child.stdout.take() {
-        Some(stdout) => spawn_stdout_reader(TOOL_VERSION_LABEL, stdout, BlankLines::Skip)
-            .and_then(|lines| recv_version_line(&lines, deadline)),
+        .process_group(PROBE_OWN_PROCESS_GROUP);
+    let mut child = start_probe(TOOL_VERSION_PROBE, command, deadline, cancel, signal.clone())?;
+    let result = match child.stdout.take() {
+        Some(stdout) => spawn_stdout_reader(TOOL_VERSION_LABEL, stdout.take(TOOL_VERSION_STDOUT_BYTES_MAX), BlankLines::Skip)
+            .and_then(|lines| recv_version_line(&lines, deadline, cancel)),
         None => Err("--version stdout not piped".to_string()),
     };
-    // SIGKILL before the wait, never after: a probe reaped first frees its
-    // pid for reuse, and the signal would then reach an unrelated process.
-    // A probe that already exited is a zombie, which SIGKILL leaves alone
-    // and the wait reaps.
-    let pid = i32::try_from(child.id()).expect("child pid fits in i32");
-    let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
-    let _ = child.wait();
-    first
+    match (result, cleanup_probe(TOOL_VERSION_PROBE, child, &mut signal)) {
+        (result, Ok(())) => result,
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(refusal), Err(cleanup)) => Err(format!("{refusal}; {cleanup}")),
+    }
 }
 
 /// The first non-blank line a `--version` probe prints, trimmed, bounded
@@ -381,22 +459,37 @@ fn tool_version(tool: &Path) -> Result<String, String> {
 /// non-blank line answered with no version, and `capture_env` must fail
 /// rather than record an empty one. The deadline is checked before every
 /// receive and the receive waits only the time left, so nothing that
-/// arrives after expiry is reported as an answer.
+/// arrives after expiry is reported as an answer. `cancel` is read before
+/// the deadline on every step of at most [`WAIT_POLL_MS`], so a set flag is
+/// answered with `cancelled`.
 fn recv_version_line(
     lines: &mpsc::Receiver<StdoutLine>,
     deadline: Instant,
+    cancel: &AtomicBool,
 ) -> Result<String, String> {
     loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Err("cancelled".to_string());
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(format!(
                 "--version did not answer within {TOOL_VERSION_TIMEOUT_SECS}s"
             ));
         }
-        match lines.recv_timeout(remaining) {
+        match lines.recv_timeout(remaining.min(Duration::from_millis(WAIT_POLL_MS))) {
             Ok(StdoutLine::Line(line)) => {
                 let version = line.trim();
                 if !version.is_empty() {
+                    // Only a line that ends in a newline is whole: the capped
+                    // reader reports EOF at TOOL_VERSION_STDOUT_BYTES_MAX, so a
+                    // line the cap cuts — or one the tool left unterminated at
+                    // EOF — arrives without one and is never a version.
+                    if !line.ends_with('\n') {
+                        return Err(format!(
+                            "--version printed a line with no newline within {TOOL_VERSION_STDOUT_BYTES_MAX} bytes"
+                        ));
+                    }
                     return Ok(version.to_string());
                 }
             }
@@ -416,7 +509,7 @@ fn recv_version_line(
 /// probe that has not started by then is given up on by [`start_probe`], and
 /// one that has not exited by then, or by the time `cancel` is set, is refused
 /// and sent SIGKILL, and the reap after that is bounded by
-/// [`GIT_HEAD_REAP_TIMEOUT_SECS`]; a probe that outlives both is reported with
+/// [`SIGKILL_REAP_TIMEOUT_SECS`]; a probe that outlives both is reported with
 /// its pid and left to a reaper thread. A probe that finished starting as
 /// [`start_probe`] gave up is cleaned up there on the same terms
 /// ([`abandon_startup`]); only one still inside its own startup has no pid to
@@ -441,15 +534,15 @@ pub fn head_sha_with<K: FnMut(Pid, Signal) -> nix::Result<()> + Clone + Send + '
     cancel: &AtomicBool,
     mut signal: K,
 ) -> Result<String, String> {
-    let deadline = Instant::now() + Duration::from_secs(GIT_HEAD_TIMEOUT_SECS);
+    let deadline = Instant::now() + Duration::from_secs(GIT_HEAD_PROBE.timeout_secs);
     let mut command = Command::new(git);
     command
         .args(["rev-parse", "--short", "HEAD"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
-        .process_group(GIT_HEAD_OWN_PROCESS_GROUP);
-    let mut child = start_probe(command, deadline, cancel, signal.clone())?;
+        .process_group(PROBE_OWN_PROCESS_GROUP);
+    let mut child = start_probe(GIT_HEAD_PROBE, command, deadline, cancel, signal.clone())?;
     let mut status: Option<WaitStatus> = None;
     let result = match child.stdout.take() {
         Some(stdout) => spawn_stdout_reader(
@@ -460,18 +553,18 @@ pub fn head_sha_with<K: FnMut(Pid, Signal) -> nix::Result<()> + Clone + Send + '
         .and_then(|lines| wait_for_head_sha(&mut child, &lines, deadline, cancel, &mut status)),
         None => Err("git rev-parse stdout not piped".to_string()),
     };
-    match (result, cleanup_probe(child, &mut signal)) {
+    match (result, cleanup_probe(GIT_HEAD_PROBE, child, &mut signal)) {
         (result, Ok(())) => result,
         (Ok(_), Err(cleanup)) => Err(cleanup),
         (Err(refusal), Err(cleanup)) => Err(format!("{refusal}; {cleanup}")),
     }
 }
 
-/// Start the `git rev-parse` probe inside `deadline`, polling `cancel` every
+/// Start `probe`'s command inside `deadline`, polling `cancel` every
 /// [`WAIT_POLL_MS`] while it starts. `Command::spawn` is synchronous and
-/// blocks until the child has execed or reported its exec error, so a `git`
-/// — or a `PATH` entry ahead of it — on a stalled filesystem would hold the
-/// recorded-run preflight with neither deadline nor cancellation in reach.
+/// blocks until the child has execed or reported its exec error, so a probe's
+/// executable — or a `PATH` entry ahead of it — on a stalled filesystem would
+/// hold the preflight with neither deadline nor cancellation in reach.
 /// Startup therefore runs on its own thread and this function waits only the
 /// time left. A rendezvous channel carries the probe, so a send that
 /// completes proves the probe was received here: a queued one this function
@@ -488,6 +581,7 @@ pub fn head_sha_with<K: FnMut(Pid, Signal) -> nix::Result<()> + Clone + Send + '
 /// [`abandoned_startup_error`] names in the returned error because no pid
 /// exists to name.
 fn start_probe<K: FnMut(Pid, Signal) -> nix::Result<()> + Clone + Send + 'static>(
+    probe: Probe,
     mut command: Command,
     deadline: Instant,
     cancel: &AtomicBool,
@@ -498,24 +592,25 @@ fn start_probe<K: FnMut(Pid, Signal) -> nix::Result<()> + Clone + Send + 'static
     // handed over, so it needs a signal of its own.
     let mut give_up_signal = signal.clone();
     let starter = std::thread::Builder::new()
-        .name(format!("bench-runner-{GIT_HEAD_LABEL}-starter"))
+        .name(format!("bench-runner-{}-starter", probe.label))
         .spawn(move || {
-            let spawned = command.spawn().map_err(|e| format!("git rev-parse: {e}"));
+            let spawned = command.spawn().map_err(|e| format!("{}: {e}", probe.command));
             if let Err(mpsc::SendError(Ok(child))) = started_tx.send(spawned) {
                 // The caller gave up and can no longer be returned to, so
                 // stderr is the only sink left for the surviving probe's pid
                 // and its refused signals (Q5: the exception is reported).
-                if let Err(e) = cleanup_probe(child, &mut signal) {
+                if let Err(e) = cleanup_probe(probe, child, &mut signal) {
                     eprintln!("{e}");
                 }
             }
         });
     if let Err(e) = starter {
-        return Err(format!("git rev-parse starter thread: {e}"));
+        return Err(format!("{} starter thread: {e}", probe.command));
     }
     loop {
         if cancel.load(Ordering::SeqCst) {
             return Err(abandon_startup(
+                probe,
                 &started_rx,
                 "cancelled".to_string(),
                 &mut give_up_signal,
@@ -524,8 +619,12 @@ fn start_probe<K: FnMut(Pid, Signal) -> nix::Result<()> + Clone + Send + 'static
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(abandon_startup(
+                probe,
                 &started_rx,
-                format!("git rev-parse did not answer within {GIT_HEAD_TIMEOUT_SECS}s"),
+                format!(
+                    "{} did not answer within {}s",
+                    probe.command, probe.timeout_secs
+                ),
                 &mut give_up_signal,
             ));
         }
@@ -533,7 +632,7 @@ fn start_probe<K: FnMut(Pid, Signal) -> nix::Result<()> + Clone + Send + 'static
             Ok(started) => return started,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("git rev-parse starter stopped".to_string());
+                return Err(format!("{} starter stopped", probe.command));
             }
         }
     }
@@ -555,17 +654,18 @@ fn start_probe<K: FnMut(Pid, Signal) -> nix::Result<()> + Clone + Send + 'static
 /// thread that ended without sending both leave no probe to clean up, so the
 /// refusal stands alone.
 fn abandon_startup<K: FnMut(Pid, Signal) -> nix::Result<()>>(
+    probe: Probe,
     started_rx: &mpsc::Receiver<Result<Child, String>>,
     refusal: String,
     signal: &mut K,
 ) -> String {
     match started_rx.try_recv() {
-        Ok(Ok(child)) => match cleanup_probe(child, signal) {
+        Ok(Ok(child)) => match cleanup_probe(probe, child, signal) {
             Ok(()) => refusal,
             Err(cleanup) => format!("{refusal}; {cleanup}"),
         },
         Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => refusal,
-        Err(mpsc::TryRecvError::Empty) => abandoned_startup_error(refusal),
+        Err(mpsc::TryRecvError::Empty) => abandoned_startup_error(probe, refusal),
     }
 }
 
@@ -579,8 +679,8 @@ fn abandon_startup<K: FnMut(Pid, Signal) -> nix::Result<()>>(
 /// cleans up whatever it receives, but only while this process lives: `main`
 /// exits right after this error, which ends that thread and leaves a probe
 /// that started late to init, unsignalled. That is Q5's exception reached
-/// through startup instead of through a refused SIGKILL — both probes are
-/// read-only `git`, and the operator is told rather than left to find it.
+/// through startup instead of through a refused SIGKILL — every probe is a
+/// read-only `git rev-parse` or `--version`, and the operator is told.
 ///
 /// The condition travels in the error rather than through an `eprintln!` of
 /// its own: a write to stderr blocks for as long as a reader that stopped
@@ -589,19 +689,21 @@ fn abandon_startup<K: FnMut(Pid, Signal) -> nix::Result<()>>(
 /// on the one path [`head_sha_with`] must return from within its deadline.
 /// Presentation is the caller's: `main` prints the error it is returned
 /// (`bench/src/main.rs`).
-fn abandoned_startup_error(refusal: String) -> String {
+fn abandoned_startup_error(probe: Probe, refusal: String) -> String {
     format!(
-        "{refusal}; git rev-parse gave up on a probe that had not finished \
+        "{refusal}; {} gave up on a probe that had not finished \
          starting; a probe that starts after this is signalled only while \
-         this process lives, and is otherwise left to init"
+         this process lives, and is otherwise left to init",
+        probe.command
     )
 }
 
 /// SIGKILL the probe's group and its own pid with `signal`, then reap it
-/// within [`GIT_HEAD_REAP_TIMEOUT_SECS`] ([`reap_probe`]). The child leads
+/// within [`SIGKILL_REAP_TIMEOUT_SECS`] ([`reap_probe`]). The child leads
 /// the group it was spawned into, so its pid is the group id and the negated
 /// pid addresses the group.
 fn cleanup_probe<K: FnMut(Pid, Signal) -> nix::Result<()>>(
+    probe: Probe,
     child: Child,
     signal: &mut K,
 ) -> Result<(), String> {
@@ -635,7 +737,7 @@ fn cleanup_probe<K: FnMut(Pid, Signal) -> nix::Result<()>>(
     }
     // After the signals, never before: the reap frees the leader's pid, so
     // no signal may follow it.
-    reap_probe(child, &signal_failures)
+    reap_probe(probe, child, &signal_failures)
 }
 
 /// [`head_sha_with`] with nix `kill` as its cleanup signal: the provenance
@@ -644,8 +746,21 @@ pub fn head_sha(git: &Path, cancel: &AtomicBool) -> Result<String, String> {
     head_sha_with(git, cancel, kill::<Signal>)
 }
 
-/// Reap [`head_sha_with`]'s probe after its cleanup signals, bounded by
-/// [`GIT_HEAD_REAP_TIMEOUT_SECS`]. The exit is read with [`probe_exit`], which
+/// Hand `child` to a detached thread named `bench-runner-<label>-reaper`
+/// that owns its one `wait` and never signals it, so a child the runner
+/// gave up on is reaped whenever it exits instead of staying a zombie.
+/// `Err` is the thread start failure; the child is then dropped unreaped.
+fn spawn_reaper(label: &str, mut child: Child) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name(format!("bench-runner-{label}-reaper"))
+        .spawn(move || {
+            let _ = child.wait();
+        })
+        .map(drop)
+}
+
+/// Reap a probe after its cleanup signals ([`cleanup_probe`]), bounded by
+/// [`SIGKILL_REAP_TIMEOUT_SECS`]. The exit is read with [`probe_exit`], which
 /// leaves the probe a zombie, and only an exited probe is reaped here, so
 /// this `child.wait()` never blocks. A probe still running at the bound —
 /// one its signals could not reach — is handed with its one reap to a
@@ -655,8 +770,8 @@ pub fn head_sha(git: &Path, cancel: &AtomicBool) -> Result<String, String> {
 /// thread ends with it and init reaps the probe instead; if the thread cannot
 /// start, the probe stays unreaped until the runner exits and the error
 /// says so.
-fn reap_probe(mut child: Child, signal_failures: &[String]) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(GIT_HEAD_REAP_TIMEOUT_SECS);
+fn reap_probe(probe: Probe, mut child: Child, signal_failures: &[String]) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(SIGKILL_REAP_TIMEOUT_SECS);
     let pid = child.id();
     let failure = loop {
         match probe_exit(&child) {
@@ -669,21 +784,16 @@ fn reap_probe(mut child: Child, signal_failures: &[String]) -> Result<(), String
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            break format!("probe {pid} still running {GIT_HEAD_REAP_TIMEOUT_SECS}s after SIGKILL");
+            break format!("probe {pid} still running {SIGKILL_REAP_TIMEOUT_SECS}s after SIGKILL");
         }
         sleep(remaining.min(Duration::from_millis(WAIT_POLL_MS)));
     };
-    let mut error = format!("git rev-parse cleanup: {failure}");
+    let mut error = format!("{} cleanup: {failure}", probe.command);
     for signal_failure in signal_failures {
         error.push_str("; ");
         error.push_str(signal_failure);
     }
-    let reaper = std::thread::Builder::new()
-        .name(format!("bench-runner-{GIT_HEAD_LABEL}-reaper"))
-        .spawn(move || {
-            let _ = child.wait();
-        });
-    if let Err(e) = reaper {
+    if let Err(e) = spawn_reaper(probe.label, child) {
         let _ = write!(error, "; reaper thread: {e}");
     }
     Err(error)
@@ -774,7 +884,7 @@ fn wait_for_head_sha(
     }
 }
 
-/// Non-reaping exit check of [`head_sha`]'s probe: `waitid` with `WNOWAIT`
+/// Non-reaping exit check of a probe: `waitid` with `WNOWAIT`
 /// reports the exit and leaves the probe a zombie, so the probe keeps its
 /// pid — and the group it leads keeps its id — until [`head_sha`] has
 /// signalled the group and reaped the leader itself. `Child::try_wait`
@@ -825,16 +935,24 @@ pub fn check_provenance(build_sha: &str, build_dirty: bool, head_sha: &str) -> R
 }
 
 /// Owns every child process `run_one` spawns. On every exit path — early
-/// return, unwind, panic — the guard sends SIGKILL to anything still
-/// running and waits it, so the test thread cannot leave an orphan.
+/// return, unwind, panic — the guard ends anything still running with
+/// [`end_child`]: SIGKILL, a reap bounded by [`GUARD_SIGKILL_REAP_TIMEOUT_SECS`],
+/// and a reaper thread for a child that outlives it. [`run_one`] records
+/// such a child in its record; `Drop` reports it on stderr.
 struct ChildGuard {
     children: Vec<(&'static str, Child)>,
+    /// Sends the cleanup SIGKILL: nix `kill` in production ([`run_one`]);
+    /// a test hands in a stand-in to drive a refused signal.
+    signal: fn(Pid, Signal) -> nix::Result<()>,
 }
 
 impl ChildGuard {
-    fn new() -> Self {
+    /// A guard whose cleanup SIGKILL goes through `signal`; a test hands in
+    /// a stand-in to drive a refused signal.
+    fn with_signal(signal: fn(Pid, Signal) -> nix::Result<()>) -> Self {
         Self {
             children: Vec::new(),
+            signal,
         }
     }
 
@@ -856,22 +974,131 @@ impl ChildGuard {
             .find(|(n, _)| *n == name)
             .map(|(_, child)| child)
     }
+
+    /// End every held child with [`end_child`] and empty the guard. Returns
+    /// one error per child it could not end, in push order.
+    fn end_all(&mut self) -> Vec<String> {
+        let signal = self.signal;
+        self.children
+            .drain(..)
+            .filter_map(|(name, child)| end_child(name, child, signal).err())
+            .collect()
+    }
 }
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        for (_name, child) in &mut self.children {
-            // A child that already exited is reaped; only a still-running
-            // child can leak the harness. SIGKILL is the unconditional
-            // last resort; the runner has already signalled SIGTERM before
-            // reaching this Drop on the happy path.
-            if matches!(child.try_wait(), Ok(None)) {
-                let pid = i32::try_from(child.id()).expect("child pid fits in i32");
-                let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
-                let _ = child.wait();
+        // `run_one_with` empties the guard itself, so only an unwind leaves
+        // children here. Every child is ended before anything is written, and
+        // the report waits on stderr for a bounded time only: Drop cannot
+        // return the failure, and must not hang behind a stalled reader.
+        report_within(
+            self.end_all(),
+            std::io::stderr(),
+            Duration::from_secs(GUARD_REPORT_TIMEOUT_SECS),
+        );
+    }
+}
+
+/// Write one line per report to `out` on a writer thread, and wait for
+/// that thread at most `bound`: `ChildGuard::drop` must not hang behind
+/// a stalled reader. A line not written when `bound` ends is best effort
+/// and is lost if the process exits first; a thread that cannot start
+/// writes nothing.
+fn report_within<W: Write + Send + 'static>(reports: Vec<String>, mut out: W, bound: Duration) {
+    if reports.is_empty() {
+        return;
+    }
+    let (done_tx, done_rx) = mpsc::channel();
+    let writer = std::thread::Builder::new()
+        .name("bench-runner-guard-report".to_string())
+        .spawn(move || {
+            for report in &reports {
+                let _ = writeln!(out, "{report}");
             }
+            let _ = done_tx.send(());
+        });
+    if writer.is_ok() {
+        let _ = done_rx.recv_timeout(bound);
+    }
+}
+
+/// SIGKILL a guard child that std has not reaped, with `signal`, and wait
+/// up to [`GUARD_SIGKILL_REAP_TIMEOUT_SECS`] for it to exit. The exit check is
+/// `Child::try_wait`, not [`probe_exit`]: the runner reaps guard children
+/// through std elsewhere (`run_guarded`'s generator wait, [`terminate_and_wait`],
+/// [`wait_for_counter_exit`]), and `try_wait` answers those from std's own
+/// record where `waitid` would ask about a pid that is no longer this
+/// child's. A child std has reaped is never signalled. A guard child leads
+/// no process group, so only its pid is signalled. `Err` names `label`, the
+/// pid, the bound and a refused SIGKILL; the child is then still unreaped
+/// and the caller decides what happens to it.
+fn kill_within_bound<K: FnMut(Pid, Signal) -> nix::Result<()>>(
+    label: &str,
+    child: &mut Child,
+    mut signal: K,
+) -> Result<(), String> {
+    let pid = child.id();
+    match child.try_wait() {
+        Ok(Some(_)) => return Ok(()),
+        Ok(None) => {}
+        Err(e) => {
+            return Err(format!(
+                "{label} cleanup: pid {pid} (start {SURVIVOR_START_UNKNOWN}) exit check failed: {e}"
+            ))
         }
     }
+    // Read while the child is running and unreaped, so the start time
+    // is its own: with the pid it names this process to a later
+    // `--resume` ([`survivor_resume_refusal`]).
+    let started = proc_start_time(pid)
+        .map_or_else(|| SURVIVOR_START_UNKNOWN.to_string(), |ticks| ticks.to_string());
+    // Only after a `try_wait` that found the child running: an unreaped
+    // child keeps its pid, so this cannot reach a stranger even if the
+    // child exits in between.
+    let refused = i32::try_from(pid)
+        .ok()
+        .map(Pid::from_raw)
+        .and_then(|target| signal(target, Signal::SIGKILL).err());
+    let deadline = Instant::now() + Duration::from_secs(GUARD_SIGKILL_REAP_TIMEOUT_SECS);
+    let mut error = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {}
+            Err(e) => break format!("{label} cleanup: pid {pid} (start {started}) exit check failed: {e}"),
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break format!(
+                "{label} cleanup: pid {pid} (start {started}) still running {GUARD_SIGKILL_REAP_TIMEOUT_SECS}s after SIGKILL"
+            );
+        }
+        sleep(remaining.min(Duration::from_millis(WAIT_POLL_MS)));
+    };
+    if let Some(e) = refused {
+        let _ = write!(error, "; SIGKILL: {e}");
+    }
+    Err(error)
+}
+
+/// End a guard child for good: [`kill_within_bound`], and a child still
+/// running after it is handed to a reaper thread ([`spawn_reaper`]) that
+/// owns its one `wait` and never signals it, so the long-lived runner
+/// collects it whenever it exits instead of keeping a zombie. `Err` is
+/// [`kill_within_bound`]'s, followed by `; reaper thread: <e>` when that
+/// thread cannot start.
+fn end_child<K: FnMut(Pid, Signal) -> nix::Result<()>>(
+    label: &str,
+    mut child: Child,
+    signal: K,
+) -> Result<(), String> {
+    let Err(mut error) = kill_within_bound(label, &mut child, signal) else {
+        return Ok(());
+    };
+    if let Err(e) = spawn_reaper(label, child) {
+        let _ = write!(error, "; reaper thread: {e}");
+    }
+    Err(error)
 }
 
 /// Read the kernel's per-process `utime`/`stime` ticks (`/proc/<pid>/stat`,
@@ -898,6 +1125,92 @@ fn read_cpu_ticks(pid: u32) -> Result<(u64, u64), String> {
         .and_then(|s| s.parse::<u64>().ok())
         .ok_or_else(|| format!("{path} missing stime"))?;
     Ok((utime, stime))
+}
+
+/// Start time of `pid` in clock ticks since boot (`/proc/<pid>/stat` field
+/// 22). `Ok(None)` is the one answer that proves no process holds the pid:
+/// its `/proc` entry is gone. Every other failure is `Err`, because a live
+/// process whose stat cannot be read or parsed must not be mistaken for an
+/// ended one ([`survivor_resume_refusal`]). The line is parsed as bytes
+/// rather than decoded: a process can set its own name to invalid UTF-8
+/// while keeping its start time, and a whole-file decode would then fail on
+/// a process that is still running. Two processes that reuse one pid differ
+/// in this field, so a pid with its start time names one process.
+fn read_proc_start_time(pid: u32) -> Result<Option<u64>, String> {
+    start_time_in(&format!("/proc/{pid}/stat"))
+}
+
+/// [`read_proc_start_time`] over one `/proc/<pid>/stat` path, so the
+/// parser can be driven with a stat line a test writes itself.
+fn start_time_in(path: &str) -> Result<Option<u64>, String> {
+    let body = match std::fs::read(path) {
+        Ok(body) => body,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("read {path}: {e}")),
+    };
+    // `comm` is parenthesised and may itself contain spaces and
+    // brackets, so the fields are counted from the last `)`.
+    let close = body
+        .iter()
+        .rposition(|b| *b == b')')
+        .ok_or_else(|| format!("{path} missing comm field"))?;
+    let field = body[close + 1..]
+        .split(u8::is_ascii_whitespace)
+        .filter(|field| !field.is_empty())
+        .nth(PROC_STAT_START_TIME_FIELD)
+        .ok_or_else(|| format!("{path} missing start time"))?;
+    std::str::from_utf8(field)
+        .ok()
+        .and_then(|field| field.parse().ok())
+        .map(Some)
+        .ok_or_else(|| format!("{path} start time does not parse"))
+}
+
+/// Start time of `pid` in clock ticks since boot, or `None` when it cannot
+/// be read. [`kill_within_bound`] records it beside the pid, where an
+/// unreadable start time is the [`SURVIVOR_START_UNKNOWN`] marker.
+pub fn proc_start_time(pid: u32) -> Option<u64> {
+    read_proc_start_time(pid).ok().flatten()
+}
+
+/// Why the child a [`CLEANUP_SURVIVOR_PREFIX`] entry names must stop a
+/// `--resume`, or `None` when no process holds its identity. The entry
+/// carries `pid <pid> (start <ticks>)` from [`kill_within_bound`]: a
+/// process that holds that pid with that start time is that child. With
+/// the start time unknown ([`SURVIVOR_START_UNKNOWN`]) any holder of the
+/// pid counts. An entry not in that shape, and a pid whose identity cannot
+/// be read, both refuse too: a resume beside a child it cannot rule out
+/// would be measured beside it.
+pub fn survivor_resume_refusal(entry: &str) -> Option<String> {
+    let Some((pid, start)) = survivor_identity(entry) else {
+        return Some(
+            "that entry does not name a pid and a start time, so that process cannot be ruled out"
+                .to_string(),
+        );
+    };
+    match read_proc_start_time(pid) {
+        Ok(Some(found)) if start.is_some_and(|start| start != found) => None,
+        Ok(Some(_)) => Some("that process is still running".to_string()),
+        Ok(None) => None,
+        Err(e) => Some(format!(
+            "pid {pid} could not be checked ({e}), so that process cannot be ruled out"
+        )),
+    }
+}
+
+/// The pid and, when recorded, the start time a survivor entry names.
+/// Only [`SURVIVOR_START_UNKNOWN`] is the unknown start time: any other
+/// token that does not parse makes the whole entry malformed, which
+/// [`survivor_resume_refusal`] counts as still running.
+fn survivor_identity(entry: &str) -> Option<(u32, Option<u64>)> {
+    let (_, rest) = entry.split_once(" pid ")?;
+    let (pid, rest) = rest.split_once(" (start ")?;
+    let (start, _) = rest.split_once(')')?;
+    let start = match start {
+        SURVIVOR_START_UNKNOWN => None,
+        ticks => Some(ticks.parse().ok()?),
+    };
+    Some((pid.parse().ok()?, start))
 }
 
 /// Count the traced process's threads (`/proc/<pid>/task` entries). This
@@ -1400,19 +1713,25 @@ fn sleep_until(host: &HostSetup, target_ns: u64) -> Result<(), String> {
     }
 }
 
-/// Sigterm a child, then wait up to `CHILD_EXIT_SLACK_SECS` for it to exit.
-/// ESRCH (the child is already gone) is ignored. Returns the exit status.
-fn terminate_and_wait(
-    host: &HostSetup,
-    label: &'static str,
+/// Sigterm a child with `signal`, then wait up to `slack_secs` for it to exit;
+/// past that it is SIGKILLed with `signal` and reaped within
+/// [`GUARD_SIGKILL_REAP_TIMEOUT_SECS`] ([`kill_within_bound`]), and the error names a
+/// child still running after that by its pid; the child stays with the
+/// caller, whose guard ends it for good. ESRCH on the SIGTERM (the child is
+/// already gone) is ignored. Returns the exit status.
+fn terminate_within<K: FnMut(Pid, Signal) -> nix::Result<()>>(
+    cancel: &AtomicBool,
+    label: &str,
     child: &mut Child,
+    slack_secs: u64,
+    mut signal: K,
 ) -> Result<std::process::ExitStatus, String> {
     let pid = i32::try_from(child.id()).expect("child pid fits in i32");
-    match kill(Pid::from_raw(pid), Signal::SIGTERM) {
+    match signal(Pid::from_raw(pid), Signal::SIGTERM) {
         Ok(()) | Err(nix::Error::ESRCH) => {}
         Err(e) => return Err(format!("SIGTERM {label}: {e}")),
     }
-    let deadline = Instant::now() + Duration::from_secs(CHILD_EXIT_SLACK_SECS);
+    let deadline = Instant::now() + Duration::from_secs(slack_secs);
     loop {
         if let Some(status) = child
             .try_wait()
@@ -1420,18 +1739,28 @@ fn terminate_and_wait(
         {
             return Ok(status);
         }
-        if ChildGuard::is_cancelled(host) {
+        if cancel.load(Ordering::Relaxed) {
             return Err("cancelled".to_string());
         }
         if Instant::now() >= deadline {
-            let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
-            let _ = child.wait();
-            return Err(format!(
-                "{label} did not exit within {CHILD_EXIT_SLACK_SECS}s of SIGTERM"
-            ));
+            let refusal = format!("{label} did not exit within {slack_secs}s of SIGTERM");
+            return Err(match kill_within_bound(label, child, &mut signal) {
+                Ok(()) => refusal,
+                Err(cleanup) => format!("{refusal}; {cleanup}"),
+            });
         }
         sleep(Duration::from_millis(WAIT_POLL_MS));
     }
+}
+
+/// [`terminate_within`] with the run's cancel flag, [`CHILD_EXIT_SLACK_SECS`]
+/// and nix `kill`.
+fn terminate_and_wait(
+    host: &HostSetup,
+    label: &'static str,
+    child: &mut Child,
+) -> Result<std::process::ExitStatus, String> {
+    terminate_within(&host.cancel, label, child, CHILD_EXIT_SLACK_SECS, kill::<Signal>)
 }
 
 /// Describe a child that did not exit successfully: its code when it exited
@@ -2248,9 +2577,44 @@ fn read_gen_report(path: &Path) -> Option<crate::gen::GenReport> {
 /// every child-process failure becomes a `harness_error` entry and the
 /// record is returned, so a single bad run does not halt the matrix.
 pub fn run_one(spec: &RunSpec, host: &HostSetup) -> RunRecord {
+    run_one_with(spec, host, kill::<Signal>)
+}
+
+/// [`run_one`] with the guard's cleanup SIGKILL sent through `signal`;
+/// a test hands in a stand-in to make a child survive its cleanup.
+pub fn run_one_with(
+    spec: &RunSpec,
+    host: &HostSetup,
+    signal: fn(Pid, Signal) -> nix::Result<()>,
+) -> RunRecord {
+    let mut guards = ChildGuard::with_signal(signal);
+    let record = run_guarded(spec, host, &mut guards);
+    record_survivors(record, &mut guards)
+}
+
+/// End every child `guards` still holds ([`ChildGuard::end_all`]) and
+/// record each one it could not end as a harness error prefixed with
+/// [`CLEANUP_SURVIVOR_PREFIX`], then judge the record again, so it is
+/// invalid and names the child's pid. A record with no survivor is
+/// returned as it came.
+fn record_survivors(mut record: RunRecord, guards: &mut ChildGuard) -> RunRecord {
+    let survivors = guards.end_all();
+    if survivors.is_empty() {
+        return record;
+    }
+    record
+        .harness_errors
+        .extend(survivors.into_iter().map(|e| format!("{CLEANUP_SURVIVOR_PREFIX}{e}")));
+    record.invalid_reasons = reconcile(&record);
+    record.valid = record.invalid_reasons.is_empty();
+    record
+}
+
+/// [`run_one`]'s body: every child it spawns goes into `guards`, which the
+/// caller ends after it returns.
+fn run_guarded(spec: &RunSpec, host: &HostSetup, guards: &mut ChildGuard) -> RunRecord {
     let constants = ProtocolConstants::for_profile(spec.profile);
     let mut harness_errors: Vec<String> = Vec::new();
-    let mut guards = ChildGuard::new();
 
     // Scratch directory.
     let stem = stem_for(spec);
@@ -2319,7 +2683,7 @@ pub fn run_one(spec: &RunSpec, host: &HostSetup) -> RunRecord {
     let mut endpoint = match spawn_endpoint(
         spec,
         host,
-        &mut guards,
+        guards,
         &dir,
         port,
         mosquitto_conf_path.as_deref(),
@@ -2348,7 +2712,7 @@ pub fn run_one(spec: &RunSpec, host: &HostSetup) -> RunRecord {
     // names its cause instead of a bare timeout.
     if let Some(handshake) = endpoint.handshake.as_mut() {
         let ready_deadline = Instant::now() + Duration::from_secs(STARTUP_TIMEOUT_SECS);
-        if let Err(e) = wait_for_line(host, &mut guards, handshake, ready_deadline, "READY") {
+        if let Err(e) = wait_for_line(host, guards, handshake, ready_deadline, "READY") {
             harness_errors.push(format!(
                 "endpoint startup failed: READY: {e} (stderr: {})",
                 dir.join(format!("{}.stderr", handshake.label)).display()
@@ -2381,7 +2745,7 @@ pub fn run_one(spec: &RunSpec, host: &HostSetup) -> RunRecord {
             host,
             &dir,
             endpoint.server_pid,
-            &mut guards,
+            guards,
             &mut harness_errors,
         ))
     } else {
@@ -2420,7 +2784,7 @@ pub fn run_one(spec: &RunSpec, host: &HostSetup) -> RunRecord {
         ) {
             harness_errors.push(format!("ARM write failed: {e}"));
         }
-        if let Err(e) = wait_for_line(host, &mut guards, handshake, arm_deadline, "ARMED") {
+        if let Err(e) = wait_for_line(host, guards, handshake, arm_deadline, "ARMED") {
             harness_errors.push(format!(
                 "endpoint startup failed: ARM handshake: {e} (stderr: {})",
                 dir.join(format!("{}.stderr", handshake.label)).display()
@@ -2504,7 +2868,7 @@ pub fn run_one(spec: &RunSpec, host: &HostSetup) -> RunRecord {
                 host,
                 &dir,
                 endpoint.server_pid,
-                &mut guards,
+                guards,
                 &mut harness_errors,
             ));
         }
@@ -2541,7 +2905,7 @@ pub fn run_one(spec: &RunSpec, host: &HostSetup) -> RunRecord {
     // and `reap_counter` below collects the exit.
     if counting {
         if let Some(c) = counter.as_mut() {
-            disarm_counter(c, &mut guards, host, &mut harness_errors);
+            disarm_counter(c, guards, host, &mut harness_errors);
         }
     }
     // CPU end sample, before the counter is reaped: a counter can confirm
@@ -2563,7 +2927,7 @@ pub fn run_one(spec: &RunSpec, host: &HostSetup) -> RunRecord {
     // two `/proc` reads later.
     if counting {
         if let Some(c) = counter.as_mut() {
-            reap_counter(c, &mut guards, host, &mut harness_errors);
+            reap_counter(c, guards, host, &mut harness_errors);
         }
     }
 
@@ -2654,7 +3018,7 @@ pub fn run_one(spec: &RunSpec, host: &HostSetup) -> RunRecord {
     // `None`, because `host.syscalls` names the tool the matrix would use
     // and this record carries no evidence from it.
     let syscalls = if let Some(c) = counter.as_mut() {
-        finalize_counter(c, &mut guards, host, &mut harness_errors)
+        finalize_counter(c, guards, host, &mut harness_errors)
     } else {
         Syscalls {
             method: SyscallMethod::None,
@@ -2958,16 +3322,37 @@ fn harness_default_origin(constants: ProtocolConstants) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        abandon_startup, Child, Command, CommandExt, Pid, Signal, Stdio,
-        GIT_HEAD_OWN_PROCESS_GROUP,
+        abandon_startup, build_minimal_record, record_survivors, report_within, start_time_in,
+        survivor_resume_refusal, terminate_within, Child, ChildGuard, Command, CommandExt, Duration,
+        Instant, Pid, Profile, RunKind, RunSpec, Signal, Stdio, ServerKind, SystemTime, UNIX_EPOCH,
+        proc_start_time, GUARD_SIGKILL_REAP_TIMEOUT_SECS, GUARD_REPORT_TIMEOUT_SECS,
+        GIT_HEAD_PROBE, PROBE_OWN_PROCESS_GROUP, SURVIVOR_START_UNKNOWN,
     };
     use nix::errno::Errno;
     use nix::sys::signal::kill;
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
     use std::sync::mpsc;
+    use std::thread::sleep;
 
     /// Long enough that the fixture probe is certainly still running when
     /// the give-up cleans it up.
     const PROBE_SLEEP_SECS: u64 = 60;
+
+    /// Slack a cleanup assertion grants the bound for the host's scheduling.
+    const REAP_SLACK_SECS: u64 = 2;
+
+    /// Lifetime of a fixture child whose SIGKILL the stand-in refuses: longer
+    /// than the SIGTERM slack, the reap bound and the assertion slack together,
+    /// so it is certainly still running when the bound ends.
+    const UNKILLED_FIXTURE_SECS: u64 =
+        TERM_SLACK_SECS + GUARD_SIGKILL_REAP_TIMEOUT_SECS + REAP_SLACK_SECS + 1;
+
+    /// Poll interval of the reap assertions.
+    const REAP_POLL: Duration = Duration::from_millis(20);
+
+    /// SIGTERM slack the `terminate_within` test grants in place of the run's 30 s.
+    const TERM_SLACK_SECS: u64 = 1;
 
     #[test]
     fn abandon_startup_cleans_up_a_probe_that_finished_starting() {
@@ -2982,7 +3367,7 @@ mod tests {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .process_group(GIT_HEAD_OWN_PROCESS_GROUP)
+            .process_group(PROBE_OWN_PROCESS_GROUP)
             .spawn()
             .expect("the fixture probe must start");
         let pid = i32::try_from(child.id()).expect("the fixture pid must fit an i32");
@@ -2994,6 +3379,7 @@ mod tests {
 
         let mut signalled = Vec::new();
         let refusal = abandon_startup(
+            GIT_HEAD_PROBE,
             &started_rx,
             "cancelled".to_string(),
             &mut |target: Pid, signal: Signal| {
@@ -3030,6 +3416,7 @@ mod tests {
         let (started_tx, started_rx) = mpsc::sync_channel::<Result<Child, String>>(1);
         let mut signalled = 0_u32;
         let refusal = abandon_startup(
+            GIT_HEAD_PROBE,
             &started_rx,
             "cancelled".to_string(),
             &mut |_: Pid, _: Signal| {
@@ -3051,5 +3438,500 @@ mod tests {
             signalled, 0,
             "a probe that has no pid yet must not be signalled"
         );
+    }
+
+    #[test]
+    fn end_all_bounds_and_reports_a_child_its_sigkill_cannot_reach() {
+        let child = Command::new("sleep")
+            .arg(UNKILLED_FIXTURE_SECS.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the fixture child must start");
+        let pid_u = child.id();
+        let pid = i32::try_from(pid_u).expect("pid fits in i32");
+
+        let mut guards = ChildGuard::with_signal(|_: Pid, _: Signal| Err(Errno::EPERM));
+        guards.push("endpoint", child);
+        let start = proc_start_time(pid_u).expect("fixture start time");
+
+        let started = Instant::now();
+        let errors = guards.end_all();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(GUARD_SIGKILL_REAP_TIMEOUT_SECS + REAP_SLACK_SECS),
+            "end_all must give up on a SIGKILL it cannot send within {GUARD_SIGKILL_REAP_TIMEOUT_SECS}s",
+        );
+        assert_eq!(errors.len(), 1, "exactly one survivor error is expected");
+        let expected = format!(
+            "endpoint cleanup: pid {pid_u} (start {start}) still running {GUARD_SIGKILL_REAP_TIMEOUT_SECS}s after SIGKILL"
+        );
+        assert!(
+            errors[0].starts_with(&expected),
+            "the survivor must name label, pid, start time and bound; got: {}",
+            errors[0]
+        );
+        assert!(
+            errors[0].contains("SIGKILL: EPERM"),
+            "the survivor must carry the refused SIGKILL: {}",
+            errors[0]
+        );
+
+        // The reaper thread now owns the wait; a zombie answers `kill(pid, None)`
+        // with `Ok`, so only its reap ends the loop.
+        let reap_deadline = Instant::now()
+            + Duration::from_secs(UNKILLED_FIXTURE_SECS + REAP_SLACK_SECS);
+        loop {
+            if let Err(Errno::ESRCH) = kill(Pid::from_raw(pid), None) {
+                break;
+            }
+            assert!(
+                Instant::now() < reap_deadline,
+                "the reaper thread did not reap the survivor before the fixture exits"
+            );
+            sleep(REAP_POLL);
+        }
+    }
+
+    #[test]
+    fn end_all_kills_and_reaps_a_running_child() {
+        let child = Command::new("sleep")
+            .arg(60.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the fixture child must start");
+        let pid_u = child.id();
+        let pid = i32::try_from(pid_u).expect("pid fits in i32");
+
+        let mut guards = ChildGuard::with_signal(kill::<Signal>);
+        guards.push("sub", child);
+
+        let errors = guards.end_all();
+        assert!(errors.is_empty(), "killable child must end without an error");
+
+        assert_eq!(
+            kill(Pid::from_raw(pid), None),
+            Err(Errno::ESRCH),
+            "a child the guard killed must be reaped by the guard"
+        );
+    }
+
+    #[test]
+    fn end_all_ends_a_killable_child_behind_one_its_sigkill_cannot_reach() {
+        // A run holds an endpoint, a subscriber, a generator and a counter.
+        // A child the SIGKILL cannot reach must not keep the guard from
+        // ending the children pushed behind it: the guard reports that one
+        // child and still kills and reaps the rest, so a bounded give-up
+        // never leaves an orphan beside the next run.
+        static REFUSED_PID: AtomicI32 = AtomicI32::new(0);
+        fn refuse_one_pid(pid: Pid, signal: Signal) -> nix::Result<()> {
+            if pid.as_raw() == REFUSED_PID.load(Ordering::SeqCst) {
+                Err(Errno::EPERM)
+            } else {
+                kill(pid, signal)
+            }
+        }
+
+        let unreachable = Command::new("sleep")
+            .arg(UNKILLED_FIXTURE_SECS.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the unreachable fixture child must start");
+        let unreachable_pid_u = unreachable.id();
+        let unreachable_pid = i32::try_from(unreachable_pid_u).expect("pid fits in i32");
+        REFUSED_PID.store(unreachable_pid, Ordering::SeqCst);
+        // Longer than the bound the guard spends on the child ahead of it,
+        // so it is certainly still running when the guard reaches it.
+        let killable = Command::new("sleep")
+            .arg(UNKILLED_FIXTURE_SECS.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the killable fixture child must start");
+        let killable_pid = i32::try_from(killable.id()).expect("pid fits in i32");
+
+        let mut guards = ChildGuard::with_signal(refuse_one_pid);
+        guards.push("endpoint", unreachable);
+        guards.push("sub", killable);
+        let start = proc_start_time(unreachable_pid_u).expect("fixture start time");
+
+        let started = Instant::now();
+        let errors = guards.end_all();
+        let elapsed = started.elapsed();
+        let killable_state = kill(Pid::from_raw(killable_pid), None);
+
+        // Tear down before asserting: the fixture the stand-in refused is
+        // finite, so the test waits for that exit and for the reap the
+        // reaper thread owns. Neither child is signalled from here: the
+        // reaper is free to free the survivor's pid number, the guard has
+        // already reaped the killable child, and either pid may name another
+        // process by now.
+        let reap_deadline =
+            Instant::now() + Duration::from_secs(UNKILLED_FIXTURE_SECS + REAP_SLACK_SECS);
+        let reaped = loop {
+            if proc_start_time(unreachable_pid_u) != Some(start) {
+                break true;
+            }
+            if Instant::now() >= reap_deadline {
+                break false;
+            }
+            sleep(REAP_POLL);
+        };
+
+        assert!(
+            elapsed < Duration::from_secs(GUARD_SIGKILL_REAP_TIMEOUT_SECS + REAP_SLACK_SECS),
+            "one survivor must cost one bound of {GUARD_SIGKILL_REAP_TIMEOUT_SECS}s, not one per child",
+        );
+        assert_eq!(
+            errors.len(),
+            1,
+            "only the child the SIGKILL could not reach is reported: {errors:?}"
+        );
+        let expected = format!(
+            "endpoint cleanup: pid {unreachable_pid_u} (start {start}) still running {GUARD_SIGKILL_REAP_TIMEOUT_SECS}s after SIGKILL"
+        );
+        assert!(
+            errors[0].starts_with(&expected),
+            "the survivor error must name the child the guard could not end; got: {}",
+            errors[0]
+        );
+        assert_eq!(
+            killable_state,
+            Err(Errno::ESRCH),
+            "the child pushed behind the survivor must still be killed and reaped"
+        );
+        assert!(
+            reaped,
+            "the reaper thread must reap the survivor once the fixture exits"
+        );
+    }
+
+    #[test]
+    fn end_all_sends_no_signal_to_a_child_std_already_reaped() {
+        static SIGNALLED: AtomicBool = AtomicBool::new(false);
+        #[allow(clippy::unnecessary_wraps)]
+        fn record_signal(_: Pid, _: Signal) -> nix::Result<()> {
+            SIGNALLED.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        let mut child = Command::new("true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the fixture child must start");
+        let _ = child.wait().expect("reap the quick child first");
+
+        let mut guards = ChildGuard::with_signal(record_signal);
+        guards.push("generator", child);
+
+        let errors = guards.end_all();
+        assert!(errors.is_empty(), "an already-reaped child must not error");
+        assert!(
+            !SIGNALLED.load(Ordering::SeqCst),
+            "the stand-in must not be called for a reaped child"
+        );
+    }
+
+    #[test]
+    fn record_survivors_returns_a_run_whose_children_all_ended_as_it_came() {
+        let child = Command::new("sleep")
+            .arg(60.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the fixture child must start");
+        let pid_u = child.id();
+        let pid = i32::try_from(pid_u).expect("pid fits in i32");
+
+        let mut guards = ChildGuard::with_signal(kill::<Signal>);
+        guards.push("sub", child);
+
+        let spec = RunSpec {
+            profile: Profile::Smoke,
+            server: ServerKind::Uring,
+            workers: 1,
+            qos: Some(1),
+            kind: RunKind::Throughput,
+            rate_fraction_pct: None,
+            offered_rate: None,
+            repetition: 1,
+            attempt: 1,
+        };
+        let mut record = build_minimal_record(&spec);
+        record.harness_errors = Vec::new();
+        record.invalid_reasons = Vec::new();
+        record.valid = true;
+
+        let out = record_survivors(record, &mut guards);
+
+        assert!(out.harness_errors.is_empty(), "no survivor means no errors");
+        assert!(out.invalid_reasons.is_empty(), "no survivor means no reasons");
+        assert!(out.valid, "an unchanged valid record stays valid");
+        assert_eq!(
+            kill(Pid::from_raw(pid), None),
+            Err(Errno::ESRCH),
+            "the child's exit is reaped through `end_child`"
+        );
+    }
+
+    #[test]
+    fn terminate_within_bounds_and_reports_a_child_that_outlives_sigterm_and_sigkill() {
+        fn refuse_sigkill(pid: Pid, signal: Signal) -> nix::Result<()> {
+            if signal == Signal::SIGKILL {
+                Err(Errno::EPERM)
+            } else {
+                kill(pid, signal)
+            }
+        }
+
+        // The stand-in refuses the cleanup's SIGKILL, so the fixture child
+        // outlives `terminate_within` and is still the caller's. `Drop`
+        // takes it back with a real SIGKILL and reaps it, so an assertion
+        // that fails cannot leave it running beside the tests that follow.
+        struct Fixture(Child);
+
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!(
+                "trap '' TERM; echo ready; exec sleep {UNKILLED_FIXTURE_SECS}"
+            ))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut fixture = Fixture(cmd.spawn().expect("the fixture child must start"));
+        let pid_u = fixture.0.id();
+
+        // The trap is installed once `ready` arrives; an ignored signal stays
+        // ignored across `exec`.
+        let stdout = fixture.0.stdout.take().expect("piped stdout");
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read ready line");
+        let start = proc_start_time(pid_u).expect("fixture start time");
+
+        let started = Instant::now();
+        let err = terminate_within(
+            &AtomicBool::new(false),
+            "endpoint",
+            &mut fixture.0,
+            TERM_SLACK_SECS,
+            refuse_sigkill,
+        )
+        .expect_err("a child that ignores SIGTERM and refuses SIGKILL must error");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed
+                < Duration::from_secs(TERM_SLACK_SECS + GUARD_SIGKILL_REAP_TIMEOUT_SECS + REAP_SLACK_SECS),
+            "terminate_within must bound its wait by slack + GUARD_SIGKILL_REAP_TIMEOUT_SECS"
+        );
+        let expected = format!(
+            "endpoint did not exit within {TERM_SLACK_SECS}s of SIGTERM; endpoint cleanup: pid {pid_u} (start {start}) still running {GUARD_SIGKILL_REAP_TIMEOUT_SECS}s after SIGKILL"
+        );
+        assert!(
+            err.starts_with(&expected),
+            "the error must name the slack, the label, pid, start time and bound; got: {err}"
+        );
+        assert!(
+            err.contains("SIGKILL: EPERM"),
+            "the error must carry the refused SIGKILL: {err}"
+        );
+        assert_eq!(
+            fixture.0.try_wait().expect("try_wait"),
+            None,
+            "the child is still the caller's, unreaped"
+        );
+    }
+
+    #[test]
+    fn terminate_within_returns_the_status_of_a_child_that_exits_on_sigterm() {
+        // The bounded give-up must not cost a healthy child its SIGTERM
+        // path: a child that exits on the signal is reaped and its status
+        // returned. Only the deadline branch answers `Err`, so an `Ok` here
+        // is proof the wait ended on the exit and not on the slack.
+        let mut child = Command::new("sleep")
+            .arg(PROBE_SLEEP_SECS.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the fixture child must start");
+        let pid = i32::try_from(child.id()).expect("pid fits in i32");
+
+        let status = terminate_within(
+            &AtomicBool::new(false),
+            "sub",
+            &mut child,
+            TERM_SLACK_SECS,
+            kill::<Signal>,
+        );
+        let reaped = kill(Pid::from_raw(pid), None);
+
+        let status = status.expect("a child that exits on SIGTERM must return its status");
+        assert!(
+            !status.success(),
+            "a child killed by SIGTERM did not exit cleanly: {status:?}"
+        );
+        assert_eq!(
+            reaped,
+            Err(Errno::ESRCH),
+            "the child must be reaped by the wait, not left a zombie"
+        );
+    }
+
+    #[test]
+    fn report_within_gives_up_on_a_writer_that_never_accepts() {
+        struct Stalled;
+        impl Write for Stalled {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                sleep(Duration::from_secs(UNKILLED_FIXTURE_SECS));
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let started = Instant::now();
+        report_within(
+            vec![
+                "endpoint cleanup: pid 1 (start 1) still running 10s after SIGKILL".to_string(),
+            ],
+            Stalled,
+            Duration::from_secs(GUARD_REPORT_TIMEOUT_SECS),
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed
+                < Duration::from_secs(GUARD_REPORT_TIMEOUT_SECS + REAP_SLACK_SECS),
+            "report_within must bound its wait on the writer thread"
+        );
+    }
+
+    #[test]
+    fn report_within_writes_every_report_to_a_writer_that_accepts() {
+        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let mut g = self.0.lock().expect("lock");
+                g.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        report_within(
+            vec!["a".to_string(), "b".to_string()],
+            Captured(shared.clone()),
+            Duration::from_secs(GUARD_REPORT_TIMEOUT_SECS),
+        );
+
+        assert_eq!(*shared.lock().expect("lock"), b"a\nb\n".to_vec());
+    }
+
+    /// A `/proc/<pid>/stat` line with `comm` set to `comm` and the start
+    /// time set to `start`, in the kernel's field order. Fields 4 to 21 and
+    /// the two behind the start time carry values that are distinct from
+    /// one another, so the fixture pins field 22 on its own and a parser
+    /// that read a neighbour would answer one of them instead of `start`.
+    fn stat_line(comm: &[u8], start: u64) -> Vec<u8> {
+        let mut line = b"4242 (".to_vec();
+        line.extend_from_slice(comm);
+        // `4242` is field 1, `comm` field 2, `S` field 3, then fields 4 to
+        // 21, then the start time in field 22 and two fields behind it.
+        line.extend_from_slice(b") S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18");
+        line.extend_from_slice(format!(" {start} 19 20\n").as_bytes());
+        line
+    }
+
+    /// A fresh path for one stat fixture, under the host's temp directory.
+    fn stat_fixture(tag: &str, body: &[u8]) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "bench-runner-stat-{tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::write(&path, body).expect("the stat fixture must be written");
+        path.to_str().expect("the fixture path must be UTF-8").to_string()
+    }
+
+    // A process can set its own name to bytes that are not UTF-8 and keep
+    // running with the start time a survivor entry recorded. Decoding the
+    // whole line would fail there, and a failure read as "the process
+    // ended" would let `--resume` measure beside that survivor.
+    #[test]
+    fn a_start_time_is_read_beside_a_process_name_that_is_not_utf8() {
+        const START: u64 = 987_654;
+
+        let path = stat_fixture("not-utf8", &stat_line(b"sl\xffeep (x)", START));
+        let read = start_time_in(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(read, Ok(Some(START)));
+    }
+
+    // Only a missing `/proc` entry proves the pid is free; a stat line the
+    // parser cannot use is an inspection failure, not an ended process.
+    #[test]
+    fn an_unusable_stat_line_is_a_failure_and_not_an_ended_process() {
+        let path = stat_fixture("unusable", b"4242 (sleep) S no fields here\n");
+        let read = start_time_in(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert!(read.is_err(), "an unusable stat line must not answer Ok: {read:?}");
+        assert_eq!(start_time_in(&path), Ok(None), "a missing stat frees the pid");
+    }
+
+    // The producer writes a number or `SURVIVOR_START_UNKNOWN`; any other
+    // token means the entry cannot be trusted to name the child, so the
+    // resume is refused rather than permitted as an unknown start time.
+    #[test]
+    fn a_survivor_start_token_that_does_not_parse_refuses_the_resume() {
+        // `/proc` has no entry for pid 0, so the pid alone cannot refuse.
+        const UNHELD_PID: u32 = 0;
+
+        for token in ["invalid", "99999999999999999999999999", "-1", ""] {
+            let entry = format!(
+                "endpoint cleanup: pid {UNHELD_PID} (start {token}) still running 10s after SIGKILL"
+            );
+            assert!(
+                survivor_resume_refusal(&entry).is_some(),
+                "start token {token:?} must refuse the resume"
+            );
+        }
+
+        for token in ["12345", SURVIVOR_START_UNKNOWN] {
+            let entry = format!(
+                "endpoint cleanup: pid {UNHELD_PID} (start {token}) still running 10s after SIGKILL"
+            );
+            assert_eq!(
+                survivor_resume_refusal(&entry),
+                None,
+                "start token {token:?} names no live process"
+            );
+        }
     }
 }

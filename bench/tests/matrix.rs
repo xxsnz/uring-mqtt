@@ -24,7 +24,10 @@ use bench::run_record::{
     Build, ConfigKey, Counts, CpuSets, CpuUsage, DriverFds, Env, GeneratorErrors, LatencySummary,
     Profile, RunKind, RunRecord, ServerKind, SyscallMethod, Syscalls, SCHEMA_VERSION,
 };
-use bench::runner::{HostSetup, ProtocolConstants, RunSpec, SCRATCH_REUSED_PREFIX};
+use bench::runner::{
+    CLEANUP_SURVIVOR_PREFIX, HostSetup, ProtocolConstants, RunSpec, SCRATCH_REUSED_PREFIX,
+    proc_start_time,
+};
 
 const ORIGIN_NS: u64 = 10_000_000_000;
 const WINDOW_START_NS: u64 = 12_000_000_000;
@@ -32,6 +35,8 @@ const WINDOW_END_NS: u64 = 17_000_000_000;
 const WARMUP_SECS: u64 = 2;
 const WINDOW_SECS: u64 = 5;
 const ONE_SECOND_NS: u64 = 1_000_000_000;
+/// The harness error a run records for a child its guard could not end.
+const SURVIVOR: &str = "endpoint cleanup: pid 4242 (start 1) still running 10s after SIGKILL";
 
 /// A `RunRecord` the matrix can use as a passing repetition. A throughput
 /// or connections record is what `reconcile` and `derive` return nothing
@@ -215,6 +220,18 @@ fn passing_record(
         invalid_reasons: Vec::new(),
         cancelled: false,
     }
+}
+
+/// Marks `rec` as a run whose child survived cleanup: pushes a
+/// `CLEANUP_SURVIVOR_PREFIX`-tagged `report` onto both `harness_errors` and
+/// `invalid_reasons`, and marks the record invalid.
+fn with_survivor(mut rec: RunRecord, report: &str) -> RunRecord {
+    rec.harness_errors
+        .push(format!("{CLEANUP_SURVIVOR_PREFIX}{report}"));
+    rec.invalid_reasons
+        .push(format!("{CLEANUP_SURVIVOR_PREFIX}{report}"));
+    rec.valid = false;
+    rec
 }
 
 fn throughput_spec() -> RunSpec {
@@ -448,6 +465,176 @@ fn cancellation_stops_scheduling_and_leaves_the_resume_budget() {
         plan.get(&existing[0].key()),
         Some(&ResumeState::NextAttempt { attempt: 2, remaining: 3 }),
         "resume must continue at attempt 2, not past the cap"
+    );
+}
+
+#[test]
+fn a_child_that_survived_cleanup_stops_scheduling_and_leaves_the_resume_budget() {
+    // A child the run could not end is still running: scheduling another
+    // run beside it would measure it against that leftover process, so the
+    // matrix stops the moment a record carries a survivor error, ahead of
+    // any cancellation, and the attempt it cut is incomplete.
+    let constants = ProtocolConstants {
+        warmup_secs: WARMUP_SECS,
+        window_secs: WINDOW_SECS,
+        repetitions: 2,
+        drain_grace_secs: 2,
+        max_config_attempts: 3,
+        enforce_spread: false,
+    };
+    let out_dir = temp_dir("survivor");
+    let scratch = temp_dir("survivor-scratch");
+    let cancel = AtomicBool::new(false);
+    let spec = throughput_spec();
+    let mut attempts: Vec<(u32, u32)> = Vec::new();
+    let expected = format!("{CLEANUP_SURVIVOR_PREFIX}{SURVIVOR}; no further run is scheduled beside it");
+
+    let err = run_configs(&[spec], &HashMap::new(), &constants, &out_dir, &scratch, &cancel, |s| {
+        attempts.push((s.attempt, s.repetition));
+        with_survivor(passing_record(s, s.repetition, s.attempt, 100), SURVIVOR)
+    })
+    .expect_err("run_configs must report the surviving child");
+
+    assert_eq!(err, expected);
+    assert_eq!(attempts, vec![(1, 1)]);
+    let existing = read_records(&out_dir).expect("read_records");
+    assert_eq!(existing.len(), 1, "the survivor's own record is persisted");
+    let plan = resume_plan(&existing, &constants);
+    assert_eq!(
+        plan.get(&existing[0].key()),
+        Some(&ResumeState::NextAttempt { attempt: 2, remaining: 3 }),
+        "the attempt the survivor cut short is incomplete, so resume repeats it"
+    );
+}
+
+#[test]
+fn a_survivor_in_the_last_repetition_of_the_last_attempt_leaves_that_attempt_unspent() {
+    // Previously the attempt counted complete once every repetition ran,
+    // and gave `remaining: 0`; a survivor in the last repetition must
+    // still leave the attempt's budget unspent.
+    let constants = ProtocolConstants {
+        warmup_secs: WARMUP_SECS,
+        window_secs: WINDOW_SECS,
+        repetitions: 2,
+        drain_grace_secs: 2,
+        max_config_attempts: 1,
+        enforce_spread: false,
+    };
+    let out_dir = temp_dir("survivor-last");
+    let scratch = temp_dir("survivor-last-scratch");
+    let cancel = AtomicBool::new(false);
+    let spec = throughput_spec();
+    let mut attempts: Vec<(u32, u32)> = Vec::new();
+    let expected = format!("{CLEANUP_SURVIVOR_PREFIX}{SURVIVOR}; no further run is scheduled beside it");
+
+    let err = run_configs(&[spec], &HashMap::new(), &constants, &out_dir, &scratch, &cancel, |s| {
+        attempts.push((s.attempt, s.repetition));
+        if s.repetition == 2 {
+            with_survivor(passing_record(s, s.repetition, s.attempt, 100), SURVIVOR)
+        } else {
+            passing_record(s, s.repetition, s.attempt, 100)
+        }
+    })
+    .expect_err("run_configs must report the surviving child");
+
+    assert_eq!(err, expected);
+    assert_eq!(attempts, vec![(1, 1), (1, 2)]);
+    let existing = read_records(&out_dir).expect("read_records");
+    assert_eq!(existing.len(), 2, "both repetitions are persisted");
+    let plan = resume_plan(&existing, &constants);
+    assert_eq!(
+        plan.get(&existing[0].key()),
+        Some(&ResumeState::NextAttempt { attempt: 2, remaining: 1 }),
+        "the survivor leaves the last attempt unspent, not complete"
+    );
+}
+
+#[test]
+fn a_survivor_whose_record_cannot_be_written_is_still_reported() {
+    // A survivor must survive a failed write: it is the only report of a
+    // leftover child, so losing it to a write failure would hide the
+    // process an operator needs to find and end.
+    let constants = ProtocolConstants {
+        warmup_secs: WARMUP_SECS,
+        window_secs: WINDOW_SECS,
+        repetitions: 2,
+        drain_grace_secs: 2,
+        max_config_attempts: 3,
+        enforce_spread: false,
+    };
+    let work = temp_dir("survivor-write-fail");
+    let out_dir = work.join("out");
+    let scratch = work.join("scratch");
+    fs::create_dir_all(&out_dir).expect("create out dir");
+    let cancel = AtomicBool::new(false);
+    let spec = throughput_spec();
+    let mut planned = spec.clone();
+    planned.repetition = 1;
+    let stem = passing_record(&planned, 1, 1, 100)
+        .file_name()
+        .replace(".json", "");
+    let run_scratch = scratch.join(&stem);
+    let mut attempts: Vec<(u32, u32)> = Vec::new();
+    let second_report = "sub cleanup: pid 4343 (start 1) still running 10s after SIGKILL";
+
+    let err = run_configs(&[spec], &HashMap::new(), &constants, &out_dir, &scratch, &cancel, |s| {
+        attempts.push((s.attempt, s.repetition));
+        fs::create_dir_all(&run_scratch).expect("create run scratch");
+        fs::write(run_scratch.join("gen.json"), b"{}").expect("write evidence");
+        let record = passing_record(s, s.repetition, s.attempt, 100);
+        fs::write(out_dir.join(format!("{}.tmp", record.file_name())), b"planted")
+            .expect("plant the temporary record");
+        with_survivor(with_survivor(record, SURVIVOR), second_report)
+    })
+    .expect_err("run_configs must report the surviving children and the write failure");
+
+    assert!(
+        err.starts_with(&format!(
+            "{CLEANUP_SURVIVOR_PREFIX}{SURVIVOR}; {CLEANUP_SURVIVOR_PREFIX}{second_report}; no further run is scheduled beside it; "
+        )),
+        "both survivors precede the write failure, in record order, got {err}"
+    );
+    assert!(
+        err.contains(&stem),
+        "the write failure names the record, got {err}"
+    );
+    assert_eq!(attempts, vec![(1, 1)]);
+}
+
+#[test]
+fn a_survivor_is_reported_ahead_of_the_cancellation_it_ran_into() {
+    // A surviving child outranks a cancellation that arrived in the same
+    // run: the leftover process is the more urgent problem, so its error
+    // is reported instead of "cancelled".
+    let constants = ProtocolConstants {
+        warmup_secs: WARMUP_SECS,
+        window_secs: WINDOW_SECS,
+        repetitions: 2,
+        drain_grace_secs: 2,
+        max_config_attempts: 3,
+        enforce_spread: false,
+    };
+    let out_dir = temp_dir("survivor-cancel");
+    let scratch = temp_dir("survivor-cancel-scratch");
+    let cancel = AtomicBool::new(false);
+    let spec = throughput_spec();
+    let mut attempts: Vec<(u32, u32)> = Vec::new();
+    let expected = format!("{CLEANUP_SURVIVOR_PREFIX}{SURVIVOR}; no further run is scheduled beside it");
+
+    let err = run_configs(&[spec], &HashMap::new(), &constants, &out_dir, &scratch, &cancel, |s| {
+        attempts.push((s.attempt, s.repetition));
+        cancel.store(true, Ordering::SeqCst);
+        with_survivor(passing_record(s, s.repetition, s.attempt, 100), SURVIVOR)
+    })
+    .expect_err("run_configs must report the surviving child, not the cancellation");
+
+    assert_eq!(err, expected);
+    assert_eq!(attempts, vec![(1, 1)]);
+    let existing = read_records(&out_dir).expect("read_records");
+    assert_eq!(existing.len(), 1);
+    assert!(
+        existing[0].cancelled,
+        "the record still carries the cancellation it ran into"
     );
 }
 
@@ -915,6 +1102,167 @@ fn resume_refuses_records_from_another_build() {
     let existing = read_records(&out_dir).expect("read");
     check_resume(&existing, Profile::Smoke, SyscallMethod::None, &rec.env, &rec.cpu_sets)
         .expect("identical env");
+}
+
+/// Lifetime of the live child a survivor entry names; the test ends it itself.
+const LIVE_CHILD_SECS: u64 = 60;
+
+/// A live child a survivor entry can name. `Drop` ends and reaps it, so a
+/// failed assertion cannot leave it running beside the tests that follow.
+struct LiveChild(std::process::Child);
+
+impl LiveChild {
+    fn spawn() -> Self {
+        LiveChild(
+            std::process::Command::new("sleep")
+                .arg(LIVE_CHILD_SECS.to_string())
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn live child"),
+        )
+    }
+
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+
+    /// Ends and reaps the child, so a test can observe the pid it held
+    /// once no process holds it. Idempotent, so `Drop` may repeat it.
+    fn end(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Drop for LiveChild {
+    fn drop(&mut self) {
+        self.end();
+    }
+}
+
+/// A record naming the given survivor entry, with `invalid_reasons` and
+/// `valid` recomputed so `check_resume`'s own recompute agrees with it.
+fn resumable_record_naming(entry: &str) -> RunRecord {
+    let mut rec = make_record(
+        Profile::Smoke,
+        ServerKind::Uring,
+        1,
+        Some(1),
+        RunKind::Throughput,
+        None,
+        1,
+        1,
+        true,
+        "0000000",
+    );
+    rec.harness_errors.push(format!("{CLEANUP_SURVIVOR_PREFIX}{entry}"));
+    rec.invalid_reasons = reconcile(&rec);
+    rec.valid = rec.invalid_reasons.is_empty();
+    rec
+}
+
+#[test]
+fn a_resume_beside_a_running_survivor_is_refused_until_it_ends() {
+    let out_dir = temp_dir("resume-survivor");
+    let mut child = LiveChild::spawn();
+    let pid = child.pid();
+    let start = proc_start_time(pid).expect("live child start time");
+    let entry = format!("endpoint cleanup: pid {pid} (start {start}) still running 10s after SIGKILL");
+    let rec = resumable_record_naming(&entry);
+    write_record(&out_dir, &rec);
+    let existing = read_records(&out_dir).expect("read");
+
+    let err = check_resume(&existing, Profile::Smoke, SyscallMethod::None, &rec.env, &rec.cpu_sets)
+        .expect_err("a running survivor must refuse the resume");
+    assert!(err.contains(&rec.file_name()), "err must name the record file: {err}");
+    assert!(err.contains(&entry), "err must name the survivor entry: {err}");
+    assert!(err.contains("end it before --resume"), "err must name the remedy: {err}");
+
+    child.end();
+
+    check_resume(&existing, Profile::Smoke, SyscallMethod::None, &rec.env, &rec.cpu_sets)
+        .expect("an ended survivor resumes");
+}
+
+#[test]
+fn a_resume_beside_a_survivor_pid_now_held_by_another_process_proceeds() {
+    let out_dir = temp_dir("resume-survivor-reused");
+    let child = LiveChild::spawn();
+    let pid = child.pid();
+    let start = proc_start_time(pid).expect("live child start time");
+    let entry = format!(
+        "endpoint cleanup: pid {pid} (start {}) still running 10s after SIGKILL",
+        start + 1
+    );
+    let rec = resumable_record_naming(&entry);
+    write_record(&out_dir, &rec);
+    let existing = read_records(&out_dir).expect("read");
+
+    check_resume(&existing, Profile::Smoke, SyscallMethod::None, &rec.env, &rec.cpu_sets)
+        .expect("a pid now held by another process must not block the resume");
+}
+
+#[test]
+fn a_resume_beside_a_live_pid_with_no_recorded_start_time_is_refused() {
+    let out_dir = temp_dir("resume-survivor-unknown");
+    let child = LiveChild::spawn();
+    let pid = child.pid();
+    let entry = format!("endpoint cleanup: pid {pid} (start ?) exit check failed: test");
+    let rec = resumable_record_naming(&entry);
+    write_record(&out_dir, &rec);
+    let existing = read_records(&out_dir).expect("read");
+
+    let err = check_resume(&existing, Profile::Smoke, SyscallMethod::None, &rec.env, &rec.cpu_sets)
+        .expect_err("a live pid with no recorded start time must refuse the resume");
+    assert!(err.contains(&entry), "err must name the survivor entry: {err}");
+}
+
+#[test]
+fn a_resume_is_refused_by_a_live_survivor_an_ended_one_precedes() {
+    // One run can leave several children, and the operator may have ended
+    // only some of them. Every survivor entry of a record is checked, so an
+    // entry whose process is gone does not stand in for the ones behind it.
+    let out_dir = temp_dir("resume-survivor-second");
+    let mut ended = LiveChild::spawn();
+    let ended_pid = ended.pid();
+    let ended_start = proc_start_time(ended_pid).expect("ended child start time");
+    ended.end();
+
+    let live = LiveChild::spawn();
+    let live_pid = live.pid();
+    let live_start = proc_start_time(live_pid).expect("live child start time");
+
+    let ended_entry =
+        format!("sub cleanup: pid {ended_pid} (start {ended_start}) still running 10s after SIGKILL");
+    let live_entry = format!(
+        "endpoint cleanup: pid {live_pid} (start {live_start}) still running 10s after SIGKILL"
+    );
+    let mut rec = resumable_record_naming(&ended_entry);
+    rec.harness_errors
+        .push(format!("{CLEANUP_SURVIVOR_PREFIX}{live_entry}"));
+    rec.invalid_reasons = reconcile(&rec);
+    rec.valid = rec.invalid_reasons.is_empty();
+    write_record(&out_dir, &rec);
+    let existing = read_records(&out_dir).expect("read");
+
+    let err = check_resume(
+        &existing,
+        Profile::Smoke,
+        SyscallMethod::None,
+        &rec.env,
+        &rec.cpu_sets,
+    )
+    .expect_err("a survivor behind an ended one must refuse the resume");
+    assert!(
+        err.contains(&live_entry),
+        "err must name the survivor that is still running: {err}"
+    );
+    assert!(
+        err.contains("end it before --resume"),
+        "err must name the remedy: {err}"
+    );
 }
 
 /// `doc::render` refuses a recorded directory holding more than one

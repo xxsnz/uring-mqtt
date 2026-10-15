@@ -29,7 +29,7 @@ use crate::run_record::{
 // (`PLAN.md ## Interface Contracts`, `Protocol constants`). They are used
 // here rather than restated so a change to the runner's declared value
 // cannot leave the published metric and the refusal rows on the old one.
-use crate::runner::{COUNTER_BOUNDARY_TOLERANCE_NS, SUSTAINED_TAIL_SECS};
+use crate::runner::{CLEANUP_SURVIVOR_PREFIX, COUNTER_BOUNDARY_TOLERANCE_NS, SUSTAINED_TAIL_SECS};
 pub use crate::runner::SYSCALL_FRACTION_PCT;
 
 /// Maximum tolerated relative spread of any configuration's metric over its
@@ -713,6 +713,16 @@ fn incomplete_reason(runs: &[RunRecord], repetitions: u32) -> Option<String> {
             cancelled.repetition
         ));
     }
+    if let Some(survivor) = runs.iter().find(|r| {
+        r.harness_errors
+            .iter()
+            .any(|e| e.starts_with(CLEANUP_SURVIVOR_PREFIX))
+    }) {
+        return Some(format!(
+            "repetition {} left a child running after cleanup",
+            survivor.repetition
+        ));
+    }
     let mut reps: Vec<u32> = runs.iter().map(|r| r.repetition).collect();
     reps.sort_unstable();
     if !reps.iter().copied().eq(1..=repetitions) {
@@ -722,8 +732,9 @@ fn incomplete_reason(runs: &[RunRecord], repetitions: u32) -> Option<String> {
 }
 
 /// `true` when `runs` hold the repetition numbers `1..=repetitions`,
-/// each exactly once, and none of them was cancelled — a run cut
-/// short by a signal is no repetition. A missing number is a
+/// each exactly once, none of them was cancelled and none left a child
+/// running after cleanup — a run cut short by a signal, or one the matrix
+/// stopped beside a surviving child, is no repetition. A missing number is a
 /// repetition that never ran; a repeated one is a record that ran
 /// once and counts twice.
 pub fn attempt_complete(runs: &[RunRecord], repetitions: u32) -> bool {

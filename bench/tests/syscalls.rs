@@ -112,7 +112,7 @@ fn make_host(dir: &Path, syscalls: SyscallMethod, counter: Option<PathBuf>) -> H
             server: bench::runner::DEFAULT_SERVER_CPUS.to_string(),
             generator: bench::runner::DEFAULT_GENERATOR_CPUS.to_string(),
         },
-        env: capture_env(&[]).expect("capture_env"),
+        env: capture_env(&[], &AtomicBool::new(false)).expect("capture_env"),
         scratch_dir: dir.to_path_buf(),
         cancel: Arc::new(AtomicBool::new(false)),
     }
