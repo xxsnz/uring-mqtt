@@ -422,8 +422,10 @@ fn dispatch_run(
     // tool), and until the handler is installed SIGTERM takes its default
     // action: the runner dies and the probe it started keeps running with
     // no diagnostic (AC-52). With the handler installed the runner stays
-    // alive, so `runner::head_sha` and `runner::tool_version` reap their
-    // probe on every path, and kill a probe that has not exited on its own
+    // alive, so `runner::head_sha` and `runner::tool_version` SIGKILL a probe
+    // that has not exited on its own and reap it (`head_sha` reports one
+    // that outlives the signal, and one still inside its own startup, which
+    // has no pid to signal yet)
     // — `head_sha` as soon as it sees the flag, `tool_version` at the
     // latest after its own `TOOL_VERSION_TIMEOUT_SECS` deadline — and the
     // flag is read again before the matrix starts.

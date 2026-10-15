@@ -12,6 +12,7 @@
 //! `window.end_ns`. The selected [`SyscallMethod`] and the tool paths
 //! come from [`HostSetup`].
 
+use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -91,12 +92,19 @@ pub const TOOL_VERSION_TIMEOUT_SECS: u64 = 5;
 /// that never answers must not hold the runner before any record exists.
 pub const GIT_HEAD_TIMEOUT_SECS: u64 = 5;
 
+/// Upper bound on the reap after [`head_sha_with`]'s cleanup SIGKILLs. Either
+/// signal can be refused, so the reap waits this long for the probe to exit
+/// and then gives up with a named error instead of blocking.
+const GIT_HEAD_REAP_TIMEOUT_SECS: u64 = 1;
+
 /// Cap on the stdout bytes [`head_sha`] reads from its `git`. The probe
 /// wants one short SHA, so everything past this cap is noise; reading it
 /// would let a `git` on `PATH` that prints without stopping, or one
 /// enormous line without a newline, grow the reader's line buffer and its
 /// channel for as long as [`GIT_HEAD_TIMEOUT_SECS`] lasts. The capped
-/// reader reports EOF at the cap and the deadline still bounds the child.
+/// reader reports EOF at the cap, so a line the cap cuts arrives without its
+/// newline and [`wait_for_head_sha`] refuses it rather than answering with a
+/// cut SHA; the deadline still bounds the child.
 const GIT_HEAD_STDOUT_BYTES_MAX: u64 = 4096;
 
 /// `process_group` argument that puts [`head_sha`]'s probe in a group of
@@ -403,37 +411,45 @@ fn recv_version_line(
 }
 
 /// `<git> rev-parse --short HEAD` of the working tree the runner is about
-/// to invoke, for [`check_provenance`]. Bounded by
-/// [`GIT_HEAD_TIMEOUT_SECS`]: the probe is killed and reaped if it has
-/// not exited by then, or sooner if `cancel` is set. `git` is the
-/// executable to run: `git` from `PATH` in production. `cancel` is the
-/// shared flag SIGINT/SIGTERM set; polling it every [`WAIT_POLL_MS`]
-/// gives the operator a same-tick cancellation instead of waiting out
-/// the deadline. Its stdout is read through a
-/// [`GIT_HEAD_STDOUT_BYTES_MAX`] cap, so neither the probe's memory nor
-/// its deadline depends on how much the executable prints. The probe runs
-/// in its own process group, so the cleanup reaches the descendants of a
-/// `git` that is a wrapper script: a background process the wrapper leaves
-/// behind holds the inherited stdout pipe open and would survive a signal
-/// addressed to the wrapper's pid alone. The cleanup signals the probe's
-/// own pid as well as that group, because an executable is free to call
-/// `setpgid` and leave the group it was spawned into: the group signal
-/// then reaches a group the probe is no longer in, and the pid signal is
-/// what keeps the reap — and with it this function — bounded.
-pub fn head_sha(git: &Path, cancel: &AtomicBool) -> Result<String, String> {
-    let mut child = Command::new(git)
+/// to invoke, for [`check_provenance`]. The answer is
+/// bounded by [`GIT_HEAD_TIMEOUT_SECS`] on every path, startup included: a
+/// probe that has not started by then is given up on by [`start_probe`], and
+/// one that has not exited by then, or by the time `cancel` is set, is refused
+/// and sent SIGKILL, and the reap after that is bounded by
+/// [`GIT_HEAD_REAP_TIMEOUT_SECS`]; a probe that outlives both is reported with
+/// its pid and left to a reaper thread. A probe that finished starting as
+/// [`start_probe`] gave up is cleaned up there on the same terms
+/// ([`abandon_startup`]); only one still inside its own startup has no pid to
+/// report, so the returned error names that condition instead
+/// ([`abandoned_startup_error`]).
+/// `git` is the executable to run: `git` from `PATH` in production. `cancel`
+/// is the shared flag SIGINT/SIGTERM set; polling it every [`WAIT_POLL_MS`]
+/// gives the operator a same-tick cancellation instead of waiting out the
+/// deadline. Its stdout is read through a [`GIT_HEAD_STDOUT_BYTES_MAX`] cap,
+/// so neither the probe's memory nor its deadline depends on how much the
+/// executable prints. The probe runs in its own process group, so the cleanup
+/// reaches the descendants of a `git` that is a wrapper script: a background
+/// process the wrapper leaves behind holds the inherited stdout pipe open and
+/// would survive a signal addressed to the wrapper's pid alone.
+/// `signal` sends the two cleanup SIGKILLs ([`cleanup_probe`]): nix `kill` in
+/// production ([`head_sha`]); a test hands in a stand-in to drive a refused
+/// signal. It is cloned for [`start_probe`], which cleans up a probe that
+/// finished starting as it gave up ([`abandon_startup`]) and hands its thread
+/// the cleanup of one that starts later still.
+pub fn head_sha_with<K: FnMut(Pid, Signal) -> nix::Result<()> + Clone + Send + 'static>(
+    git: &Path,
+    cancel: &AtomicBool,
+    mut signal: K,
+) -> Result<String, String> {
+    let deadline = Instant::now() + Duration::from_secs(GIT_HEAD_TIMEOUT_SECS);
+    let mut command = Command::new(git);
+    command
         .args(["rev-parse", "--short", "HEAD"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
-        .process_group(GIT_HEAD_OWN_PROCESS_GROUP)
-        .spawn()
-        .map_err(|e| format!("git rev-parse: {e}"))?;
-    // The child leads the group it was spawned into, so its pid is the
-    // group id and the negated pid addresses the group.
-    let pid = i32::try_from(child.id()).ok().map(Pid::from_raw);
-    let group = pid.map(|pid| Pid::from_raw(-pid.as_raw()));
-    let deadline = Instant::now() + Duration::from_secs(GIT_HEAD_TIMEOUT_SECS);
+        .process_group(GIT_HEAD_OWN_PROCESS_GROUP);
+    let mut child = start_probe(command, deadline, cancel, signal.clone())?;
     let mut status: Option<WaitStatus> = None;
     let result = match child.stdout.take() {
         Some(stdout) => spawn_stdout_reader(
@@ -444,37 +460,241 @@ pub fn head_sha(git: &Path, cancel: &AtomicBool) -> Result<String, String> {
         .and_then(|lines| wait_for_head_sha(&mut child, &lines, deadline, cancel, &mut status)),
         None => Err("git rev-parse stdout not piped".to_string()),
     };
+    match (result, cleanup_probe(child, &mut signal)) {
+        (result, Ok(())) => result,
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(refusal), Err(cleanup)) => Err(format!("{refusal}; {cleanup}")),
+    }
+}
+
+/// Start the `git rev-parse` probe inside `deadline`, polling `cancel` every
+/// [`WAIT_POLL_MS`] while it starts. `Command::spawn` is synchronous and
+/// blocks until the child has execed or reported its exec error, so a `git`
+/// — or a `PATH` entry ahead of it — on a stalled filesystem would hold the
+/// recorded-run preflight with neither deadline nor cancellation in reach.
+/// Startup therefore runs on its own thread and this function waits only the
+/// time left. A rendezvous channel carries the probe, so a send that
+/// completes proves the probe was received here: a queued one this function
+/// never took would be dropped — neither killed nor reaped — when it
+/// returns. Every give-up therefore takes one last non-blocking receive
+/// ([`abandon_startup`]), because a `spawn` that finished while this function
+/// was descheduled leaves its probe in the channel's waiting send, and that
+/// probe has a pid this function can clean up itself. When startup finishes
+/// after the give-up instead, the starting thread still owns the probe and
+/// hands it to [`cleanup_probe`], which signals and reaps it exactly as the
+/// caller's own cleanup would, and reports on stderr what it can no longer
+/// return. That authority ends with this process: a startup that finishes
+/// after the CLI exits leaves an unsignalled probe to init, which
+/// [`abandoned_startup_error`] names in the returned error because no pid
+/// exists to name.
+fn start_probe<K: FnMut(Pid, Signal) -> nix::Result<()> + Clone + Send + 'static>(
+    mut command: Command,
+    deadline: Instant,
+    cancel: &AtomicBool,
+    mut signal: K,
+) -> Result<Child, String> {
+    let (started_tx, started_rx) = mpsc::sync_channel(0);
+    // The give-up path cleans up a probe the starting thread has already
+    // handed over, so it needs a signal of its own.
+    let mut give_up_signal = signal.clone();
+    let starter = std::thread::Builder::new()
+        .name(format!("bench-runner-{GIT_HEAD_LABEL}-starter"))
+        .spawn(move || {
+            let spawned = command.spawn().map_err(|e| format!("git rev-parse: {e}"));
+            if let Err(mpsc::SendError(Ok(child))) = started_tx.send(spawned) {
+                // The caller gave up and can no longer be returned to, so
+                // stderr is the only sink left for the surviving probe's pid
+                // and its refused signals (Q5: the exception is reported).
+                if let Err(e) = cleanup_probe(child, &mut signal) {
+                    eprintln!("{e}");
+                }
+            }
+        });
+    if let Err(e) = starter {
+        return Err(format!("git rev-parse starter thread: {e}"));
+    }
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(abandon_startup(
+                &started_rx,
+                "cancelled".to_string(),
+                &mut give_up_signal,
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(abandon_startup(
+                &started_rx,
+                format!("git rev-parse did not answer within {GIT_HEAD_TIMEOUT_SECS}s"),
+                &mut give_up_signal,
+            ));
+        }
+        match started_rx.recv_timeout(remaining.min(Duration::from_millis(WAIT_POLL_MS))) {
+            Ok(started) => return started,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("git rev-parse starter stopped".to_string());
+            }
+        }
+    }
+}
+
+/// Give up on [`start_probe`]'s startup with `refusal`, cleaning up a probe
+/// that did finish starting first.
+///
+/// The rendezvous send blocks until this side receives, so a `Command::spawn`
+/// that returned while the caller was descheduled — the deadline or `cancel`
+/// landing in that window — leaves a started, signalable probe waiting in the
+/// channel. Q5's exception is only for a probe the runner cannot signal, so
+/// this one is taken and given the same [`cleanup_probe`] the caller's own
+/// path gives it, and a cleanup failure follows the refusal in the same
+/// `refusal; cleanup` order [`head_sha_with`] uses. Nothing to receive means
+/// startup is still inside `spawn`: that is the reported exception, named in
+/// the error after the refusal ([`abandoned_startup_error`]). A received
+/// `spawn` failure and a starting
+/// thread that ended without sending both leave no probe to clean up, so the
+/// refusal stands alone.
+fn abandon_startup<K: FnMut(Pid, Signal) -> nix::Result<()>>(
+    started_rx: &mpsc::Receiver<Result<Child, String>>,
+    refusal: String,
+    signal: &mut K,
+) -> String {
+    match started_rx.try_recv() {
+        Ok(Ok(child)) => match cleanup_probe(child, signal) {
+            Ok(()) => refusal,
+            Err(cleanup) => format!("{refusal}; {cleanup}"),
+        },
+        Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => refusal,
+        Err(mpsc::TryRecvError::Empty) => abandoned_startup_error(refusal),
+    }
+}
+
+/// Name in the returned error the startup [`start_probe`] is giving up on,
+/// after `refusal` and in the same `refusal; context` order a cleanup
+/// failure uses ([`head_sha_with`]), so AC-15's `did not answer within` and
+/// AC-16's `cancelled` keep the front of the error the caller matches on.
+///
+/// `Command::spawn` has not returned, so there is no pid to name and nothing
+/// here can signal what it may already have forked. The starting thread
+/// cleans up whatever it receives, but only while this process lives: `main`
+/// exits right after this error, which ends that thread and leaves a probe
+/// that started late to init, unsignalled. That is Q5's exception reached
+/// through startup instead of through a refused SIGKILL — both probes are
+/// read-only `git`, and the operator is told rather than left to find it.
+///
+/// The condition travels in the error rather than through an `eprintln!` of
+/// its own: a write to stderr blocks for as long as a reader that stopped
+/// consuming a full pipe leaves it full, and panics when the write fails, so
+/// reporting it here would put an unbounded external write — and a panic —
+/// on the one path [`head_sha_with`] must return from within its deadline.
+/// Presentation is the caller's: `main` prints the error it is returned
+/// (`bench/src/main.rs`).
+fn abandoned_startup_error(refusal: String) -> String {
+    format!(
+        "{refusal}; git rev-parse gave up on a probe that had not finished \
+         starting; a probe that starts after this is signalled only while \
+         this process lives, and is otherwise left to init"
+    )
+}
+
+/// SIGKILL the probe's group and its own pid with `signal`, then reap it
+/// within [`GIT_HEAD_REAP_TIMEOUT_SECS`] ([`reap_probe`]). The child leads
+/// the group it was spawned into, so its pid is the group id and the negated
+/// pid addresses the group.
+fn cleanup_probe<K: FnMut(Pid, Signal) -> nix::Result<()>>(
+    child: Child,
+    signal: &mut K,
+) -> Result<(), String> {
+    let pid = i32::try_from(child.id()).ok().map(Pid::from_raw);
+    let group = pid.map(|pid| Pid::from_raw(-pid.as_raw()));
     // SIGKILL the whole group, so a `git` wrapper's background descendant
     // goes with the wrapper instead of outliving the probe with the
-    // inherited stdout pipe. Nothing above reaps the leader — the exit
+    // inherited stdout pipe. Nothing before this reaps the leader — the exit
     // check is [`probe_exit`], which leaves it a zombie — so the leader
     // still holds its pid here, and with it the id of the group it leads.
     // The signal therefore cannot reach anything but this probe's own
     // group, whether the leader is running or already exited.
+    let mut signal_failures = Vec::new();
     if let Some(group) = group {
-        let _ = kill(group, Signal::SIGKILL);
+        if let Err(e) = signal(group, Signal::SIGKILL) {
+            signal_failures.push(format!("group SIGKILL: {e}"));
+        }
     }
-    // And the probe's own pid, which is the signal the bound rests on. An
-    // executable is free to call `setpgid` and join another group: the
-    // group signal above then names a group without the probe in it — an
-    // empty group answers `ESRCH` — and a probe that hangs on would block
-    // the `child.wait()` below with no deadline. An unreaped child still
-    // owns its pid, so this signal can no more reach a stranger than the
-    // group signal can, and a probe that already exited is a zombie,
-    // which SIGKILL leaves for the wait to reap.
+    // And the probe's own pid: an executable is free to call `setpgid` and
+    // join another group, and the group signal above then names a group
+    // without the probe in it — an empty group answers `ESRCH`. An unreaped
+    // child still owns its pid, so this signal can no more reach a stranger
+    // than the group signal can, and a probe that already exited is a
+    // zombie, which SIGKILL leaves for the reap. Neither signal is sure to
+    // land: a probe that moved its real and saved UID away refuses both
+    // with `EPERM`, so [`reap_probe`] bounds the reap on its own.
     if let Some(pid) = pid {
-        let _ = kill(pid, Signal::SIGKILL);
+        if let Err(e) = signal(pid, Signal::SIGKILL) {
+            signal_failures.push(format!("pid SIGKILL: {e}"));
+        }
     }
-    // After the signals, never before: this is the reap that frees the
-    // leader's pid, and the group it names must already be gone.
-    let _ = child.wait();
-    result
+    // After the signals, never before: the reap frees the leader's pid, so
+    // no signal may follow it.
+    reap_probe(child, &signal_failures)
+}
+
+/// [`head_sha_with`] with nix `kill` as its cleanup signal: the provenance
+/// probe `bench run --profile recorded` runs before any record exists.
+pub fn head_sha(git: &Path, cancel: &AtomicBool) -> Result<String, String> {
+    head_sha_with(git, cancel, kill::<Signal>)
+}
+
+/// Reap [`head_sha_with`]'s probe after its cleanup signals, bounded by
+/// [`GIT_HEAD_REAP_TIMEOUT_SECS`]. The exit is read with [`probe_exit`], which
+/// leaves the probe a zombie, and only an exited probe is reaped here, so
+/// this `child.wait()` never blocks. A probe still running at the bound —
+/// one its signals could not reach — is handed with its one reap to a
+/// detached thread that collects it whenever it exits and never signals
+/// it; the error names the probe's pid, the bound and every signal in
+/// `signal_failures`. When the runner exits right after the error, the
+/// thread ends with it and init reaps the probe instead; if the thread cannot
+/// start, the probe stays unreaped until the runner exits and the error
+/// says so.
+fn reap_probe(mut child: Child, signal_failures: &[String]) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(GIT_HEAD_REAP_TIMEOUT_SECS);
+    let pid = child.id();
+    let failure = loop {
+        match probe_exit(&child) {
+            Ok(Some(_)) => {
+                let _ = child.wait();
+                return Ok(());
+            }
+            Ok(None) => {}
+            Err(e) => break format!("probe {pid} exit check failed: {e}"),
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break format!("probe {pid} still running {GIT_HEAD_REAP_TIMEOUT_SECS}s after SIGKILL");
+        }
+        sleep(remaining.min(Duration::from_millis(WAIT_POLL_MS)));
+    };
+    let mut error = format!("git rev-parse cleanup: {failure}");
+    for signal_failure in signal_failures {
+        error.push_str("; ");
+        error.push_str(signal_failure);
+    }
+    let reaper = std::thread::Builder::new()
+        .name(format!("bench-runner-{GIT_HEAD_LABEL}-reaper"))
+        .spawn(move || {
+            let _ = child.wait();
+        });
+    if let Err(e) = reaper {
+        let _ = write!(error, "; reaper thread: {e}");
+    }
+    Err(error)
 }
 
 /// Wait for the `git rev-parse` child to print one line, bounded by
 /// `deadline`, polling `cancel` every [`WAIT_POLL_MS`] steps and keeping
 /// the first `WaitStatus` from [`probe_exit`] without calling it again. The
-/// first non-empty, trimmed line the receiver reads is the SHA; EOF
+/// first non-blank line the receiver reads that ends in a newline, trimmed,
+/// is the SHA — a line without its newline is one the stdout cap cut, or the
+/// tail of a stream that ended mid-line, and is never an answer; EOF
 /// with no line is a failed probe; a printed line on a non-zero exit is
 /// overwritten by the exit error. The deadline is checked before the exit
 /// status and the line, so a probe that answers only past the bound is
@@ -535,7 +755,10 @@ fn wait_for_head_sha(
         }
         match lines.recv_timeout(poll) {
             Ok(StdoutLine::Line(line)) => {
-                if first.is_none() {
+                // Only a line that ends in a newline is whole: the capped reader
+                // reports EOF at GIT_HEAD_STDOUT_BYTES_MAX, so a line the cap cuts
+                // arrives without one and must not be answered as a SHA.
+                if first.is_none() && line.ends_with('\n') {
                     let trimmed = line.trim().to_string();
                     if !trimmed.is_empty() {
                         first = Some(trimmed);
@@ -2723,5 +2946,110 @@ fn harness_default_origin(constants: ProtocolConstants) -> u64 {
         target
     } else {
         (target / ONE_SECOND_NS + 1) * ONE_SECOND_NS
+    }
+}
+
+// The handoff `start_probe` cannot make atomic is only reachable from
+// inside the module: the probe is in a private channel and the window
+// between `Command::spawn` returning and the caller's receive is the
+// scheduler's to choose. These tests drive [`abandon_startup`] directly, so
+// the window is taken rather than waited for. Every other probe behaviour
+// is covered from `bench/tests/runner.rs`.
+#[cfg(test)]
+mod tests {
+    use super::{
+        abandon_startup, Child, Command, CommandExt, Pid, Signal, Stdio,
+        GIT_HEAD_OWN_PROCESS_GROUP,
+    };
+    use nix::errno::Errno;
+    use nix::sys::signal::kill;
+    use std::sync::mpsc;
+
+    /// Long enough that the fixture probe is certainly still running when
+    /// the give-up cleans it up.
+    const PROBE_SLEEP_SECS: u64 = 60;
+
+    #[test]
+    fn abandon_startup_cleans_up_a_probe_that_finished_starting() {
+        // `Command::spawn` returned and its rendezvous send is waiting while
+        // the caller is descheduled, and the deadline or `cancel` lands in
+        // that window. This probe has a pid, so the give-up must signal and
+        // reap it itself: Q5's exception covers only a probe the runner
+        // cannot signal, and the starting thread's own cleanup does not
+        // survive the CLI's exit.
+        let child = Command::new("sleep")
+            .arg(PROBE_SLEEP_SECS.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(GIT_HEAD_OWN_PROCESS_GROUP)
+            .spawn()
+            .expect("the fixture probe must start");
+        let pid = i32::try_from(child.id()).expect("the fixture pid must fit an i32");
+
+        // Capacity 1 stands in for the zero-capacity channel's waiting
+        // send: either way `try_recv` has a started probe to take.
+        let (started_tx, started_rx) = mpsc::sync_channel::<Result<Child, String>>(1);
+        started_tx.send(Ok(child)).expect("the fixture handoff");
+
+        let mut signalled = Vec::new();
+        let refusal = abandon_startup(
+            &started_rx,
+            "cancelled".to_string(),
+            &mut |target: Pid, signal: Signal| {
+                signalled.push((target, signal));
+                kill(target, signal)
+            },
+        );
+
+        assert_eq!(
+            refusal, "cancelled",
+            "a completed cleanup must leave the refusal exactly as AC-16 has it"
+        );
+        assert_eq!(
+            signalled,
+            vec![
+                (Pid::from_raw(-pid), Signal::SIGKILL),
+                (Pid::from_raw(pid), Signal::SIGKILL),
+            ],
+            "the give-up must SIGKILL the probe's group and then its own pid"
+        );
+        assert_eq!(
+            kill(Pid::from_raw(pid), None),
+            Err(Errno::ESRCH),
+            "the give-up must reap the probe it signalled"
+        );
+    }
+
+    #[test]
+    fn abandon_startup_names_a_startup_with_no_pid_in_the_refusal_it_returns() {
+        // A startup still inside `Command::spawn` has no probe to take and
+        // no pid to signal, so the condition travels in the returned error
+        // — never through a write to stderr of its own, which a full pipe
+        // would hold past the deadline this give-up exists to keep.
+        let (started_tx, started_rx) = mpsc::sync_channel::<Result<Child, String>>(1);
+        let mut signalled = 0_u32;
+        let refusal = abandon_startup(
+            &started_rx,
+            "cancelled".to_string(),
+            &mut |_: Pid, _: Signal| {
+                signalled += 1;
+                Ok(())
+            },
+        );
+        drop(started_tx);
+
+        assert!(
+            refusal.starts_with("cancelled"),
+            "AC-16's refusal must stay at the front of the error: {refusal}"
+        );
+        assert!(
+            refusal.contains("had not finished starting"),
+            "the error must name the startup it gave up on: {refusal}"
+        );
+        assert_eq!(
+            signalled, 0,
+            "a probe that has no pid yet must not be signalled"
+        );
     }
 }

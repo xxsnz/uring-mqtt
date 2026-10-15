@@ -421,6 +421,8 @@ Exit codes:
   `GIT_HEAD_TIMEOUT_SECS` (5 s)) or SIGINT/SIGTERM during the
   preflight.
 
+A dirty / mismatched build refusal with nothing to commit can come from the build itself: when a build-time `git` probe fails or gives up after 5 s, `cargo build` prints a `cargo:warning` and embeds `unknown`, and cargo keeps that value until one of the build script's `rerun-if-changed` inputs changes and `bench` is rebuilt — a new commit, a changed index or source tree, or `bench/build.rs` itself touched. A probe given up on while it was still starting — a stalled filesystem under `git` or under an earlier `PATH` entry — is left to init if its startup finishes after the build script or the CLI exits, so a stray read-only `git` can outlive the command that started it.
+
 The recorded profile runs only the full fixed matrix; `check_request`
 refuses `--servers`/`--workers`/`--qos` subsets.
 
