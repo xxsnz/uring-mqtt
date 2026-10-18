@@ -402,11 +402,25 @@ async fn worker_main(
                 }
                 match res {
                     Ok((stream, peer)) => {
+                        // The shipped worker drops a connection at its limit
+                        // too, and only logs it (`src/broker/worker.rs:539-546`).
+                        // The twin has no logger, so the first drop is kept as
+                        // accept-path evidence for `join`, worded apart from a
+                        // syscall failure.
                         if state.at_limit() {
+                            if accept_failure.is_none() {
+                                accept_failure = Some(format!(
+                                    "accept {peer}: connection limit {} reached",
+                                    state.limit
+                                ));
+                            }
                             drop(stream);
                             continue;
                         }
-                        if stream.set_nodelay(true).is_err() {
+                        if let Err(e) = stream.set_nodelay(true) {
+                            if accept_failure.is_none() {
+                                accept_failure = Some(format!("accept {peer}: set_nodelay: {e}"));
+                            }
                             drop(stream);
                             continue;
                         }
@@ -537,8 +551,10 @@ async fn worker_main(
     // An accept error and a session refusal, violation or non-routine error
     // never stop the twin — the shipped worker also keeps serving — but each
     // is server-side evidence that invalidates the run, so `join` reports it
-    // when nothing worse happened. The accept error wins: it means the worker
-    // stopped taking clients, while a session outcome concerns one client.
+    // when nothing worse happened. An accept-path cause wins — an accept
+    // error, or a client dropped at the connection limit or on a failed
+    // `set_nodelay` — because no session ever saw that client, while a
+    // session outcome concerns one client the session served.
     if failure.is_none() {
         failure = accept_failure.or(session_failure);
     }

@@ -515,29 +515,31 @@ async fn run_throughput_connection(task: ConnectionTask) -> Result<(), String> {
                 task.counters.add_connect_errors(1);
                 return Ok(());
             }
-            Err(OpenError::Protocol) => {
+            Err(OpenError::Protocol(reason)) => {
                 task.counters.add_connect_errors(1);
                 task.counters.add_protocol_errors(1);
+                // The counters say a CONNACK invalidated the run; only this
+                // line says which reply did it.
+                eprintln!("gen: connection {}: {reason}", task.conn_id);
                 return Ok(());
             }
         };
 
     match task.config.qos {
-        0 => {
-            run_qos0_throughput(read_half, write_half, task, deadline_instant).await;
-        }
-        _ => {
-            run_qos1_throughput(read_half, write_half, task, deadline_instant).await;
-        }
+        0 => run_qos0_throughput(read_half, write_half, task, deadline_instant).await,
+        _ => run_qos1_throughput(read_half, write_half, task, deadline_instant).await,
     }
-    Ok(())
 }
 
 /// Wait for CONNACK and split the stream into a framed reader + write half.
 /// `deadline_instant` is the wall-clock equivalent of `window.end_ns + drain_grace`.
 enum OpenError {
     Connect,
-    Protocol,
+    /// Why the reply is not a valid CONNACK for this CONNECT. Every reason
+    /// is built from a fixed set of short texts — the codec's non-`Io`
+    /// `DecodeError`s and `ConnectAckReason` both print a constant — so the
+    /// diagnostic a caller prints stays bounded.
+    Protocol(String),
 }
 
 async fn open_session(
@@ -573,14 +575,36 @@ async fn open_session(
     .await
     {
         Ok(Some(Ok((Packet::ConnectAck(ack), _)))) => ack,
-        Ok(Some(Ok(_))) => return Err(OpenError::Protocol),
+        Ok(Some(Ok(_))) => {
+            return Err(OpenError::Protocol(
+                "first packet was not a CONNACK".to_string(),
+            ))
+        }
+        // A frame the codec rejects — reserved flag bits, a return code
+        // MQTT 3.1.1 does not define — is the broker's malformed reply,
+        // counted like every other malformed frame; a read failure is
+        // the transport's (`qos1_reader_task` splits the same way).
+        Ok(Some(Err(e))) if !matches!(e, DecodeError::Io(_)) => {
+            return Err(OpenError::Protocol(format!("CONNACK decode failed: {e}")))
+        }
         _ => return Err(OpenError::Connect),
     };
     if !matches!(
         connack.return_code,
         rmqtt_codec::v3::ConnectAckReason::ConnectionAccepted
     ) {
-        return Err(OpenError::Protocol);
+        return Err(OpenError::Protocol(format!(
+            "CONNACK refused the session: {:?}",
+            connack.return_code
+        )));
+    }
+    // `wire::encode_connect` always sets CleanSession, so
+    // [MQTT-3.2.2-1] requires Session Present 0; a broker claiming a
+    // stored session is not answering this CONNECT.
+    if connack.session_present {
+        return Err(OpenError::Protocol(
+            "CONNACK claimed Session Present for a CleanSession CONNECT".to_string(),
+        ));
     }
     let now = monotonic_now_ns();
     let hard_deadline_ns = config
@@ -596,12 +620,25 @@ async fn open_session(
     Ok((read_half, write_half, deadline_instant))
 }
 
+/// The cause a throughput publish write reports when it did not
+/// complete, worded as `latency_send_batch` words it; `None` when the
+/// write completed.
+fn publish_write_failure(
+    result: Result<std::io::Result<()>, tokio::time::error::Elapsed>,
+) -> Option<String> {
+    match result {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => Some(format!("publish write failed: {e}")),
+        Err(_) => Some("publish write did not finish by the hard deadline".to_string()),
+    }
+}
+
 async fn run_qos0_throughput(
     read_half: OwnedReadHalf,
     mut write_half: OwnedWriteHalf,
     task: ConnectionTask,
     deadline_instant: tokio::time::Instant,
-) {
+) -> Result<(), String> {
     let counters = Arc::clone(&task.counters);
     let conn_id = task.conn_id;
     let reader_handle = tokio::spawn(async move {
@@ -642,14 +679,26 @@ async fn run_qos0_throughput(
             let payload = stamp.encode();
             wire::encode_publish(&mut write_buf, 0, None, &payload);
         }
-        if !matches!(
-            tokio::time::timeout_at(deadline_instant, write_half.write_all(&write_buf)).await,
-            Ok(Ok(()))
-        ) {
-            task.counters.add_stalled(1);
-            return;
+        let batch_len = u64::try_from(BATCH).expect("BATCH fits in u64");
+        // A batch is offered once its write begins: publishes of a
+        // partly written batch can be delivered, so counting only
+        // completed writes would let `delivered` exceed `offered`.
+        task.counters.add_offered(batch_len);
+        let write_result =
+            tokio::time::timeout_at(deadline_instant, write_half.write_all(&write_buf)).await;
+        if let Some(cause) = publish_write_failure(write_result) {
+            // QoS 0 has no acknowledgement to resolve a publish by, so
+            // every publish of a batch whose write did not complete is
+            // unresolved.
+            task.counters.add_stalled(batch_len);
+            // Stop the reader before the connection ends: a dropped
+            // handle only detaches it, and a detached reader keeps the
+            // socket and can still count a protocol error after the
+            // report is built.
+            reader_handle.abort();
+            let _ = reader_handle.await;
+            return Err(cause);
         }
-        task.counters.add_offered(u64::try_from(BATCH).expect("BATCH fits in u64"));
     }
     let _ = tokio::time::timeout(
         Duration::from_secs(IO_TIMEOUT_SECS),
@@ -658,6 +707,7 @@ async fn run_qos0_throughput(
     .await;
     let _ = write_half.shutdown().await;
     let _ = reader_handle.await;
+    Ok(())
 }
 
 async fn run_qos1_throughput(
@@ -665,7 +715,7 @@ async fn run_qos1_throughput(
     mut write_half: OwnedWriteHalf,
     task: ConnectionTask,
     deadline_instant: tokio::time::Instant,
-) {
+) -> Result<(), String> {
     let semaphore = Arc::new(Semaphore::new(
         usize::try_from(task.config.qos1_window).expect("qos1_window fits in usize"),
     ));
@@ -690,6 +740,7 @@ async fn run_qos1_throughput(
                 .saturating_sub(monotonic_now_ns())
                 .max(1),
         );
+    let mut write_failure: Option<String> = None;
     while monotonic_now_ns() < task.config.window.end_ns {
         let Ok(Ok(permit)) = tokio::time::timeout_at(
             window_end_instant,
@@ -710,53 +761,95 @@ async fn run_qos1_throughput(
             drop(permits);
             continue;
         };
+        let batch_len = u64::try_from(alloc_ids.len()).expect("batch size fits in u64");
+        // Submitted before the write: the reader decrements `in_flight`
+        // and adds a permit per accepted PUBACK, and a PUBACK for this
+        // batch's first PUBLISH can arrive before `write_all` returns.
+        task.counters.add_offered(batch_len);
+        in_flight.fetch_add(batch_len, Ordering::Relaxed);
+        for permit in permits {
+            permit.forget();
+        }
         let write_result =
             tokio::time::timeout_at(deadline_instant, write_half.write_all(&write_buf[..payload_len]))
                 .await;
-        match write_result {
-            Ok(Ok(())) => {
-                task.counters
-                    .add_offered(u64::try_from(alloc_ids.len()).expect("batch size fits in u64"));
-                in_flight.fetch_add(alloc_ids.len() as u64, Ordering::Relaxed);
-                for permit in permits {
-                    permit.forget();
-                }
-            }
-            _ => {
-                task.counters.add_stalled(1);
-                return;
-            }
+        if let Some(cause) = publish_write_failure(write_result) {
+            // The batch stays in flight: a PUBACK for a PUBLISH that was
+            // written still resolves its id, and the drain counts the
+            // rest as `stalled`.
+            write_failure = Some(cause);
+            break;
         }
     }
-    qos1_drain_and_disconnect(&mut write_half, &in_flight, deadline_instant, &task.counters).await;
-    let _ = reader_handle.await;
+    qos1_drain_and_disconnect(
+        &mut write_half,
+        &in_flight,
+        deadline_instant,
+        &task.counters,
+        reader_handle,
+        write_failure.is_some(),
+    )
+    .await;
+    write_failure.map_or(Ok(()), Err)
 }
 
-/// Drain every in-flight packet id, write DISCONNECT, and shut the writer
-/// half down. Stalled ids at the deadline count in `stalled`.
+/// Drain every in-flight packet id up to the deadline, then write
+/// DISCONNECT unless a publish write failed (a partial PUBLISH may be on
+/// the wire), shut the writer half down and end the reader. Ids still in
+/// flight at the deadline count in `stalled`, read only after the reader
+/// has stopped, so no PUBACK is counted both `acked` and `stalled`.
 async fn qos1_drain_and_disconnect(
     write_half: &mut OwnedWriteHalf,
     in_flight: &AtomicU64,
     deadline_instant: tokio::time::Instant,
     counters: &Counters,
+    reader_handle: tokio::task::JoinHandle<()>,
+    write_failed: bool,
 ) {
     let drain_fut = async {
         while in_flight.load(Ordering::Relaxed) > 0 {
             tokio::task::yield_now().await;
         }
     };
-    if tokio::time::timeout_at(deadline_instant, drain_fut).await.is_err() {
+    let drained = tokio::time::timeout_at(deadline_instant, drain_fut).await.is_ok();
+    let mut reader_handle = Some(reader_handle);
+    if !drained || write_failed {
+        // Stop the reader before reading what is left: a PUBACK it
+        // counted after that read would be both `acked` and `stalled`.
+        // The aborted handle resolves once the reader is no longer
+        // running — at most the end of the poll it is in.
+        if let Some(handle) = reader_handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
         let leaked = in_flight.load(Ordering::Relaxed);
         if leaked > 0 {
             counters.add_stalled(leaked);
         }
     }
-    let _ = tokio::time::timeout(
-        Duration::from_secs(IO_TIMEOUT_SECS),
-        write_half.write_all(&wire::DISCONNECT),
-    )
-    .await;
+    // Bounded by the hard deadline, not `IO_TIMEOUT_SECS` after it: the
+    // time AC-24 allows past the deadline belongs to `run_generator`'s
+    // backstop, which counts an unfinished connection `stalled`, so
+    // spending it here would count leftovers twice (`latency_teardown`
+    // bounds its DISCONNECT the same way).
+    if !write_failed {
+        let _ =
+            tokio::time::timeout_at(deadline_instant, write_half.write_all(&wire::DISCONNECT))
+                .await;
+    }
     let _ = write_half.shutdown().await;
+    if let Some(mut handle) = reader_handle {
+        // A peer that keeps its socket open after DISCONNECT never sends
+        // the EOF the reader waits for, so an unbounded join would
+        // outlast the deadline and leave the backstop to count the whole
+        // connection `stalled`. The reader can still count a protocol
+        // error, so the aborted handle is awaited before the report is
+        // built (as in `latency_teardown`).
+        if tokio::time::timeout_at(deadline_instant, &mut handle).await.is_err() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
 }
 
 /// Reader task: pull PUBACKs, release packet ids, retry the semaphore. Other
@@ -884,6 +977,10 @@ fn ends_the_connection(kind: std::io::ErrorKind) -> bool {
 }
 
 async fn run_connections_mode(task: ConnectionTask) -> Result<(), String> {
+    // One CONNACK diagnostic per task, not per cycle: a broker that answers
+    // every cycle the same way would otherwise print one line per connection
+    // it accepts, and this mode opens thousands of them.
+    let mut connack_reported = false;
     while monotonic_now_ns() < task.config.window.end_ns {
         let cycle_client = format!("bench-c{}", task.conn_id);
         let Ok(Ok(mut stream)) = tokio::time::timeout(
@@ -932,9 +1029,20 @@ async fn run_connections_mode(task: ConnectionTask) -> Result<(), String> {
         // inside the window and completes after `window.end_ns` is not a
         // connection the broker accepted inside the window.
         let connack_at = monotonic_now_ns();
-        if buf[0] != 0x20 || buf[1] != 0x02 || buf[3] != 0x00 {
+        // buf[2] is the acknowledge-flags byte: reserved bits must be 0, and Session Present must be 0 for the CleanSession CONNECT this cycle sent ([MQTT-3.2.2-1]).
+        if buf[0] != 0x20 || buf[1] != 0x02 || buf[2] != 0x00 || buf[3] != 0x00 {
             drop(stream);
             task.counters.add_protocol_errors(1);
+            // `protocol_errors` says a CONNACK invalidated the run; only
+            // this line says which reply did it (`open_session` carries the
+            // same detail on the other modes' paths).
+            if !connack_reported {
+                connack_reported = true;
+                eprintln!(
+                    "gen: connection {}: CONNACK was not 20 02 00 00: {:02x?}",
+                    task.conn_id, buf
+                );
+            }
             continue;
         }
         if task.config.window.contains(connack_at) {
@@ -1087,6 +1195,7 @@ async fn run_latency_connection(task: ConnectionTask) -> Result<(), String> {
         &in_flight,
         reader_handle,
         &mut write_half,
+        pacer_result.is_err(),
     )
     .await;
 
@@ -1117,9 +1226,12 @@ async fn latency_open_session(
             counters.add_connect_errors(1);
             return Ok(None);
         }
-        Err(OpenError::Protocol) => {
+        Err(OpenError::Protocol(reason)) => {
             counters.add_connect_errors(1);
             counters.add_protocol_errors(1);
+            // The counters say a CONNACK invalidated the run; only this
+            // line says which reply did it.
+            eprintln!("gen: connection {conn_id}: {reason}");
             return Ok(None);
         }
     };
@@ -1209,7 +1321,6 @@ async fn latency_pacer(state: PacerState<'_>, write_half: &mut OwnedWriteHalf) -
             write_half,
             deadline_instant,
             in_flight,
-            packet_ids,
             batch: &batch,
             write_buf: &write_buf,
         })
@@ -1235,7 +1346,7 @@ async fn latency_pacer(state: PacerState<'_>, write_half: &mut OwnedWriteHalf) -
                 // thousands of synchronous stderr writes at an accepted high
                 // rate, and a block inside `eprintln!` if nothing drains
                 // stderr would hold this task past the hard deadline (AC-24).
-                // The batch is already counted `stalled`; the slots it never
+                // The batch is already counted `offered`; the slots it never
                 // reached are counted arithmetically, and the cause travels
                 // out through `run_connection`'s per-connection diagnostic.
                 count_remaining_missed(counters, conn_id, next_slot_k, config, rate);
@@ -1255,7 +1366,6 @@ struct SendBatchInputs<'a> {
     write_half: &'a mut OwnedWriteHalf,
     deadline_instant: tokio::time::Instant,
     in_flight: &'a Arc<AtomicU64>,
-    packet_ids: &'a Arc<std::sync::Mutex<PacketIds>>,
     batch: &'a [(Option<NonZeroU16>, u64)],
     write_buf: &'a [u8],
 }
@@ -1371,14 +1481,15 @@ enum SendOutcome {
     /// went out and the batch still holds its QoS 1 packet ids.
     WindowEnded,
     /// The write failed or did not finish by the hard deadline. The batch is
-    /// already counted `stalled` and its ids are released, but the socket is
-    /// unusable, so the caller must stop pacing. Carries the cause.
+    /// already counted `offered` — its QoS 1 ids stay in flight for the
+    /// teardown drain, a QoS 0 batch is counted `stalled` — but the socket
+    /// is unusable, so the caller must stop pacing. Carries the cause.
     Failed(String),
 }
 
-/// Gate the window end, then perform one `write_all` of the already encoded
-/// `write_buf` under the deadline, and update the counters (`offered`,
-/// `lateness`, `lateness_over_range`, `in_flight`, `stalled`).
+/// Gate the window end, count the batch as offered (and, for QoS 1, in flight), then perform one
+/// `write_all` of the already encoded `write_buf` under the deadline, and update the counters (`lateness`,
+/// `lateness_over_range`, and `stalled` for a failed QoS 0 batch).
 async fn latency_send_batch(inputs: SendBatchInputs<'_>) -> SendOutcome {
     let SendBatchInputs {
         counters,
@@ -1387,7 +1498,6 @@ async fn latency_send_batch(inputs: SendBatchInputs<'_>) -> SendOutcome {
         write_half,
         deadline_instant,
         in_flight,
-        packet_ids,
         batch,
         write_buf,
     } = inputs;
@@ -1405,6 +1515,13 @@ async fn latency_send_batch(inputs: SendBatchInputs<'_>) -> SendOutcome {
             return None;
         }
         counters.update_last_write_start(start);
+        // Submitted once the gate passes, before the write: a PUBACK for
+        // this batch's first PUBLISH can arrive before `write_all`
+        // returns, and a partly written batch can be delivered.
+        counters.add_offered(sent);
+        if config.qos == 1 {
+            in_flight.fetch_add(sent, Ordering::Relaxed);
+        }
         Some(write_half.write_all(write_buf).await)
     };
     let write_result = tokio::time::timeout_at(deadline_instant, gated_write).await;
@@ -1412,9 +1529,6 @@ async fn latency_send_batch(inputs: SendBatchInputs<'_>) -> SendOutcome {
         Ok(None) => SendOutcome::WindowEnded,
         Ok(Some(Ok(()))) => {
             let send_ns = monotonic_now_ns();
-            if config.qos == 1 {
-                in_flight.fetch_add(sent, Ordering::Relaxed);
-            }
             for (_, due) in batch {
                 if *due >= config.window.start_ns && *due < config.window.end_ns {
                     let value = send_ns.saturating_sub(*due);
@@ -1425,17 +1539,24 @@ async fn latency_send_batch(inputs: SendBatchInputs<'_>) -> SendOutcome {
                     }
                 }
             }
-            counters.add_offered(sent);
             SendOutcome::Sent
         }
         Ok(Some(Err(e))) => {
-            latency_release_batch_ids(config, packet_ids, batch);
-            counters.add_stalled(sent);
+            // QoS 1 ids stay in flight for `latency_teardown`'s drain to
+            // resolve; QoS 0 has no acknowledgement, so the batch is
+            // unresolved.
+            if config.qos != 1 {
+                counters.add_stalled(sent);
+            }
             SendOutcome::Failed(format!("publish write failed: {e}"))
         }
         Err(_) => {
-            latency_release_batch_ids(config, packet_ids, batch);
-            counters.add_stalled(sent);
+            // QoS 1 ids stay in flight for `latency_teardown`'s drain to
+            // resolve; QoS 0 has no acknowledgement, so the batch is
+            // unresolved.
+            if config.qos != 1 {
+                counters.add_stalled(sent);
+            }
             SendOutcome::Failed(
                 "publish write did not finish by the hard deadline".to_string(),
             )
@@ -1443,15 +1564,15 @@ async fn latency_send_batch(inputs: SendBatchInputs<'_>) -> SendOutcome {
     }
 }
 
-/// Drain in-flight QoS 1 ids up to the deadline, write DISCONNECT, shut the
-/// writer down, and rejoin the reader task (QoS 1 only).
+/// Drain in-flight QoS 1 ids up to the deadline (stopping the reader before the leftovers are counted), write DISCONNECT unless a publish write failed (a partial PUBLISH may be on the wire), shut the writer down, and rejoin the reader task (QoS 1 only).
 async fn latency_teardown(
     config: &GenConfig,
     counters: &Arc<Counters>,
     deadline_instant: tokio::time::Instant,
     in_flight: &Arc<AtomicU64>,
-    reader_handle: Option<tokio::task::JoinHandle<()>>,
+    mut reader_handle: Option<tokio::task::JoinHandle<()>>,
     write_half: &mut OwnedWriteHalf,
+    write_failed: bool,
 ) {
     if config.qos == 1 {
         let drain_fut = async {
@@ -1460,6 +1581,14 @@ async fn latency_teardown(
             }
         };
         if tokio::time::timeout_at(deadline_instant, drain_fut).await.is_err() {
+            // Stop the reader before reading what is left: a PUBACK it
+            // counted after that read would be both `acked` and
+            // `stalled`. The aborted handle resolves once the reader is
+            // no longer running — at most the end of the poll it is in.
+            if let Some(handle) = reader_handle.take() {
+                handle.abort();
+                let _ = handle.await;
+            }
             let leaked = in_flight.load(Ordering::Relaxed);
             if leaked > 0 {
                 counters.add_stalled(leaked);
@@ -1472,8 +1601,10 @@ async fn latency_teardown(
     // backstop, which counts an abandoned task as `stalled`. Spending it here
     // instead would race that backstop and double-count slots the pacer has
     // already accounted for.
-    let _ =
-        tokio::time::timeout_at(deadline_instant, write_half.write_all(&wire::DISCONNECT)).await;
+    if !write_failed {
+        let _ = tokio::time::timeout_at(deadline_instant, write_half.write_all(&wire::DISCONNECT))
+            .await;
+    }
     let _ = write_half.shutdown().await;
     if let Some(mut handle) = reader_handle {
         // A peer that holds its socket open while withholding PUBACK never
@@ -1607,6 +1738,254 @@ async fn qos1_latency_reader(
     if outstanding > 0 {
         eprintln!(
             "gen: connection {conn_id}: QoS 1 reader saw EOF with {outstanding} ids outstanding"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        latency_teardown, qos1_drain_and_disconnect, qos1_latency_reader, qos1_reader_task, wire,
+        Counters, GenConfig, Mode, PacketIds, Window,
+    };
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::Semaphore;
+
+    /// Deadline handed to the teardown under test — long enough that the
+    /// clean path never meets it.
+    const TEARDOWN_DEADLINE: Duration = Duration::from_secs(2);
+    /// Ids left in flight for the leftover tests: a batch the peer never
+    /// acknowledged.
+    const LEFTOVER_IDS: u64 = 3;
+    /// Deadline handed to a teardown whose drain cannot finish — short
+    /// enough to meet inside a test, far longer than one scheduler poll.
+    const LEFTOVER_DEADLINE: Duration = Duration::from_millis(200);
+    /// How long the leftover tests hold their peer's PUBACKs back — past
+    /// `LEFTOVER_DEADLINE`, so the drain meets the deadline with every id
+    /// still in flight and the teardown has already returned.
+    const PUBACK_DELAY: Duration = Duration::from_millis(400);
+    /// Time the leftover tests give a reader that was never stopped to count
+    /// after the teardown returned — long enough to cover `PUBACK_DELAY` and
+    /// the polls that follow it.
+    const ABORT_GRACE: Duration = Duration::from_millis(400);
+
+    async fn connected_pair() -> (
+        tokio::net::tcp::OwnedReadHalf,
+        tokio::net::tcp::OwnedWriteHalf,
+        TcpStream,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let client = TcpStream::connect(addr).await.expect("connect");
+        let (peer, _) = listener.accept().await.expect("accept");
+        let (read_half, write_half) = client.into_split();
+        (read_half, write_half, peer)
+    }
+
+    async fn peer_bytes(mut peer: TcpStream) -> Vec<u8> {
+        let mut buf = Vec::new();
+        tokio::time::timeout(TEARDOWN_DEADLINE * 2, peer.read_to_end(&mut buf))
+            .await
+            .expect("peer bytes must arrive in time")
+            .expect("peer read must succeed");
+        buf
+    }
+
+    #[tokio::test]
+    async fn qos1_drain_writes_disconnect_only_when_no_write_failed() {
+        for write_failed in [false, true] {
+            let (read_half, mut write_half, peer) = connected_pair().await;
+            let in_flight = AtomicU64::new(0);
+            let counters = Counters::new(1, Mode::Throughput);
+            let reader_handle = tokio::spawn(async {});
+            qos1_drain_and_disconnect(
+                &mut write_half,
+                &in_flight,
+                tokio::time::Instant::now() + TEARDOWN_DEADLINE,
+                &counters,
+                reader_handle,
+                write_failed,
+            )
+            .await;
+            drop(write_half);
+            drop(read_half);
+            let bytes = peer_bytes(peer).await;
+            if write_failed {
+                assert!(
+                    bytes.is_empty(),
+                    "no DISCONNECT must follow a failed write, got {bytes:?}"
+                );
+            } else {
+                assert_eq!(
+                    bytes,
+                    wire::DISCONNECT.to_vec(),
+                    "DISCONNECT must follow a clean drain"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn latency_teardown_writes_disconnect_only_when_no_write_failed() {
+        for write_failed in [false, true] {
+            let (_read_half, mut write_half, peer) = connected_pair().await;
+            let config = GenConfig {
+                addr: "127.0.0.1:1".parse().expect("parse addr"),
+                mode: Mode::Latency { rate: 1 },
+                qos: 0,
+                connections: 1,
+                qos1_window: 1,
+                origin_ns: 0,
+                window: Window {
+                    start_ns: 0,
+                    end_ns: 0,
+                },
+                drain_grace: Duration::ZERO,
+            };
+            let counters = Arc::new(Counters::new(1, config.mode));
+            let in_flight = Arc::new(AtomicU64::new(0));
+            latency_teardown(
+                &config,
+                &counters,
+                tokio::time::Instant::now() + TEARDOWN_DEADLINE,
+                &in_flight,
+                None,
+                &mut write_half,
+                write_failed,
+            )
+            .await;
+            drop(write_half);
+            let bytes = peer_bytes(peer).await;
+            if write_failed {
+                assert!(
+                    bytes.is_empty(),
+                    "no DISCONNECT must follow a failed write, got {bytes:?}"
+                );
+            } else {
+                assert_eq!(
+                    bytes,
+                    wire::DISCONNECT.to_vec(),
+                    "DISCONNECT must follow a clean teardown"
+                );
+            }
+        }
+    }
+
+    /// Allocate the ids a teardown's drain finds still in flight, and hand
+    /// the peer a task that writes one PUBACK per id only after the drain
+    /// deadline has passed. A teardown that detaches the production reader
+    /// instead of aborting and awaiting it counts those PUBACKs after the
+    /// report is built, which these tests make visible.
+    fn leftover_ids_acked_late(mut peer: TcpStream) -> Arc<std::sync::Mutex<PacketIds>> {
+        let mut ids = PacketIds::new();
+        let mut pubacks = Vec::new();
+        for _ in 0..LEFTOVER_IDS {
+            let id = ids.allocate().expect("packet id available").get();
+            pubacks.extend_from_slice(&[0x40, 0x02, (id >> 8) as u8, (id & 0xFF) as u8]);
+        }
+        tokio::spawn(async move {
+            tokio::time::sleep(PUBACK_DELAY).await;
+            // A teardown that stopped its reader has already dropped the
+            // read half, so this write can draw a reset; the test's
+            // assertion is what the reader did, not what the peer wrote.
+            let _ = peer.write_all(&pubacks).await;
+        });
+        Arc::new(std::sync::Mutex::new(ids))
+    }
+
+    #[tokio::test]
+    async fn qos1_drain_counts_the_leftovers_as_stalled_and_leaves_no_reader_running() {
+        let (read_half, mut write_half, peer) = connected_pair().await;
+        let in_flight = Arc::new(AtomicU64::new(LEFTOVER_IDS));
+        let counters = Arc::new(Counters::new(1, Mode::Throughput));
+        let packet_ids = leftover_ids_acked_late(peer);
+        let semaphore = Arc::new(Semaphore::new(0));
+        let reader_handle = tokio::spawn(qos1_reader_task(
+            0,
+            read_half,
+            Arc::clone(&counters),
+            Arc::clone(&semaphore),
+            Arc::clone(&packet_ids),
+            Arc::clone(&in_flight),
+        ));
+
+        qos1_drain_and_disconnect(
+            &mut write_half,
+            &in_flight,
+            tokio::time::Instant::now() + LEFTOVER_DEADLINE,
+            &counters,
+            reader_handle,
+            false,
+        )
+        .await;
+
+        assert_eq!(
+            counters.stalled.load(Ordering::Relaxed),
+            LEFTOVER_IDS,
+            "every id still in flight at the deadline counts once in stalled"
+        );
+        let acked_when_counted = counters.acked.load(Ordering::Relaxed);
+        tokio::time::sleep(ABORT_GRACE).await;
+        assert_eq!(
+            counters.acked.load(Ordering::Relaxed),
+            acked_when_counted,
+            "the teardown must leave no reader running: a detached reader keeps counting PUBACKs after the report is built"
+        );
+    }
+
+    #[tokio::test]
+    async fn latency_teardown_counts_the_leftovers_as_stalled_and_leaves_no_reader_running() {
+        let (read_half, mut write_half, peer) = connected_pair().await;
+        let config = GenConfig {
+            addr: "127.0.0.1:1".parse().expect("parse addr"),
+            mode: Mode::Latency { rate: 1 },
+            qos: 1,
+            connections: 1,
+            qos1_window: 1,
+            origin_ns: 0,
+            window: Window {
+                start_ns: 0,
+                end_ns: 0,
+            },
+            drain_grace: Duration::ZERO,
+        };
+        let counters = Arc::new(Counters::new(1, config.mode));
+        let in_flight = Arc::new(AtomicU64::new(LEFTOVER_IDS));
+        let packet_ids = leftover_ids_acked_late(peer);
+        let reader_handle = tokio::spawn(qos1_latency_reader(
+            0,
+            read_half,
+            Arc::clone(&counters),
+            Arc::clone(&packet_ids),
+            Arc::clone(&in_flight),
+        ));
+
+        latency_teardown(
+            &config,
+            &counters,
+            tokio::time::Instant::now() + LEFTOVER_DEADLINE,
+            &in_flight,
+            Some(reader_handle),
+            &mut write_half,
+            false,
+        )
+        .await;
+
+        assert_eq!(
+            counters.stalled.load(Ordering::Relaxed),
+            LEFTOVER_IDS,
+            "every id still in flight at the deadline counts once in stalled"
+        );
+        let acked_when_counted = counters.acked.load(Ordering::Relaxed);
+        tokio::time::sleep(ABORT_GRACE).await;
+        assert_eq!(
+            counters.acked.load(Ordering::Relaxed),
+            acked_when_counted,
+            "the teardown must leave no reader running: a detached reader keeps counting PUBACKs after the report is built"
         );
     }
 }

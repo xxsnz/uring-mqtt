@@ -222,6 +222,13 @@ async fn connect_and_subscribe(
             ack.return_code.reason()
         ));
     }
+    // `wire::encode_connect` sets CleanSession, so [MQTT-3.2.2-1]
+    // requires Session Present 0; a broker claiming a stored session
+    // is not answering this CONNECT, and no subscription built on it
+    // may lead to READY (AC-18).
+    if ack.session_present {
+        return Err("CONNACK claims a stored session on a clean-session CONNECT".to_string());
+    }
 
     let packet_id = NonZeroU16::new(SUBSCRIBE_PACKET_ID).expect("non-zero");
     write_with_timeout(

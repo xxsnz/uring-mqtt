@@ -733,6 +733,72 @@ fn twin_join_reports_a_refused_connect() {
     result.expect("join must report a refused connect");
 }
 
+/// AC-17 — with `max_connections_per_worker(1)`, a second accepted
+/// connection is dropped at the worker's connection limit, and `join`
+/// reports the cause by name.
+#[test]
+fn twin_join_reports_a_connection_dropped_at_its_connection_limit() {
+    let _exclusive = twin_exclusive();
+    let (tx, rx) = mpsc::channel::<Result<(), String>>();
+    std::thread::Builder::new()
+        .name("twin-limit-join".into())
+        .spawn(move || {
+            let outcome = (|| -> Result<(), String> {
+                let port = bench::free_port();
+                let config = BrokerConfig::new(format!("127.0.0.1:{port}"))
+                    .num_workers(1)
+                    .max_connections_per_worker(1);
+                let (callback, _sink) = collecting_callback();
+                let handle = twin::start(config, callback)?;
+
+                let mut client_a =
+                    connect_v3(loopback_addr(port)).map_err(|e| format!("connect a: {e}"))?;
+                let mut client_b =
+                    connect_raw(loopback_addr(port)).map_err(|e| format!("connect b: {e}"))?;
+
+                let mut buf = [0u8; 1];
+                match client_b.read(&mut buf) {
+                    Ok(0) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+                    Ok(n) => {
+                        return Err(format!(
+                            "expected client b dropped without CONNACK, read {n} byte(s)"
+                        ))
+                    }
+                    Err(e) => return Err(format!("unexpected read error on client b: {e}")),
+                }
+
+                client_a
+                    .write_all(&DISCONNECT)
+                    .map_err(|e| format!("write disconnect: {e}"))?;
+                loop {
+                    match client_a.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(_) => continue,
+                        Err(e) => return Err(format!("read until EOF: {e}")),
+                    }
+                }
+
+                handle.shutdown_handle().shutdown();
+                match handle.join() {
+                    Err(e) if e.contains("connection limit 1 reached") => Ok(()),
+                    Err(e) => Err(format!("unexpected worker error: {e}")),
+                    Ok(dropped) => Err(format!(
+                        "expected join to report the limit drop, got Ok({dropped})"
+                    )),
+                }
+            })();
+            let _ = tx.send(outcome);
+        })
+        .expect("spawn harness");
+
+    let bound = SESSION_ERROR_JOIN_BOUND + HARNESS_TIMEOUT;
+    let Ok(result) = rx.recv_timeout(bound) else {
+        panic!("harness did not report within {bound:?}")
+    };
+    result.expect("join must report the connection dropped at its connection limit");
+}
+
 /// AC-14 — `TokioTimer::timeout` races a future against a deadline: `Err`
 /// for one still pending, `Ok` for one that finishes first.
 #[test]

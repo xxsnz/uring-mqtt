@@ -169,6 +169,8 @@ fn read_json(report: &std::path::Path) -> String {
 
 /// MQTT v3 CONNACK carrying "connection accepted" (return code 0).
 const CONNACK_OK: [u8; 4] = [0x20, 0x02, 0x00, 0x00];
+/// MQTT v3 CONNACK carrying "connection accepted" with Session Present set.
+const CONNACK_SESSION_PRESENT: [u8; 4] = [0x20, 0x02, 0x01, 0x00];
 
 /// MQTT v3 SUBACK granting QoS 1 for a single subscription (packet id 1).
 const SUBACK_QOS1: [u8; 5] = [0x90, 0x03, 0x00, 0x01, 0x01];
@@ -594,6 +596,46 @@ fn sub_exits_nonzero_when_the_broker_refuses_the_subscription() {
     assert!(
         !report.exists(),
         "a refused subscription must write no report"
+    );
+
+    let _ = std::fs::remove_file(&report);
+}
+
+/// AC-10: a CONNACK claiming a stored session on a clean-session CONNECT
+/// must end the run with no `READY` printed and no report written.
+#[test]
+fn sub_exits_nonzero_when_the_connack_claims_a_session() {
+    let broker = spawn_fake_broker("sub-test-session-present", |mut stream| {
+        let Some(connect) = read_frame(&mut stream) else { return };
+        if connect.first() != Some(&CONNECT_FIRST_BYTE) {
+            return;
+        }
+        if stream.write_all(&CONNACK_SESSION_PRESENT).is_err() {
+            return;
+        }
+        let Some(subscribe) = read_frame(&mut stream) else { return };
+        if subscribe.first() == Some(&SUBSCRIBE_FIRST_BYTE) {
+            let _ = stream.write_all(&SUBACK_QOS1);
+        }
+        std::thread::sleep(Duration::from_secs(5));
+    });
+
+    let port = broker.addr();
+    let report = report_path("session-present");
+    let _ = std::fs::remove_file(&report);
+
+    let (mut child, rx, _stdin) = spawn_sub(1, &port, &report);
+
+    wait_exit_code(&mut child, EXIT_TIMEOUT, 1);
+
+    let seen: Vec<String> = rx.try_iter().collect();
+    assert!(
+        !seen.iter().any(|line| line == "READY"),
+        "a session-claiming CONNACK must never print READY, saw {seen:?}"
+    );
+    assert!(
+        !report.exists(),
+        "a session-claiming CONNACK must write no report"
     );
 
     let _ = std::fs::remove_file(&report);

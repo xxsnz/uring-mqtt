@@ -1305,6 +1305,70 @@ fn smoke_render_accepts_a_tool_version_of_control_characters() {
     assert!(doc.contains("SMOKE — not publishable"), "doc:\n{doc}");
 }
 
+/// `full_recorded_set()` with `edit` applied to every record's `cpu_sets`.
+fn recorded_set_with_cpu_sets(edit: impl Fn(&mut CpuSets)) -> Vec<RunRecord> {
+    let mut records = full_recorded_set();
+    for rec in &mut records {
+        edit(&mut rec.cpu_sets);
+    }
+    records
+}
+
+#[test]
+fn render_refuses_a_recorded_document_with_a_blank_cpu_set() {
+    assert_recorded_refusal(
+        &recorded_set_with_cpu_sets(|cpu_sets| cpu_sets.server = String::new()),
+        "BlankCpuSet(\"server\")",
+    );
+    // `cell` turns control characters into spaces, so a NUL-only
+    // generator set publishes a blank cell too.
+    assert_recorded_refusal(
+        &recorded_set_with_cpu_sets(|cpu_sets| cpu_sets.generator = "\u{0}".to_string()),
+        "BlankCpuSet(\"generator\")",
+    );
+    // Two blank fields: the refusal names server first.
+    assert_recorded_refusal(
+        &recorded_set_with_cpu_sets(|cpu_sets| {
+            cpu_sets.server = "  ".to_string();
+            cpu_sets.generator = String::new();
+        }),
+        "BlankCpuSet(\"server\")",
+    );
+
+    // Ordering guard: a mixed pair is refused before the blank-set
+    // check ever reads the shared pair.
+    let mut records = full_recorded_set();
+    records[0].cpu_sets.server = String::new();
+    match render(&records, false) {
+        Err(DocError::ProtocolViolation(text)) => {
+            assert!(
+                text.starts_with("multiple cpu_sets pairs"),
+                "text = {text}"
+            );
+        }
+        other => panic!("expected ProtocolViolation(multiple cpu_sets pairs), got {other:?}"),
+    }
+
+    // Ordering guard: the blank-environment check sits ahead of the
+    // blank-cpu-set check, so a set that breaks both names the field.
+    let mut records = recorded_set_with_env(|env| env.host = String::new());
+    for rec in &mut records {
+        rec.cpu_sets.server = String::new();
+    }
+    assert_recorded_refusal(&records, "BlankEnvironment(\"host\")");
+}
+
+#[test]
+fn smoke_render_accepts_a_blank_cpu_set() {
+    // The blank-cpu-set check sits inside `if !smoke`: a smoke document
+    // still publishes a blank cpu_sets pair.
+    let mut records = vec![throughput_record(ServerKind::Uring, 1, 1, 1)];
+    records[0].cpu_sets.server = String::new();
+    records[0].cpu_sets.generator = String::new();
+    let doc = render(&records, true).expect("smoke render must accept a blank cpu set");
+    assert!(doc.contains("SMOKE — not publishable"), "doc:\n{doc}");
+}
+
 #[test]
 fn render_refuses_a_blank_environment_field_before_a_missing_tool_list() {
     // Refusal order: the blank-environment check sits ahead of

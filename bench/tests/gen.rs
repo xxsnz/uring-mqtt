@@ -8,9 +8,10 @@
 //! (AC-19 through AC-26). Raw-byte fixtures and the free-port registry
 //! mirror `tests/broker_handle_api.rs:29-38` and `bench/tests/twin.rs`.
 
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::num::NonZeroU16;
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -40,7 +41,27 @@ const HARNESS_TIMEOUT: Duration = Duration::from_secs(30);
 /// Watchdog for the hard-deadline tests, generous above their own bound.
 const DEADLINE_WATCHDOG: Duration = Duration::from_secs(60);
 
+/// Time the acking peer keeps its socket open after the generator's EOF —
+/// past the generator's whole deadline.
+const PEER_HOLD_OPEN: Duration = Duration::from_secs(10);
+/// Time, from the first PUBLISH, the acking peer acknowledges every PUBLISH
+/// before it closes the connection mid-stream.
+const ACK_PHASE: Duration = Duration::from_millis(200);
+/// Latency rate for the failed-batch test: the acking peer keeps up with it,
+/// so the pacer never runs out of packet ids and is writing when the peer
+/// closes.
+const FAILED_BATCH_RATE: u64 = 100_000;
+/// Time `bench gen` gets to exit: its own hard deadline plus
+/// `IO_TIMEOUT_SECS`, with room for process start-up.
+const GEN_CLI_EXIT_BOUND: Duration = Duration::from_secs(20);
+const WAIT_POLL: Duration = Duration::from_millis(50);
+
 const CONNACK_OK: [u8; 4] = [0x20, 0x02, 0x00, 0x00];
+const CONNACK_SESSION_PRESENT: [u8; 4] = [0x20, 0x02, 0x01, 0x00];
+const CONNACK_RESERVED_FLAG: [u8; 4] = [0x20, 0x02, 0x02, 0x00];
+/// Session Present, then two reserved bits — every one must be refused in
+/// connections mode.
+const NONZERO_ACK_FLAGS: [u8; 3] = [0x01, 0x02, 0x80];
 
 /// Next whole second at or after `ns`.
 fn next_whole_second_at_or_after(ns: u64) -> u64 {
@@ -172,6 +193,49 @@ fn closes_after_connack_peer() -> SocketAddr {
     addr
 }
 
+/// A test-local peer that answers a complete CONNECT with `connack`, reads
+/// once more and closes — a process-boundary stand-in for a broker sending a
+/// malformed or session-claiming CONNACK. The CONNECT goes through the same
+/// `Codec` as in `acking_peer`, so a fragmented one cannot make the peer
+/// reply and close while part of the request is still unread.
+fn connack_peer(connack: [u8; 4]) -> SocketAddr {
+    let port = bench::free_port();
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("parse addr");
+    let listener = TcpListener::bind(addr).expect("bind connack peer");
+    let addr = listener.local_addr().expect("local_addr");
+    std::thread::Builder::new()
+        .name("gen-connack-peer".into())
+        .spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 256];
+                    let mut codec = Codec::default();
+                    let mut pending = BytesMut::new();
+                    loop {
+                        let Ok(n) = stream.read(&mut buf) else { return };
+                        if n == 0 {
+                            return;
+                        }
+                        pending.extend_from_slice(&buf[..n]);
+                        match codec.decode(&mut pending) {
+                            Ok(Some((Packet::Connect(_), _))) => break,
+                            Ok(_) => continue,
+                            Err(_) => return,
+                        }
+                    }
+                    if stream.write_all(&connack).is_err() {
+                        return;
+                    }
+                    let _ = stream.read(&mut buf);
+                    drop(stream);
+                });
+            }
+        })
+        .expect("spawn connack peer");
+    addr
+}
+
 /// A test-local TCP peer that accepts every connection and never writes a
 /// byte back, standing in for a broker withholding CONNACK. A process
 /// boundary stand-in, not a mock of a module this project owns.
@@ -238,6 +302,163 @@ fn silent_puback_peer() -> SocketAddr {
         })
         .expect("spawn silent peer");
     addr
+}
+
+/// A test-local peer that acknowledges every QoS 1 PUBLISH. With
+/// `close_after` it closes that long after the first PUBLISH, while the
+/// generator is still writing; without it, it acknowledges until the
+/// generator's EOF and then holds its socket open. In the closing form every
+/// PUBLISH is acknowledged, so the generator never waits on packet ids, its
+/// next write after the close draws a RST and the write after that fails —
+/// a failed batch whose earlier publishes were acknowledged. A
+/// process-boundary stand-in, not a mock.
+fn acking_peer(close_after: Option<Duration>) -> SocketAddr {
+    let port = bench::free_port();
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("parse addr");
+    let listener = TcpListener::bind(addr).expect("bind acking peer");
+    let addr = listener.local_addr().expect("local_addr");
+    std::thread::Builder::new()
+        .name("gen-acking-peer".into())
+        .spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                std::thread::spawn(move || {
+                    let mut buf = vec![0u8; 65_536].into_boxed_slice();
+                    let mut started: Option<Instant> = None;
+                    let mut codec = Codec::default();
+                    let mut pending = BytesMut::new();
+                    while close_after
+                        .is_none_or(|phase| started.is_none_or(|t| t.elapsed() < phase))
+                    {
+                        let Ok(n) = stream.read(&mut buf) else { break };
+                        if n == 0 {
+                            break;
+                        }
+                        pending.extend_from_slice(&buf[..n]);
+                        let mut acks = Vec::new();
+                        while let Ok(Some((packet, _))) = codec.decode(&mut pending) {
+                            match packet {
+                                Packet::Connect(_) => {
+                                    if stream.write_all(&CONNACK_OK).is_err() {
+                                        return;
+                                    }
+                                }
+                                Packet::Publish(p) => {
+                                    started.get_or_insert_with(Instant::now);
+                                    if let Some(id) = p.packet_id {
+                                        let id = id.get();
+                                        acks.extend_from_slice(&[
+                                            0x40,
+                                            0x02,
+                                            (id >> 8) as u8,
+                                            (id & 0xFF) as u8,
+                                        ]);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        if stream.write_all(&acks).is_err() {
+                            break;
+                        }
+                    }
+                    if close_after.is_some() {
+                        drop(stream);
+                    } else {
+                        std::thread::sleep(PEER_HOLD_OPEN);
+                        drop(stream);
+                    }
+                });
+            }
+        })
+        .expect("spawn acking peer");
+    addr
+}
+
+/// Owns a spawned `bench gen` process. `Drop` kills and reaps a child that
+/// is still running, so a failed assertion or a timeout cannot leave a
+/// generator holding its port.
+struct GenChild(Child);
+
+impl std::ops::Deref for GenChild {
+    type Target = Child;
+
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for GenChild {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for GenChild {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+/// Spawn `bench gen` with `args` plus `--report`, wait for it to exit within
+/// `GEN_CLI_EXIT_BOUND`, and return its parsed report with its captured
+/// stderr. Stderr is drained on a background thread so a child that writes
+/// diagnostics cannot block on a full pipe (`spawn_sub`, `cli_sub.rs:66-113`).
+fn run_gen_cli(tag: &str, args: &[String]) -> Result<(GenReport, String), String> {
+    let report_path =
+        std::env::temp_dir().join(format!("bench-gen-{tag}-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&report_path);
+
+    let mut child = GenChild(
+        Command::new(env!("CARGO_BIN_EXE_bench"))
+            .arg("gen")
+            .args(args)
+            .arg("--report")
+            .arg(&report_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("spawn bench gen: {e}"))?,
+    );
+
+    let stderr = child.stderr.take().expect("child stderr piped");
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = BufReader::new(stderr).read_to_end(&mut buf);
+        String::from_utf8_lossy(&buf).into_owned()
+    });
+
+    let deadline = Instant::now() + GEN_CLI_EXIT_BOUND;
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|e| format!("try_wait: {e}"))? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "bench gen did not exit within {GEN_CLI_EXIT_BOUND:?}"
+            ));
+        }
+        std::thread::sleep(WAIT_POLL);
+    };
+    // Collected before the exit check: a refusal (a late start, a report
+    // write failure) explains itself on stderr, and an error that carries
+    // only the status discards that explanation.
+    let stderr = stderr_handle
+        .join()
+        .map_err(|_| "stderr thread panicked".to_string())?;
+    if !status.success() {
+        return Err(format!("bench gen exited {status:?}; stderr:\n{stderr}"));
+    }
+    let data =
+        std::fs::read_to_string(&report_path).map_err(|e| format!("read report: {e}"))?;
+    let _ = std::fs::remove_file(&report_path);
+    let report: GenReport =
+        serde_json::from_str(&data).map_err(|e| format!("parse report: {e}"))?;
+    Ok((report, stderr))
 }
 
 /// The slot grid ends `SLOT_GRID_END_LEAD_NS` before the window end, and
@@ -768,9 +989,13 @@ fn latency_mode_accounts_for_billions_of_remaining_slots_within_the_deadline() {
         "a one-second window at RATE slots/s schedules exactly its slot grid"
     );
     assert_eq!(
-        report.offered + report.stalled + report.missed_slots,
+        report.offered + report.missed_slots,
         grid_slots(RATE, NS_PER_SEC),
-        "every scheduled slot must be offered, stalled or missed exactly once"
+        "every scheduled slot must be offered or missed exactly once"
+    );
+    assert!(
+        report.stalled <= report.offered,
+        "a stalled publish is an offered one"
     );
     assert!(
         report.missed_slots > 1_000_000_000,
@@ -825,9 +1050,9 @@ fn latency_mode_stops_pacing_after_the_first_failed_publish_write() {
         "a one-second window at RATE slots/s schedules exactly its slot grid"
     );
     assert_eq!(
-        report.offered + report.stalled + report.missed_slots,
+        report.offered + report.missed_slots,
         grid_slots(RATE, NS_PER_SEC),
-        "every scheduled slot must be offered, stalled or missed exactly once"
+        "every scheduled slot must be offered or missed exactly once"
     );
     let batch = u64::try_from(gen::BATCH).expect("BATCH fits in u64");
     assert!(
@@ -835,6 +1060,251 @@ fn latency_mode_stops_pacing_after_the_first_failed_publish_write() {
         "only the batch of the first failed write may count as stalled: {}",
         report.stalled
     );
+    assert!(report.stalled >= 1, "the failed batch must count as stalled");
+    assert!(
+        report.stalled <= report.offered,
+        "a stalled publish is an offered one"
+    );
+}
+
+/// AC-12, AC-13 — a QoS 1 throughput connection against a peer that
+/// acknowledges every PUBLISH and then closes mid-stream prints the publish
+/// write diagnostic exactly once and reconciles the failed batch's ids:
+/// every id is either acked or counted stalled, and the two sum to offered.
+#[test]
+fn qos1_throughput_reconciles_a_failed_batch_with_the_acks_it_received() {
+    let addr = acking_peer(Some(ACK_PHASE));
+    let before_ns = monotonic_now_ns();
+    let wall_start = Instant::now();
+    let origin_ns = origin_with_lead(LEAD_SECS);
+    let window_end_ns = origin_ns + NS_PER_SEC;
+    let args: Vec<String> = vec![
+        "--addr".into(),
+        addr.to_string(),
+        "--mode".into(),
+        "throughput".into(),
+        "--qos".into(),
+        "1".into(),
+        "--connections".into(),
+        "1".into(),
+        "--qos1-window".into(),
+        "65535".into(),
+        "--origin-ns".into(),
+        origin_ns.to_string(),
+        "--window-start-ns".into(),
+        origin_ns.to_string(),
+        "--window-end-ns".into(),
+        window_end_ns.to_string(),
+        "--drain-grace-secs".into(),
+        "1".into(),
+    ];
+    let (report, stderr) =
+        run_gen_cli("qos1-throughput-failed-batch", &args).expect("bench gen must exit 0");
+    let elapsed = wall_start.elapsed();
+    let bound = Duration::from_nanos(origin_ns.saturating_sub(before_ns))
+        + Duration::from_secs(1 + 1 + gen::IO_TIMEOUT_SECS + 2);
+    assert!(
+        elapsed <= bound,
+        "bench gen exceeded its hard deadline: {elapsed:?} > {bound:?}"
+    );
+
+    let failure_lines: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("gen: connection ") && line.contains(": publish write "))
+        .collect();
+    assert_eq!(
+        failure_lines.len(),
+        1,
+        "exactly one connection must print the publish write diagnostic, got {failure_lines:?}"
+    );
+
+    let acked = report.acked.expect("QoS 1 reports acked");
+    assert!(
+        acked >= 1,
+        "at least one publish must have been acked before the write failed"
+    );
+    assert!(
+        report.stalled >= 1,
+        "the failed batch must leave ids unresolved"
+    );
+    assert_eq!(
+        acked + report.stalled,
+        report.offered,
+        "acked and stalled must reconcile with offered"
+    );
+    assert_eq!(report.protocol_errors, 0);
+}
+
+/// AC-12, AC-13, AC-15 — the same reconciliation as
+/// `qos1_throughput_reconciles_a_failed_batch_with_the_acks_it_received`, in
+/// latency mode: every scheduled slot is still offered or missed exactly
+/// once.
+#[test]
+fn qos1_latency_reconciles_a_failed_batch_with_the_acks_it_received() {
+    let addr = acking_peer(Some(ACK_PHASE));
+    let before_ns = monotonic_now_ns();
+    let wall_start = Instant::now();
+    let origin_ns = origin_with_lead(LEAD_SECS);
+    let window_end_ns = origin_ns + NS_PER_SEC;
+    let args: Vec<String> = vec![
+        "--addr".into(),
+        addr.to_string(),
+        "--mode".into(),
+        "latency".into(),
+        "--rate".into(),
+        FAILED_BATCH_RATE.to_string(),
+        "--qos".into(),
+        "1".into(),
+        "--connections".into(),
+        "1".into(),
+        "--qos1-window".into(),
+        "65535".into(),
+        "--origin-ns".into(),
+        origin_ns.to_string(),
+        "--window-start-ns".into(),
+        origin_ns.to_string(),
+        "--window-end-ns".into(),
+        window_end_ns.to_string(),
+        "--drain-grace-secs".into(),
+        "1".into(),
+    ];
+    let (report, stderr) =
+        run_gen_cli("qos1-latency-failed-batch", &args).expect("bench gen must exit 0");
+    let elapsed = wall_start.elapsed();
+    let bound = Duration::from_nanos(origin_ns.saturating_sub(before_ns))
+        + Duration::from_secs(1 + 1 + gen::IO_TIMEOUT_SECS + 2);
+    assert!(
+        elapsed <= bound,
+        "bench gen exceeded its hard deadline: {elapsed:?} > {bound:?}"
+    );
+
+    let failure_lines: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("gen: connection ") && line.contains(": publish write "))
+        .collect();
+    assert_eq!(
+        failure_lines.len(),
+        1,
+        "exactly one connection must print the publish write diagnostic, got {failure_lines:?}"
+    );
+
+    let acked = report.acked.expect("QoS 1 reports acked");
+    assert!(
+        acked >= 1,
+        "at least one publish must have been acked before the write failed"
+    );
+    assert!(
+        report.stalled >= 1,
+        "the failed batch must leave ids unresolved"
+    );
+    assert_eq!(
+        acked + report.stalled,
+        report.offered,
+        "acked and stalled must reconcile with offered"
+    );
+    assert_eq!(report.protocol_errors, 0);
+    assert_eq!(
+        report.offered + report.missed_slots,
+        report.scheduled.expect("latency reports scheduled"),
+        "every scheduled slot must be offered or missed"
+    );
+}
+
+/// AC-12, AC-14 — a QoS 0 throughput connection against a peer that closes
+/// right after CONNACK counts its one failed batch as stalled in full, and
+/// offered accounts for at least that much.
+#[test]
+fn qos0_throughput_counts_its_failed_batch_as_offered_and_stalled() {
+    let (report, elapsed, bound) =
+        run_bounded("gen-qos0-throughput-failed-batch", DEADLINE_WATCHDOG, move || {
+            let addr = closes_after_connack_peer();
+            let before_ns = monotonic_now_ns();
+            let wall_start = Instant::now();
+            let origin_ns = origin_with_lead(LEAD_SECS);
+            let window = Window {
+                start_ns: origin_ns,
+                end_ns: origin_ns + NS_PER_SEC,
+            };
+            let config = gen::GenConfig {
+                addr,
+                mode: Mode::Throughput,
+                qos: 0,
+                connections: 1,
+                qos1_window: QOS1_WINDOW,
+                origin_ns,
+                window,
+                drain_grace: Duration::from_secs(1),
+            };
+            let report: GenReport =
+                gen::run_generator(&config).map_err(|e| format!("run_generator: {e}"))?;
+            let elapsed = wall_start.elapsed();
+            let bound = Duration::from_nanos(origin_ns.saturating_sub(before_ns))
+                + Duration::from_secs(1 + 1 + gen::IO_TIMEOUT_SECS + 2);
+            Ok((report, elapsed, bound))
+        });
+
+    assert!(
+        elapsed <= bound,
+        "generator exceeded its hard deadline: {elapsed:?} > {bound:?}"
+    );
+    assert_eq!(
+        report.stalled, 64,
+        "the failed batch's whole BATCH must count as stalled"
+    );
+    assert!(
+        report.offered >= report.stalled,
+        "a stalled publish is an offered one"
+    );
+}
+
+/// AC-13 — a QoS 1 throughput connection against a peer that acknowledges
+/// every PUBLISH and withholds EOF still returns by its hard deadline, with
+/// every offered publish acked and nothing stalled.
+#[test]
+fn qos1_throughput_returns_by_its_deadline_when_the_peer_withholds_eof() {
+    let (report, elapsed, bound) =
+        run_bounded(
+            "gen-qos1-throughput-withholds-eof",
+            DEADLINE_WATCHDOG,
+            move || {
+                let addr = acking_peer(None);
+                let before_ns = monotonic_now_ns();
+                let wall_start = Instant::now();
+                let origin_ns = origin_with_lead(LEAD_SECS);
+                let window = Window {
+                    start_ns: origin_ns,
+                    end_ns: origin_ns + NS_PER_SEC,
+                };
+                let config = gen::GenConfig {
+                    addr,
+                    mode: Mode::Throughput,
+                    qos: 1,
+                    connections: 1,
+                    qos1_window: QOS1_WINDOW,
+                    origin_ns,
+                    window,
+                    drain_grace: Duration::from_secs(1),
+                };
+                let report: GenReport =
+                    gen::run_generator(&config).map_err(|e| format!("run_generator: {e}"))?;
+                let elapsed = wall_start.elapsed();
+                let bound = Duration::from_nanos(origin_ns.saturating_sub(before_ns))
+                    + Duration::from_secs(1 + 1 + gen::IO_TIMEOUT_SECS + 2);
+                Ok((report, elapsed, bound))
+            },
+        );
+
+    assert!(
+        elapsed <= bound,
+        "generator exceeded its hard deadline against a peer withholding EOF: {elapsed:?} > {bound:?}"
+    );
+    assert_eq!(
+        report.acked,
+        Some(report.offered),
+        "every offered QoS 1 publish must be acked"
+    );
+    assert_eq!(report.stalled, 0, "a clean run must leave nothing stalled");
+    assert_eq!(report.protocol_errors, 0);
 }
 
 /// AC-23 — a QoS 1 slot whose packet id cannot be allocated counts in
@@ -1000,4 +1470,103 @@ fn generator_refuses_a_window_starting_before_its_origin() {
     };
     let err = gen::run_generator(&config).expect_err("a pre-origin window must be refused");
     assert!(err.contains("origin"), "unexpected refusal: {err}");
+}
+
+/// AC-8 — a CONNACK claiming a stored session on this cycle's
+/// clean-session CONNECT is a protocol error in throughput mode, not an
+/// accepted session.
+#[test]
+fn throughput_refuses_a_connack_that_claims_a_session() {
+    let report: GenReport = run_bounded("gen-session-present", DEADLINE_WATCHDOG, move || {
+        let addr = connack_peer(CONNACK_SESSION_PRESENT);
+        let origin_ns = origin_with_lead(LEAD_SECS);
+        let window = Window {
+            start_ns: origin_ns,
+            end_ns: origin_ns + NS_PER_SEC,
+        };
+        let config = gen::GenConfig {
+            addr,
+            mode: Mode::Throughput,
+            qos: 1,
+            connections: 2,
+            qos1_window: QOS1_WINDOW,
+            origin_ns,
+            window,
+            drain_grace: Duration::from_secs(1),
+        };
+        gen::run_generator(&config).map_err(|e| format!("run_generator: {e}"))
+    });
+
+    assert_eq!(report.protocol_errors, 2);
+    assert_eq!(report.connect_errors, 2);
+    assert_eq!(report.offered, 0);
+}
+
+/// AC-11 — a CONNACK the codec rejects with a non-`Io` decode error is the
+/// broker's malformed reply, counted as a protocol error like every other
+/// malformed frame.
+#[test]
+fn throughput_counts_a_connack_with_reserved_flags_as_a_protocol_error() {
+    let report: GenReport = run_bounded("gen-reserved-flag", DEADLINE_WATCHDOG, move || {
+        let addr = connack_peer(CONNACK_RESERVED_FLAG);
+        let origin_ns = origin_with_lead(LEAD_SECS);
+        let window = Window {
+            start_ns: origin_ns,
+            end_ns: origin_ns + NS_PER_SEC,
+        };
+        let config = gen::GenConfig {
+            addr,
+            mode: Mode::Throughput,
+            qos: 1,
+            connections: 2,
+            qos1_window: QOS1_WINDOW,
+            origin_ns,
+            window,
+            drain_grace: Duration::from_secs(1),
+        };
+        gen::run_generator(&config).map_err(|e| format!("run_generator: {e}"))
+    });
+
+    assert_eq!(report.protocol_errors, 2);
+    assert_eq!(report.connect_errors, 2);
+    assert_eq!(report.offered, 0);
+}
+
+/// AC-9 — connections mode must refuse a CONNACK whose acknowledge-flags
+/// byte sets Session Present or either reserved bit, counting a protocol
+/// error and completing no cycle.
+#[test]
+fn connections_mode_refuses_a_connack_with_session_present_or_reserved_flags() {
+    for &flags in &NONZERO_ACK_FLAGS {
+        let report: GenReport =
+            run_bounded("gen-connections-refuses", DEADLINE_WATCHDOG, move || {
+                let addr = connack_peer([0x20, 0x02, flags, 0x00]);
+                let origin_ns = origin_with_lead(LEAD_SECS);
+                let window = Window {
+                    start_ns: origin_ns,
+                    end_ns: origin_ns + NS_PER_SEC,
+                };
+                let config = gen::GenConfig {
+                    addr,
+                    mode: Mode::Connections,
+                    qos: 0,
+                    connections: 1,
+                    qos1_window: QOS1_WINDOW,
+                    origin_ns,
+                    window,
+                    drain_grace: Duration::from_secs(1),
+                };
+                gen::run_generator(&config).map_err(|e| format!("run_generator: {e}"))
+            });
+
+        assert!(
+            report.protocol_errors >= 1,
+            "acknowledge-flags byte {flags:#04x} must count a protocol error"
+        );
+        assert_eq!(
+            report.cycles_in_window,
+            Some(0),
+            "acknowledge-flags byte {flags:#04x} must complete no cycle"
+        );
+    }
 }

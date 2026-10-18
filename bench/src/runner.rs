@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -248,10 +248,10 @@ const COUNTER_EXIT_POLL_MS: u64 = 1;
 /// Upper bound on the finalization drain of the strace counter's stderr,
 /// measured from the start of the drain and not from its last line. The
 /// counter is an operator-supplied executable: it can exit and leave a
-/// descendant holding the inherited stderr pipe open, and a descendant
-/// that writes a line more often than [`WAIT_POLL_MS`] would otherwise
-/// keep the drain off EOF for as long as it runs, so `run_one` would never
-/// return its record and the per-call guard would never fall.
+/// descendant holding the inherited stderr pipe open, and such a descendant
+/// would otherwise keep the drain off EOF for as long as it runs, so
+/// `run_one` would never return its record and the per-call guard would
+/// never fall.
 const COUNTER_DRAIN_TIMEOUT_SECS: u64 = 5;
 
 /// Cap on the lines `Syscalls::diagnostics` retains, counted across the
@@ -260,6 +260,12 @@ const COUNTER_DRAIN_TIMEOUT_SECS: u64 = 5;
 /// cap is a stream, not a diagnostic, and the record names the truncation
 /// rather than growing with it.
 const COUNTER_DIAGNOSTIC_LINES_MAX: usize = 256;
+
+/// Longest strace stderr line, in bytes without its newline, the reader
+/// thread accepts. A longer line is a stream, not a diagnostic: the
+/// reader reports it as a read failure and queues nothing more, so one
+/// line cannot hold unbounded memory.
+const COUNTER_STDERR_LINE_BYTES_MAX: u64 = 4096;
 
 /// Bytes the runner writes to the perf ctl fifo at each control point.
 const PERF_ENABLE: &[u8] = b"enable\n";
@@ -1359,6 +1365,7 @@ fn build_minimal_record(spec: &RunSpec) -> RunRecord {
 
 /// What a child's stdout reader thread forwards: one line, the end of the
 /// stream, or the error that ended it.
+#[derive(Debug, PartialEq, Eq)]
 enum StdoutLine {
     Line(String),
     Eof,
@@ -1375,17 +1382,22 @@ enum BlankLines {
 }
 
 /// Why [`drain_stderr_lines`] stopped, when it stopped for a reason the
-/// record has to name. EOF, a cancelled run and a disconnected reader are
-/// the clean endings and carry no member here.
+/// record has to name. EOF, a read failure (named from [`StderrLoss`]), a
+/// cancelled run and a disconnected reader carry no member here.
 enum DrainEnd {
-    /// The reader thread's own read failed: the lines after this point were
-    /// never read, so the retained diagnostics stop mid-stream.
-    ReadFailed(String),
     /// [`COUNTER_DRAIN_TIMEOUT_SECS`] passed with the stream still open.
     TimedOut,
-    /// [`COUNTER_DIAGNOSTIC_LINES_MAX`] lines were retained and the stream
-    /// was still open.
-    LineCap,
+}
+
+/// What the strace stderr reader thread could not hand over through its
+/// bounded queue, recorded the moment it happened: whether it dropped a
+/// line at a full queue, and the failure that ended its reading.
+/// [`finalize_counter`] reads it after the drain, so neither a full queue
+/// nor a drain that stopped early can erase either.
+#[derive(Default)]
+struct StderrLoss {
+    dropped: bool,
+    failure: Option<String>,
 }
 
 /// Read a child's stdout on its own thread. A blocking `read_line` on the
@@ -1831,9 +1843,13 @@ struct Counter {
     /// redirected stderr (`<scratch>/perf.txt`) or strace's `-o` file
     /// (`<scratch>/strace.txt`).
     raw_path: PathBuf,
-    /// Strace only: receiver for the stderr reader thread. Carries every
-    /// line until the runner drains it for `diagnostics`.
+    /// Strace only: receiver for the stderr reader thread. Carries the
+    /// lines the bounded queue kept until the runner drains them for
+    /// `diagnostics`.
     stderr_rx: Option<mpsc::Receiver<StdoutLine>>,
+    /// Strace only: what the stderr reader thread dropped or failed on,
+    /// recorded as it happened and read by [`finalize_counter`].
+    stderr_loss: Option<Arc<Mutex<StderrLoss>>>,
     /// Strace only: the stderr lines [`arm_counter`] already consumed while
     /// it waited for the "attached" marker, the marker's own line included.
     /// They are kept here because the marker's thread count, and an attach
@@ -1851,7 +1867,7 @@ struct Counter {
     enabled_ns: Option<u64>,
     disabled_ns: Option<u64>,
     /// Exit status of the counter child, already reaped. [`reap_counter`]
-    /// collects it at the window end, so this is `Some` by the time
+    /// collects it at the window end — or [`disarm_counter`], when the counter had already exited — so this is `Some` by the time
     /// [`finalize_counter`] builds the record; `None` means the stop never
     /// completed, or a failed prep skipped it.
     exit: Option<ExitStatus>,
@@ -1869,6 +1885,7 @@ impl Counter {
             ack_read: Some(ack_read),
             raw_path,
             stderr_rx: None,
+            stderr_loss: None,
             armed_lines: Vec::new(),
             expected_threads: None,
             enabled_ns: None,
@@ -1881,6 +1898,7 @@ impl Counter {
     fn new_strace(
         raw_path: PathBuf,
         stderr_rx: mpsc::Receiver<StdoutLine>,
+        stderr_loss: Arc<Mutex<StderrLoss>>,
         expected_threads: Option<u64>,
     ) -> Self {
         Self {
@@ -1889,6 +1907,7 @@ impl Counter {
             ack_read: None,
             raw_path,
             stderr_rx: Some(stderr_rx),
+            stderr_loss: Some(stderr_loss),
             armed_lines: Vec::new(),
             expected_threads,
             enabled_ns: None,
@@ -1911,6 +1930,7 @@ impl Counter {
             ack_read: None,
             raw_path,
             stderr_rx: None,
+            stderr_loss: None,
             armed_lines: Vec::new(),
             expected_threads: None,
             enabled_ns: None,
@@ -2165,44 +2185,84 @@ fn spawn_strace_counter(
         );
     };
     match spawn_counter_stderr_reader(stderr) {
-        Ok(rx) => Counter::new_strace(strace_txt, rx, expected_threads),
+        Ok((rx, loss)) => Counter::new_strace(strace_txt, rx, loss, expected_threads),
         Err(e) => dead(e, harness_errors),
     }
 }
 
-/// Reader thread for the strace counter's stderr. Every line is kept
-/// (strace prints `attached` and `ptrace(...)` on a single thread's
-/// failure) and the receiver stays open until the thread sees EOF.
+/// Reader thread for the strace counter's stderr. Every line is queued
+/// up to the queue bound (strace prints `attached` and `ptrace(...)` on
+/// a single thread's failure). Nothing receives between the attach
+/// marker and the finalization drain, so the queue holds at most
+/// [`COUNTER_DIAGNOSTIC_LINES_MAX`] lines — no more than the record can
+/// keep. No send blocks: a blocked reader would stall strace's stderr
+/// writes and, through its ptrace stops, the traced server. What the
+/// queue cannot carry goes into the returned [`StderrLoss`] the moment
+/// it happens — a dropped line, and the failure that ends the reading,
+/// a line longer than [`COUNTER_STDERR_LINE_BYTES_MAX`] included — so a
+/// full queue cannot erase it. After a failure the thread still reads
+/// the pipe to EOF: closing it would hand strace SIGPIPE on its next
+/// stderr write.
 fn spawn_counter_stderr_reader(
     stderr: std::process::ChildStderr,
-) -> Result<mpsc::Receiver<StdoutLine>, String> {
-    let (tx, rx) = mpsc::channel();
+) -> Result<(mpsc::Receiver<StdoutLine>, Arc<Mutex<StderrLoss>>), String> {
+    let (tx, rx) = mpsc::sync_channel(COUNTER_DIAGNOSTIC_LINES_MAX);
+    let loss = Arc::new(Mutex::new(StderrLoss::default()));
+    let thread_loss = Arc::clone(&loss);
     std::thread::Builder::new()
         .name(format!("bench-runner-{COUNTER_STDERR_LABEL}"))
         .spawn(move || {
             let mut reader = BufReader::new(stderr);
-            let mut line = String::new();
+            let mut buf: Vec<u8> = Vec::new();
             loop {
-                line.clear();
-                match reader.read_line(&mut line) {
-                    Ok(0) => {
-                        let _ = tx.send(StdoutLine::Eof);
+                buf.clear();
+                // One byte past the cap: a line of exactly the cap ends
+                // in its newline, a longer one does not.
+                let message = match (&mut reader)
+                    .take(COUNTER_STDERR_LINE_BYTES_MAX + 1)
+                    .read_until(b'\n', &mut buf)
+                {
+                    Ok(0) => StdoutLine::Eof,
+                    Ok(_)
+                        if buf.len() as u64 > COUNTER_STDERR_LINE_BYTES_MAX
+                            && buf.last() != Some(&b'\n') =>
+                    {
+                        StdoutLine::Failed(format!(
+                            "line longer than {COUNTER_STDERR_LINE_BYTES_MAX} bytes"
+                        ))
+                    }
+                    Ok(_) => match String::from_utf8(buf.clone()) {
+                        Ok(line) => StdoutLine::Line(line),
+                        Err(_) => StdoutLine::Failed(
+                            "stream did not contain valid UTF-8".to_string(),
+                        ),
+                    },
+                    Err(e) => StdoutLine::Failed(e.to_string()),
+                };
+                match message {
+                    StdoutLine::Line(_) => match tx.try_send(message) {
+                        Ok(()) => {}
+                        Err(mpsc::TrySendError::Full(_)) => {
+                            thread_loss.lock().expect("stderr loss poisoned").dropped = true;
+                        }
+                        Err(mpsc::TrySendError::Disconnected(_)) => break,
+                    },
+                    StdoutLine::Failed(ref cause) => {
+                        thread_loss.lock().expect("stderr loss poisoned").failure =
+                            Some(cause.clone());
+                        let _ = tx.try_send(message);
+                        let _ = std::io::copy(&mut reader, &mut std::io::sink());
                         break;
                     }
-                    Ok(_) => {
-                        if tx.send(StdoutLine::Line(line.clone())).is_err() {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx.send(StdoutLine::Failed(e.to_string()));
+                    StdoutLine::Eof => {
+                        let _ = tx.try_send(message);
                         break;
                     }
                 }
             }
         })
         .map_err(|e| format!("syscall counter: spawn stderr reader: {e}"))?;
-    Ok(rx)
+    Ok((rx, loss))
 }
 
 /// Enable the counter at `window.start_ns`. Perf: write `enable\n`,
@@ -2242,7 +2302,10 @@ fn arm_counter(counter: &mut Counter, host: &HostSetup, harness_errors: &mut Vec
 /// and every line read on the way to it, including the marker's own: the
 /// marker carries the attached thread count and an attach failure can
 /// print before it, and both are the evidence AC-60's partial-attachment
-/// rejection reads, so no consumed line is dropped.
+/// rejection reads, so no consumed line within the record's cap is dropped;
+/// at most [`COUNTER_DIAGNOSTIC_LINES_MAX`] + 1 lines are kept. A read
+/// failure ends the wait without an error of its own: [`finalize_counter`]
+/// names it from [`StderrLoss`].
 fn wait_for_strace_attach(
     rx: &mpsc::Receiver<StdoutLine>,
     host: &HostSetup,
@@ -2261,7 +2324,13 @@ fn wait_for_strace_attach(
         match rx.recv_timeout(Duration::from_millis(WAIT_POLL_MS)) {
             Ok(StdoutLine::Line(line)) => {
                 let attached = line.contains(STRACE_ATTACHED_MARKER);
-                lines.push(line.trim_end().to_string());
+                // One line past the record's cap: `finalize_counter` keeps
+                // only the first `COUNTER_DIAGNOSTIC_LINES_MAX`, and the extra
+                // line is how it knows this wait dropped some, so a flood
+                // before the marker needs no more memory than that.
+                if lines.len() <= COUNTER_DIAGNOSTIC_LINES_MAX {
+                    lines.push(line.trim_end().to_string());
+                }
                 if attached {
                     return (Some(monotonic_now_ns()), lines);
                 }
@@ -2271,8 +2340,9 @@ fn wait_for_strace_attach(
                     .push("syscall counter: stderr closed before attached".to_string());
                 return (None, lines);
             }
-            Ok(StdoutLine::Failed(e)) => {
-                harness_errors.push(format!("syscall counter: stderr read: {e}"));
+            Ok(StdoutLine::Failed(_)) => {
+                // The reader recorded the cause in `StderrLoss`;
+                // `finalize_counter` names it once.
                 return (None, lines);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -2292,6 +2362,8 @@ fn wait_for_strace_attach(
 /// ticks are sampled between them: a counter may confirm the stop on time
 /// and still take seconds to write its summary out, and those seconds
 /// belong to neither `sampled_ns` nor the tick deltas it divides.
+/// A counter that already exited gets no signal: its exit is recorded and
+/// the run is invalid (see the liveness test below).
 fn disarm_counter(
     counter: &mut Counter,
     guards: &mut ChildGuard,
@@ -2300,6 +2372,27 @@ fn disarm_counter(
 ) {
     if counter.prep_error.is_some() {
         return;
+    }
+    // A counter that is no longer running stopped counting before
+    // the window end, so its count covers less than the window.
+    // `kill` cannot tell: the child stays unreaped in the guard and
+    // a signal to the zombie succeeds. Std keeps the status
+    // `try_wait` reaps, so the exit is recorded here, `reap_counter`
+    // skips the counter, and `disabled_ns` stays `None` — row 22
+    // rejects the record and this error names how it ended.
+    if let Some(child) = guards.child_mut(COUNTER_LABEL) {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                counter.exit = Some(status);
+                harness_errors.push(format!(
+                    "syscall counter: exited before the window end with {:?}",
+                    counter_exit_from_status(status)
+                ));
+                return;
+            }
+            Ok(None) => {}
+            Err(e) => harness_errors.push(format!("syscall counter: try_wait: {e}")),
+        }
     }
     if counter.kind == CounterKind::Perf {
         // The SIGINT below brings the counter down whatever this write
@@ -2342,6 +2435,12 @@ fn reap_counter(
     harness_errors: &mut Vec<String>,
 ) {
     if counter.prep_error.is_some() {
+        return;
+    }
+    // Already reaped by `disarm_counter`'s liveness test: the counter
+    // stopped before the window end and has no confirmed stop to
+    // stamp.
+    if counter.exit.is_some() {
         return;
     }
     counter.exit = wait_for_counter_exit(guards, host, harness_errors);
@@ -2390,31 +2489,36 @@ fn finalize_counter(
     // is the None arm.
     let diagnostics = if matches!(counter.kind, CounterKind::Strace) {
         let mut lines = std::mem::take(&mut counter.armed_lines);
-        // The cap spans both sources: the marker wait's lines are already
-        // retained, so the drain only gets what is left of it. A marker
-        // wait that filled the cap on its own leaves a zero budget, which
-        // the drain reports as the same truncation.
+        // The cap spans both sources: the marker wait's lines are
+        // already retained, so the drain only gets what is left of it.
+        // The marker wait keeps one line past the cap, so more than the
+        // cap here means it dropped lines itself.
+        let mut truncated = lines.len() > COUNTER_DIAGNOSTIC_LINES_MAX;
         let budget = COUNTER_DIAGNOSTIC_LINES_MAX.saturating_sub(lines.len());
         if let Some(rx) = counter.stderr_rx.as_ref() {
-            let (rest, drain_end) = drain_stderr_lines(rx, host, budget);
+            let (rest, dropped, drain_end) = drain_stderr_lines(rx, host, budget);
             lines.extend(rest);
-            match drain_end {
-                Some(DrainEnd::ReadFailed(e)) => {
-                    harness_errors.push(format!("syscall counter: stderr read: {e}"));
-                }
-                Some(DrainEnd::TimedOut) => {
-                    harness_errors.push(format!(
-                        "syscall counter: stderr still open after {COUNTER_DRAIN_TIMEOUT_SECS}s, diagnostics truncated at {} lines",
-                        lines.len()
-                    ));
-                }
-                Some(DrainEnd::LineCap) => {
-                    harness_errors.push(format!(
-                        "syscall counter: diagnostics truncated at {COUNTER_DIAGNOSTIC_LINES_MAX} lines"
-                    ));
-                }
-                None => {}
+            truncated |= dropped;
+            if let Some(DrainEnd::TimedOut) = drain_end {
+                harness_errors.push(format!(
+                    "syscall counter: stderr still open after {COUNTER_DRAIN_TIMEOUT_SECS}s, diagnostics truncated at {} lines",
+                    lines.len()
+                ));
             }
+        }
+        // Read after the drain: the reader records a dropped line and its
+        // ending failure before it queues anything after them.
+        if let Some(loss) = counter.stderr_loss.as_ref() {
+            let loss = loss.lock().expect("stderr loss poisoned");
+            truncated |= loss.dropped;
+            if let Some(cause) = loss.failure.as_ref() {
+                harness_errors.push(format!("syscall counter: stderr read: {cause}"));
+            }
+        }
+        if truncated {
+            harness_errors.push(format!(
+                "syscall counter: diagnostics truncated at {COUNTER_DIAGNOSTIC_LINES_MAX} lines"
+            ));
         }
         lines.truncate(COUNTER_DIAGNOSTIC_LINES_MAX);
         check_strace_attachment(&lines, counter.expected_threads, harness_errors);
@@ -2492,40 +2596,53 @@ fn wait_for_counter_exit(
 /// Drain the remaining lines out of the strace stderr reader, for
 /// `Syscalls::diagnostics`, under two bounds the drain holds whatever the
 /// counter does: [`COUNTER_DRAIN_TIMEOUT_SECS`] from the first poll, and
-/// `budget` further retained lines. Both are needed because the counter is
-/// an operator-supplied executable — an idle stream reaches EOF, but a
+/// `budget` further retained lines — lines past the budget are received
+/// and dropped rather than ending the drain, and the returned flag says
+/// whether any was. Both are needed because the counter is an
+/// operator-supplied executable — an idle stream reaches EOF, but a
 /// descendant that keeps the pipe open and writes more often than
 /// [`WAIT_POLL_MS`] reaches neither EOF nor a quiet gap, and this runs
 /// inside `run_one` before the record is returned and the per-call guard
 /// falls.
 ///
-/// EOF, a cancelled run and a disconnected reader end the drain cleanly —
-/// the diagnostics is what the run recorded, not a stream the operator is
-/// still following. The other three endings come back as a [`DrainEnd`]:
-/// the lines after them were never read, so the caller has to reject the
-/// run instead of publishing diagnostics that stop in the middle for an
-/// unrecorded reason.
+/// EOF, a read failure, a cancelled run and a disconnected reader end the
+/// drain without a [`DrainEnd`]; a read failure is named by
+/// [`finalize_counter`] from [`StderrLoss`], which the reader filled
+/// before it queued anything about it. A quiet gap no longer ends the
+/// drain: the reader thread can lag behind bytes already in the pipe, and
+/// only its own ending proves it has read them, so a stream that stays
+/// open quietly now runs to [`COUNTER_DRAIN_TIMEOUT_SECS`] and is named
+/// as still open.
 fn drain_stderr_lines(
     rx: &mpsc::Receiver<StdoutLine>,
     host: &HostSetup,
     budget: usize,
-) -> (Vec<String>, Option<DrainEnd>) {
+) -> (Vec<String>, bool, Option<DrainEnd>) {
     let mut out: Vec<String> = Vec::new();
+    let mut dropped = false;
     let deadline = Instant::now() + Duration::from_secs(COUNTER_DRAIN_TIMEOUT_SECS);
     loop {
-        if out.len() >= budget {
-            return (out, Some(DrainEnd::LineCap));
-        }
         if ChildGuard::is_cancelled(host) {
-            return (out, None);
+            return (out, dropped, None);
         }
         if Instant::now() >= deadline {
-            return (out, Some(DrainEnd::TimedOut));
+            return (out, dropped, Some(DrainEnd::TimedOut));
         }
         match rx.recv_timeout(Duration::from_millis(WAIT_POLL_MS)) {
-            Ok(StdoutLine::Line(line)) => out.push(line.trim_end().to_string()),
-            Ok(StdoutLine::Failed(e)) => return (out, Some(DrainEnd::ReadFailed(e))),
-            Ok(StdoutLine::Eof) | Err(_) => return (out, None),
+            Ok(StdoutLine::Line(line)) => {
+                if out.len() < budget {
+                    out.push(line.trim_end().to_string());
+                } else {
+                    dropped = true;
+                }
+            }
+            // A quiet gap is not an end: the reader may not have reached
+            // the bytes still in the pipe. Only the reader's own ending
+            // — EOF, a failure it already recorded, or its exit — ends
+            // the drain early; anything else waits for the deadline.
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Ok(StdoutLine::Failed(_) | StdoutLine::Eof)
+            | Err(mpsc::RecvTimeoutError::Disconnected) => return (out, dropped, None),
         }
     }
 }
@@ -3356,17 +3473,20 @@ fn harness_default_origin(constants: ProtocolConstants) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        abandon_startup, build_minimal_record, record_survivors, report_within, start_time_in,
-        survivor_resume_refusal, terminate_within, Child, ChildGuard, Command, CommandExt, Duration,
-        Instant, Pid, Profile, RunKind, RunSpec, Signal, Stdio, ServerKind, SystemTime, UNIX_EPOCH,
-        proc_start_time, GUARD_SIGKILL_REAP_TIMEOUT_SECS, GUARD_REPORT_TIMEOUT_SECS,
-        GIT_HEAD_PROBE, PROBE_OWN_PROCESS_GROUP, SURVIVOR_START_UNKNOWN,
+        abandon_startup, build_minimal_record, record_survivors, report_within, spawn_counter_stderr_reader,
+        start_time_in, survivor_resume_refusal, terminate_within, wait_for_strace_attach, Arc, Child,
+        ChildGuard, Command, CommandExt, CpuSets, Duration, Env, HostSetup, Instant, PathBuf, Pid,
+        Profile, RunKind, RunSpec, Signal, Stdio, ServerKind, StdoutLine, SyscallMethod, SystemTime,
+        UNIX_EPOCH, proc_start_time, COUNTER_DIAGNOSTIC_LINES_MAX, COUNTER_STDERR_LINE_BYTES_MAX,
+        GUARD_SIGKILL_REAP_TIMEOUT_SECS, GUARD_REPORT_TIMEOUT_SECS, GIT_HEAD_PROBE,
+        PROBE_OWN_PROCESS_GROUP, StderrLoss, SURVIVOR_START_UNKNOWN, WAIT_POLL_MS,
     };
     use nix::errno::Errno;
     use nix::sys::signal::kill;
     use std::io::{BufRead, BufReader, Write};
     use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
     use std::sync::mpsc;
+    use std::sync::Mutex;
     use std::thread::sleep;
 
     /// Long enough that the fixture probe is certainly still running when
@@ -3967,5 +4087,344 @@ mod tests {
                 "start token {token:?} names no live process"
             );
         }
+    }
+
+    /// Lines the flood fixture writes: `seq 0 19999` is 108 890 bytes, past
+    /// the 64 KiB pipe buffer, so the fixture cannot exit before the
+    /// reader has taken far more than the queue bound.
+    const READER_FLOOD_LINES: usize = 20_000;
+
+    /// Time the flood fixture and then the reader thread get to finish; a
+    /// reader that blocks on its queue never lets either finish.
+    const READER_FLOOD_BOUND: Duration = Duration::from_secs(10);
+
+    /// Lines ahead of the attach marker — past `COUNTER_DIAGNOSTIC_LINES_MAX`.
+    const ATTACH_FLOOD_LINES: usize = 300;
+
+    /// Build a `HostSetup` for the in-crate reader / marker-wait tests.
+    /// Only `syscalls` and `cancel` are read by these paths; every other
+    /// field stays empty.
+    fn counter_fixture_host() -> HostSetup {
+        HostSetup {
+            bench_exe: PathBuf::new(),
+            mosquitto_bin: None,
+            syscalls: SyscallMethod::Strace,
+            perf_bin: None,
+            strace_bin: None,
+            cpu_sets: CpuSets {
+                server: String::new(),
+                generator: String::new(),
+            },
+            env: Env {
+                kernel: String::new(),
+                cpu_model: String::new(),
+                host: String::new(),
+                git_sha: String::new(),
+                git_dirty: false,
+                tools: Vec::new(),
+            },
+            scratch_dir: PathBuf::new(),
+            cpu_pressure_path: PathBuf::new(),
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Wait for a child to exit and then for the reader thread to drop its
+    /// `StderrLoss` clone, so the reader has finished and will queue
+    /// nothing more. On timeout the child is killed and the test panics
+    /// with `what` naming which wait timed out.
+    fn wait_for_reader_done(child: &mut Child, loss: &Arc<Mutex<StderrLoss>>, what: &str) {
+        let deadline = Instant::now() + READER_FLOOD_BOUND;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!("child did not exit before {READER_FLOOD_BOUND:?} while waiting for {what}");
+                    }
+                    sleep(Duration::from_millis(WAIT_POLL_MS));
+                }
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("try_wait while waiting for {what}: {e}");
+                }
+            }
+        }
+        loop {
+            if Arc::strong_count(loss) == 1 {
+                return;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("reader thread did not finish before {READER_FLOOD_BOUND:?} while waiting for {what}");
+            }
+            sleep(Duration::from_millis(WAIT_POLL_MS));
+        }
+    }
+
+    #[test]
+    fn counter_stderr_reader_queues_only_the_first_lines_it_can_keep() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(format!("seq 0 {} >&2", READER_FLOOD_LINES - 1))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn flood fixture");
+        let stderr = child.stderr.take().expect("piped stderr");
+        let (rx, loss) = spawn_counter_stderr_reader(stderr).expect("spawn probe");
+
+        wait_for_reader_done(&mut child, &loss, "flood fixture exit");
+
+        let queued: Vec<String> = rx
+            .try_iter()
+            .map(|m| match m {
+                StdoutLine::Line(l) => l,
+                StdoutLine::Eof => "<eof>".to_string(),
+                StdoutLine::Failed(e) => format!("<failed {e}>"),
+            })
+            .collect();
+        assert_eq!(
+            queued.len(),
+            COUNTER_DIAGNOSTIC_LINES_MAX,
+            "queue must hold exactly COUNTER_DIAGNOSTIC_LINES_MAX lines; got {queued:?}"
+        );
+        assert_eq!(queued[0], "0\n", "queue head");
+        assert_eq!(
+            queued[COUNTER_DIAGNOSTIC_LINES_MAX - 1],
+            format!("{}\n", COUNTER_DIAGNOSTIC_LINES_MAX - 1),
+            "queue tail"
+        );
+        let locked = loss.lock().expect("stderr loss poisoned");
+        assert!(locked.dropped, "a dropped line must be recorded");
+        assert!(
+            locked.failure.is_none(),
+            "a flood the reader read to the end must not record a failure; got {:?}",
+            locked.failure
+        );
+    }
+
+    #[test]
+    fn counter_stderr_reader_fails_a_line_one_byte_past_the_cap() {
+        struct Fixture {
+            script: &'static str,
+            label: &'static str,
+            no_eol_after: bool,
+            exact_cap_then_eof: bool,
+            non_utf8: bool,
+        }
+        let fixtures: [Fixture; 4] = [
+            Fixture {
+                script:
+                    "head -c 4096 /dev/zero | tr '\\0' x >&2; echo >&2; \
+                     head -c 4097 /dev/zero | tr '\\0' x >&2; echo >&2",
+                label: "4097-byte line after a 4096-byte line",
+                no_eol_after: false,
+                exact_cap_then_eof: false,
+                non_utf8: false,
+            },
+            Fixture {
+                script: "head -c 4096 /dev/zero | tr '\\0' x >&2",
+                label: "4096-byte line, EOF-terminated",
+                no_eol_after: false,
+                exact_cap_then_eof: true,
+                non_utf8: false,
+            },
+            Fixture {
+                script: "head -c 4097 /dev/zero | tr '\\0' x >&2",
+                label: "4097-byte line, EOF-terminated",
+                no_eol_after: true,
+                exact_cap_then_eof: false,
+                non_utf8: false,
+            },
+            Fixture {
+                script: "printf '\\377\\n' >&2",
+                label: "non-UTF-8 line",
+                no_eol_after: false,
+                exact_cap_then_eof: false,
+                non_utf8: true,
+            },
+        ];
+
+        for fixture in &fixtures {
+            let mut child = Command::new("sh")
+                .arg("-c")
+                .arg(fixture.script)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn fixture");
+            let stderr = child.stderr.take().expect("piped stderr");
+            let (rx, loss) =
+                spawn_counter_stderr_reader(stderr).expect("spawn probe");
+
+            wait_for_reader_done(&mut child, &loss, fixture.label);
+
+            let queued: Vec<StdoutLine> = rx.try_iter().collect();
+            let failure_text = format!("line longer than {COUNTER_STDERR_LINE_BYTES_MAX} bytes");
+            if fixture.non_utf8 {
+                assert_eq!(
+                    queued.len(),
+                    1,
+                    "[{}] exactly one Failed message expected; got {:?}",
+                    fixture.label,
+                    queued
+                );
+                assert!(
+                    matches!(&queued[0], StdoutLine::Failed(e) if *e == "stream did not contain valid UTF-8"),
+                    "[{}] expected Failed(UTF-8); got {:?}",
+                    fixture.label,
+                    queued[0]
+                );
+                assert_eq!(
+                    loss.lock().expect("stderr loss poisoned").failure.as_deref(),
+                    Some("stream did not contain valid UTF-8"),
+                    "[{}] failure recorded",
+                    fixture.label
+                );
+            } else if fixture.exact_cap_then_eof {
+                assert_eq!(
+                    queued.len(),
+                    2,
+                    "[{}] Line then Eof expected; got {:?}",
+                    fixture.label,
+                    queued
+                );
+                let line = match &queued[0] {
+                    StdoutLine::Line(s) => s,
+                    other => panic!("[{}] expected Line, got {:?}", fixture.label, other),
+                };
+                assert_eq!(
+                    line.len() as u64,
+                    COUNTER_STDERR_LINE_BYTES_MAX,
+                    "[{}] exact-cap line length",
+                    fixture.label
+                );
+                assert_eq!(queued[1], StdoutLine::Eof, "[{}] trailing Eof", fixture.label);
+                assert!(
+                    loss.lock().expect("stderr loss poisoned").failure.is_none(),
+                    "[{}] no failure recorded",
+                    fixture.label
+                );
+            } else if fixture.no_eol_after {
+                assert_eq!(
+                    queued.len(),
+                    1,
+                    "[{}] exactly one Failed message expected; got {:?}",
+                    fixture.label,
+                    queued
+                );
+                assert!(
+                    matches!(&queued[0], StdoutLine::Failed(e) if *e == failure_text),
+                    "[{}] expected Failed({:?}); got {:?}",
+                    fixture.label,
+                    failure_text,
+                    queued[0]
+                );
+                assert_eq!(
+                    loss.lock().expect("stderr loss poisoned").failure.as_deref(),
+                    Some(failure_text.as_str()),
+                    "[{}] failure recorded",
+                    fixture.label
+                );
+            } else {
+                assert_eq!(
+                    queued.len(),
+                    2,
+                    "[{}] Line then Failed expected; got {:?}",
+                    fixture.label,
+                    queued
+                );
+                let first = match &queued[0] {
+                    StdoutLine::Line(s) => s,
+                    other => panic!("[{}] expected Line, got {:?}", fixture.label, other),
+                };
+                assert_eq!(
+                    first.len(),
+                    usize::try_from(COUNTER_STDERR_LINE_BYTES_MAX + 1)
+                        .expect("line cap fits in usize"),
+                    "[{}] exact-cap-plus-newline line length",
+                    fixture.label
+                );
+                assert!(
+                    matches!(&queued[1], StdoutLine::Failed(e) if *e == failure_text),
+                    "[{}] expected Failed({:?}); got {:?}",
+                    fixture.label,
+                    failure_text,
+                    queued[1]
+                );
+                assert_eq!(
+                    loss.lock().expect("stderr loss poisoned").failure.as_deref(),
+                    Some(failure_text.as_str()),
+                    "[{}] failure recorded",
+                    fixture.label
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn strace_attach_wait_keeps_only_the_first_lines_it_can_keep() {
+        let (tx, rx) = mpsc::channel();
+        for i in 0..ATTACH_FLOOD_LINES {
+            tx.send(StdoutLine::Line(format!("noise {i}\n")))
+                .expect("send noise");
+        }
+        tx.send(StdoutLine::Line(
+            "strace: Process 7 attached\n".to_string(),
+        ))
+        .expect("send marker");
+        drop(tx);
+
+        let mut errors = Vec::new();
+        let host = counter_fixture_host();
+        let (enabled, lines) = wait_for_strace_attach(&rx, &host, &mut errors);
+
+        assert!(enabled.is_some(), "marker must be observed; errors={errors:?}");
+        assert_eq!(
+            lines.len(),
+            COUNTER_DIAGNOSTIC_LINES_MAX + 1,
+            "attach wait must keep one line past the record's cap and no more; the marker arrived after them and is not retained"
+        );
+        assert_eq!(lines[0], "noise 0", "first line retained");
+        assert!(
+            errors.is_empty(),
+            "a marker-arrival wait must not push a read failure of its own; got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn strace_attach_wait_ends_on_a_read_failure_without_naming_it() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(StdoutLine::Line("strace: starting\n".to_string()))
+            .expect("send line");
+        tx.send(StdoutLine::Failed(
+            "line longer than 4096 bytes".to_string(),
+        ))
+        .expect("send failure");
+        drop(tx);
+
+        let mut errors = Vec::new();
+        let host = counter_fixture_host();
+        let (enabled, lines) = wait_for_strace_attach(&rx, &host, &mut errors);
+
+        assert_eq!(enabled, None, "no marker arrived, so nothing is enabled");
+        assert_eq!(
+            lines,
+            vec!["strace: starting".to_string()],
+            "the lines read before the failure are kept"
+        );
+        // `finalize_counter` names the failure once, from `StderrLoss`; a
+        // second error here would report it twice for one record.
+        assert!(
+            errors.is_empty(),
+            "the failure is named from StderrLoss, not here; got {errors:?}"
+        );
     }
 }

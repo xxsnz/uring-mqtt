@@ -488,6 +488,11 @@ exit 1:
   position has a blank path.
 - `BlankToolVersion(path)` — the `env.tools` entry for that path has
   a blank version.
+- `BlankCpuSet(field)` — the shared `cpu_sets.server` or
+  `cpu_sets.generator` is blank. `bench run` records the
+  `--server-cpus` / `--generator-cpus` value it passed to
+  `taskset -c`; record a fresh run with non-blank sets — `--resume`
+  refuses a changed value.
 - `InconsistentRecord(file: mismatches)` — `recompute` rejected at
   least one record.
 - `ProtocolViolation(text)` — recorded constants diverge, a counted

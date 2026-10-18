@@ -278,6 +278,241 @@ echo "strace: Process $PID attached with $((THREADS - 1)) threads" >&2
 while :; do sleep 0.1; done
 "#;
 
+/// Strace that attaches, writes a parseable `-c` summary and exits 0
+/// one second into the five-second smoke window while the server keeps
+/// running — a partial-window count the runner must not accept.
+const FAKE_STRACE_EARLY_EXIT: &str = r#"
+OUT=
+PID=
+while [ $# -gt 0 ]; do
+    case $1 in
+        -o)
+            OUT="$2"
+            shift
+            ;;
+        -p)
+            PID="$2"
+            shift
+            ;;
+    esac
+    shift
+done
+[ -n "$OUT" ] && [ -n "$PID" ] || exit 2
+THREADS=$(ls "/proc/$PID/task" | wc -l)
+echo "strace: Process $PID attached with $THREADS threads" >&2
+echo "100.00    0.000100           1       100           total" > "$OUT"
+sleep 1
+exit 0
+"#;
+
+/// Perf that acks `enable`, writes its count to stderr (the runner's
+/// raw-output file) and exits 0 one second into the window, before
+/// the runner's `disable`.
+const FAKE_PERF_EARLY_EXIT: &str = r#"
+CTL=
+ACK=
+for arg in "$@"; do
+    case $arg in
+        --control=fifo:*,*)
+            CTL="${arg#--control=fifo:}"
+            ACK="${CTL#*,}"
+            CTL="${CTL%%,*}"
+            ;;
+    esac
+done
+[ -n "$CTL" ] && [ -n "$ACK" ] || exit 2
+exec 3<"$CTL"
+exec 4>"$ACK"
+read -r c <&3
+[ "$c" = enable ] || exit 3
+echo ack >&4
+echo "5000,,raw_syscalls:sys_enter,1000,100.00,," >&2
+sleep 1
+exit 0
+"#;
+
+/// Strace that prints one stderr line longer than the reader's
+/// 4096-byte cap after attaching, then more stderr than a pipe holds.
+const FAKE_STRACE_LONG_LINE: &str = r#"
+trap 'echo "100.00    0.000100           1       100           total" > "$OUT"; kill $IDLE 2>/dev/null; trap - INT; kill -INT $$' INT
+OUT=
+PID=
+while [ $# -gt 0 ]; do
+    case $1 in
+        -o)
+            OUT="$2"
+            shift
+            ;;
+        -p)
+            PID="$2"
+            shift
+            ;;
+    esac
+    shift
+done
+[ -n "$OUT" ] && [ -n "$PID" ] || exit 2
+THREADS=$(ls "/proc/$PID/task" | wc -l)
+echo "strace: Process $PID attached with $THREADS threads" >&2
+head -c 5000 /dev/zero | tr '\0' x >&2
+echo >&2
+i=0
+while [ $i -lt 2000 ]; do echo "after the long line, filler to pass the 64 KiB pipe buffer: $i ....................................." >&2; i=$((i+1)); done
+sleep 1000 &
+IDLE=$!
+wait
+"#;
+
+/// Strace that prints 1000 stderr lines after attaching — past the
+/// 256-line diagnostics cap.
+const FAKE_STRACE_FLOOD: &str = r#"
+trap 'echo "100.00    0.000100           1       100           total" > "$OUT"; kill $IDLE 2>/dev/null; trap - INT; kill -INT $$' INT
+OUT=
+PID=
+while [ $# -gt 0 ]; do
+    case $1 in
+        -o)
+            OUT="$2"
+            shift
+            ;;
+        -p)
+            PID="$2"
+            shift
+            ;;
+    esac
+    shift
+done
+[ -n "$OUT" ] && [ -n "$PID" ] || exit 2
+THREADS=$(ls "/proc/$PID/task" | wc -l)
+echo "strace: Process $PID attached with $THREADS threads" >&2
+i=0
+while [ $i -lt 1000 ]; do echo "flood $i" >&2; i=$((i+1)); done
+sleep 1000 &
+IDLE=$!
+wait
+"#;
+
+/// Strace that floods past the diagnostics cap and then prints a line
+/// longer than the byte cap — both causes must be named.
+const FAKE_STRACE_FLOOD_THEN_LONG_LINE: &str = r#"
+trap 'echo "100.00    0.000100           1       100           total" > "$OUT"; kill $IDLE 2>/dev/null; trap - INT; kill -INT $$' INT
+OUT=
+PID=
+while [ $# -gt 0 ]; do
+    case $1 in
+        -o)
+            OUT="$2"
+            shift
+            ;;
+        -p)
+            PID="$2"
+            shift
+            ;;
+    esac
+    shift
+done
+[ -n "$OUT" ] && [ -n "$PID" ] || exit 2
+THREADS=$(ls "/proc/$PID/task" | wc -l)
+echo "strace: Process $PID attached with $THREADS threads" >&2
+i=0
+while [ $i -lt 1000 ]; do echo "flood $i" >&2; i=$((i+1)); done
+head -c 5000 /dev/zero | tr '\0' x >&2
+echo >&2
+sleep 1000 &
+IDLE=$!
+wait
+"#;
+
+/// Strace whose descendant prints a too-long stderr line 300 ms after
+/// the counter exited — a drain that ended on a quiet gap would miss
+/// it.
+const FAKE_STRACE_LATE_LONG_LINE: &str = r#"
+trap 'echo "100.00    0.000100           1       100           total" > "$OUT"; kill $IDLE 2>/dev/null; ( sleep 0.3; head -c 5000 /dev/zero | tr '\''\0'\'' x >&2; echo >&2 ) & trap - INT; kill -INT $$' INT
+OUT=
+PID=
+while [ $# -gt 0 ]; do
+    case $1 in
+        -o)
+            OUT="$2"
+            shift
+            ;;
+        -p)
+            PID="$2"
+            shift
+            ;;
+    esac
+    shift
+done
+[ -n "$OUT" ] && [ -n "$PID" ] || exit 2
+THREADS=$(ls "/proc/$PID/task" | wc -l)
+echo "strace: Process $PID attached with $THREADS threads" >&2
+sleep 1000 &
+IDLE=$!
+wait
+"#;
+
+/// Strace that prints a too-long line and leaves a descendant holding
+/// stderr open, so the reader sees no EOF before the drain ends. The
+/// holder starts from the INT trap, at the window end: started before the
+/// window it would release stderr partway through the finalization drain,
+/// and an implementation that only reports the failure at EOF would pass.
+const FAKE_STRACE_LONG_LINE_HELD_OPEN: &str = r#"
+trap 'echo "100.00    0.000100           1       100           total" > "$OUT"; kill $IDLE 2>/dev/null; sleep 8 & trap - INT; kill -INT $$' INT
+OUT=
+PID=
+while [ $# -gt 0 ]; do
+    case $1 in
+        -o)
+            OUT="$2"
+            shift
+            ;;
+        -p)
+            PID="$2"
+            shift
+            ;;
+    esac
+    shift
+done
+[ -n "$OUT" ] && [ -n "$PID" ] || exit 2
+THREADS=$(ls "/proc/$PID/task" | wc -l)
+echo "strace: Process $PID attached with $THREADS threads" >&2
+head -c 5000 /dev/zero | tr '\0' x >&2
+echo >&2
+sleep 1000 &
+IDLE=$!
+wait
+"#;
+
+/// Strace whose stderr lines, the attach marker included, exactly fill the
+/// 256-line diagnostics cap (255 filler lines after the marker) and are
+/// then followed by EOF — the record keeps every line, so nothing was
+/// truncated.
+const FAKE_STRACE_EXACTLY_THE_CAP: &str = r#"
+trap 'echo "100.00    0.000100           1       100           total" > "$OUT"; kill $IDLE 2>/dev/null; trap - INT; kill -INT $$' INT
+OUT=
+PID=
+while [ $# -gt 0 ]; do
+    case $1 in
+        -o)
+            OUT="$2"
+            shift
+            ;;
+        -p)
+            PID="$2"
+            shift
+            ;;
+    esac
+    shift
+done
+[ -n "$OUT" ] && [ -n "$PID" ] || exit 2
+THREADS=$(ls "/proc/$PID/task" | wc -l)
+echo "strace: Process $PID attached with $THREADS threads" >&2
+i=0
+while [ $i -lt 255 ]; do echo "filler $i" >&2; i=$((i+1)); done
+sleep 1000 &
+IDLE=$!
+wait
+"#;
+
 #[test]
 fn run_one_counts_syscalls_through_the_perf_control_protocol() {
     let dir = temp_dir("perf-success");
@@ -660,4 +895,271 @@ fn run_one_names_no_counter_on_a_latency_run_that_fails_before_its_window() {
 
         let _ = fs::remove_dir_all(&dir);
     }
+}
+
+#[test]
+fn run_one_invalidates_a_strace_run_whose_counter_exited_before_the_window_end() {
+    let dir = temp_dir("strace-early-exit");
+    let script = make_script(&dir, "fake-strace.sh", FAKE_STRACE_EARLY_EXIT);
+    let host = make_host(&dir, SyscallMethod::Strace, Some(script));
+    let record = run_one(&counted_spec(), &host);
+
+    assert!(!record.valid);
+    let counter_errors: Vec<&str> = record
+        .harness_errors
+        .iter()
+        .map(String::as_str)
+        .filter(|e| e.starts_with("syscall counter:"))
+        .collect();
+    assert_eq!(
+        counter_errors,
+        vec!["syscall counter: exited before the window end with Code(0)"],
+        "harness_errors was {:?}",
+        record.harness_errors
+    );
+    assert_eq!(record.syscalls.exit, Some(CounterExit::Code(0)));
+    assert_eq!(record.syscalls.disabled_ns, None);
+    assert!(record.syscalls.raw.is_some());
+    assert_eq!(record.syscalls.count, Some(100));
+    assert!(
+        record
+            .invalid_reasons
+            .iter()
+            .any(|r| r.starts_with("counter boundaries outside tolerance")),
+        "expected 'counter boundaries outside tolerance' in {:?}",
+        record.invalid_reasons
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn run_one_invalidates_a_strace_run_with_a_stderr_line_longer_than_the_cap() {
+    let dir = temp_dir("strace-long-line");
+    let script = make_script(&dir, "fake-strace.sh", FAKE_STRACE_LONG_LINE);
+    let host = make_host(&dir, SyscallMethod::Strace, Some(script));
+    let record = run_one(&counted_spec(), &host);
+
+    assert!(!record.valid, "a too-long stderr line must invalidate the run");
+    assert!(
+        record
+            .harness_errors
+            .iter()
+            .any(|e| e == "syscall counter: stderr read: line longer than 4096 bytes"),
+        "expected 'syscall counter: stderr read: line longer than 4096 bytes' in {:?}",
+        record.harness_errors
+    );
+    let diagnostics = record.syscalls.diagnostics.as_deref().unwrap_or("");
+    assert!(
+        diagnostics.lines().all(|l| l.len() <= 4096),
+        "no kept diagnostics line may exceed the 4096-byte cap; got: {diagnostics}"
+    );
+    // The failure is named once, from `StderrLoss` — not again from the
+    // message the reader queued.
+    assert_eq!(
+        record
+            .harness_errors
+            .iter()
+            .filter(|e| e.starts_with("syscall counter: stderr read:"))
+            .count(),
+        1,
+        "the read failure must be named once; harness_errors was {:?}",
+        record.harness_errors
+    );
+    assert_eq!(record.syscalls.count, Some(100));
+    assert_eq!(record.syscalls.exit, Some(CounterExit::Signal(2)));
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn run_one_names_a_long_stderr_line_that_follows_a_diagnostics_flood() {
+    let dir = temp_dir("strace-flood-then-long-line");
+    let script = make_script(&dir, "fake-strace.sh", FAKE_STRACE_FLOOD_THEN_LONG_LINE);
+    let host = make_host(&dir, SyscallMethod::Strace, Some(script));
+    let record = run_one(&counted_spec(), &host);
+
+    assert!(
+        record
+            .harness_errors
+            .iter()
+            .any(|e| e == "syscall counter: diagnostics truncated at 256 lines"),
+        "expected 'syscall counter: diagnostics truncated at 256 lines' in {:?}",
+        record.harness_errors
+    );
+    assert!(
+        record
+            .harness_errors
+            .iter()
+            .any(|e| e == "syscall counter: stderr read: line longer than 4096 bytes"),
+        "expected 'syscall counter: stderr read: line longer than 4096 bytes' in {:?}",
+        record.harness_errors
+    );
+    assert_eq!(record.syscalls.exit, Some(CounterExit::Signal(2)));
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn run_one_names_a_long_stderr_line_while_a_descendant_holds_stderr_open() {
+    let dir = temp_dir("strace-long-line-held-open");
+    let script = make_script(&dir, "fake-strace.sh", FAKE_STRACE_LONG_LINE_HELD_OPEN);
+    let host = make_host(&dir, SyscallMethod::Strace, Some(script));
+    let record = run_one(&counted_spec(), &host);
+
+    assert!(
+        record
+            .harness_errors
+            .iter()
+            .any(|e| e == "syscall counter: stderr read: line longer than 4096 bytes"),
+        "expected 'syscall counter: stderr read: line longer than 4096 bytes' in {:?}",
+        record.harness_errors
+    );
+    assert!(
+        !record
+            .harness_errors
+            .iter()
+            .any(|e| e.starts_with("syscall counter: stderr still open after")),
+        "the reader's own failure must end the drain, not the timeout; harness_errors was {:?}",
+        record.harness_errors
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn run_one_names_a_long_stderr_line_written_after_the_counter_exits() {
+    let dir = temp_dir("strace-late-long-line");
+    let script = make_script(&dir, "fake-strace.sh", FAKE_STRACE_LATE_LONG_LINE);
+    let host = make_host(&dir, SyscallMethod::Strace, Some(script));
+    let record = run_one(&counted_spec(), &host);
+
+    assert!(
+        record
+            .harness_errors
+            .iter()
+            .any(|e| e == "syscall counter: stderr read: line longer than 4096 bytes"),
+        "expected 'syscall counter: stderr read: line longer than 4096 bytes' in {:?}",
+        record.harness_errors
+    );
+    assert!(
+        !record
+            .harness_errors
+            .iter()
+            .any(|e| e.starts_with("syscall counter: stderr still open after")),
+        "a quiet gap must not end the drain before the late line arrives; harness_errors was {:?}",
+        record.harness_errors
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn run_one_reports_a_strace_diagnostics_flood_as_truncated() {
+    let dir = temp_dir("strace-flood");
+    let script = make_script(&dir, "fake-strace.sh", FAKE_STRACE_FLOOD);
+    let host = make_host(&dir, SyscallMethod::Strace, Some(script));
+    let record = run_one(&counted_spec(), &host);
+
+    assert!(
+        record
+            .harness_errors
+            .iter()
+            .any(|e| e == "syscall counter: diagnostics truncated at 256 lines"),
+        "expected 'syscall counter: diagnostics truncated at 256 lines' in {:?}",
+        record.harness_errors
+    );
+    let diagnostics = record
+        .syscalls
+        .diagnostics
+        .as_deref()
+        .expect("strace diagnostics captured");
+    assert_eq!(diagnostics.lines().count(), 256);
+    assert!(
+        diagnostics
+            .lines()
+            .next()
+            .expect("at least one diagnostics line")
+            .contains("attached with"),
+        "first diagnostics line must be the attach marker; got: {diagnostics}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn run_one_reports_no_truncation_when_the_diagnostics_exactly_fill_the_cap() {
+    let dir = temp_dir("strace-exactly-the-cap");
+    let script = make_script(&dir, "fake-strace.sh", FAKE_STRACE_EXACTLY_THE_CAP);
+    let host = make_host(&dir, SyscallMethod::Strace, Some(script));
+    let record = run_one(&counted_spec(), &host);
+
+    let diagnostics = record
+        .syscalls
+        .diagnostics
+        .as_deref()
+        .expect("strace diagnostics captured");
+    assert_eq!(
+        diagnostics.lines().count(),
+        256,
+        "every line the counter wrote fits the cap; got:\n{diagnostics}"
+    );
+    // The drain kept exactly its budget and then saw EOF: nothing was
+    // dropped, so no truncation may be reported.
+    assert!(
+        !record
+            .harness_errors
+            .iter()
+            .any(|e| e.contains("diagnostics truncated")),
+        "no line was dropped; harness_errors was {:?}",
+        record.harness_errors
+    );
+    assert!(
+        !record
+            .harness_errors
+            .iter()
+            .any(|e| e.starts_with("syscall counter: stderr read:")),
+        "no read failed; harness_errors was {:?}",
+        record.harness_errors
+    );
+    assert_eq!(record.syscalls.count, Some(100));
+    assert_eq!(record.syscalls.exit, Some(CounterExit::Signal(2)));
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn run_one_invalidates_a_perf_run_whose_counter_exited_before_the_window_end() {
+    let dir = temp_dir("perf-early-exit");
+    let script = make_script(&dir, "fake-perf.sh", FAKE_PERF_EARLY_EXIT);
+    let host = make_host(&dir, SyscallMethod::Perf, Some(script));
+    let record = run_one(&counted_spec(), &host);
+
+    assert!(!record.valid);
+    let counter_errors: Vec<&str> = record
+        .harness_errors
+        .iter()
+        .map(String::as_str)
+        .filter(|e| e.starts_with("syscall counter:"))
+        .collect();
+    assert_eq!(
+        counter_errors,
+        vec!["syscall counter: exited before the window end with Code(0)"],
+        "harness_errors was {:?}",
+        record.harness_errors
+    );
+    assert_eq!(record.syscalls.exit, Some(CounterExit::Code(0)));
+    assert_eq!(record.syscalls.disabled_ns, None);
+    assert!(record.syscalls.raw.is_some());
+    assert_eq!(record.syscalls.count, Some(5000));
+    assert!(
+        record
+            .invalid_reasons
+            .iter()
+            .any(|r| r.starts_with("counter boundaries outside tolerance")),
+        "expected 'counter boundaries outside tolerance' in {:?}",
+        record.invalid_reasons
+    );
+
+    let _ = fs::remove_dir_all(&dir);
 }

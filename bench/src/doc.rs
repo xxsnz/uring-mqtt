@@ -70,6 +70,10 @@ pub enum DocError {
     /// entry whose version holds nothing but whitespace and control
     /// characters.
     BlankToolVersion(String),
+    /// Recorded mode requires the shared `cpu_sets.server` and
+    /// `cpu_sets.generator` to render a non-blank cell; holds the field
+    /// name, `server` or `generator`, of the first blank one.
+    BlankCpuSet(String),
     /// `analysis::recompute` flagged a record whose derived fields
     /// contradict its raw observations.
     InconsistentRecord(String),
@@ -288,6 +292,19 @@ pub fn render(records: &[RunRecord], smoke: bool) -> Result<String, DocError> {
             return Err(DocError::ProtocolViolation(format!(
                 "multiple cpu_sets pairs: {cpu_set_pairs:?}"
             )));
+        }
+        // `## Environment` prints the shared pair as one cell for every
+        // figure, and the CPU % columns divide by the CPUs it names. A
+        // set that `cell` renders blank identifies no CPU and leaves every
+        // CPU figure `n/a`, so the field is named instead. Checked after
+        // the pair check, so a set that disagrees still reports as mixed.
+        if let Some((server, generator)) = cpu_set_pairs.iter().next() {
+            if cell(server).trim().is_empty() {
+                return Err(DocError::BlankCpuSet("server".to_string()));
+            }
+            if cell(generator).trim().is_empty() {
+                return Err(DocError::BlankCpuSet("generator".to_string()));
+            }
         }
     }
 
