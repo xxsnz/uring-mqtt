@@ -15,8 +15,9 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use bench::analysis::host_pressure_note;
 use bench::run_record::{Profile, RunKind, RunRecord, SCHEMA_VERSION, ServerKind};
-use bench::runner::TOOL_VERSION_TIMEOUT_SECS;
+use bench::runner::{HOST_CPU_PRESSURE_PATH, TOOL_VERSION_TIMEOUT_SECS};
 use nix::sys::signal::{kill, Signal};
 use nix::sys::wait::waitpid;
 use nix::unistd::Pid;
@@ -500,6 +501,24 @@ fn load_records(dir: &std::path::Path) -> Vec<(String, RunRecord)> {
     out
 }
 
+/// `name: reasons; host clause` for every invalid record in `records`, so
+/// a smoke failure that stops before every record exists — a failed
+/// throughput configuration leaves its latency configurations unrun —
+/// still names the host condition each invalid run was measured under.
+fn invalid_summary(records: &[(String, RunRecord)]) -> Vec<String> {
+    records
+        .iter()
+        .filter(|(_, record)| !record.valid)
+        .map(|(name, record)| {
+            format!(
+                "{name}: {:?}; {}",
+                record.invalid_reasons,
+                host_pressure_note(record)
+            )
+        })
+        .collect()
+}
+
 /// Assert that `record` is valid, naming the reasons when it is not.
 fn assert_record_valid(name: &str, record: &RunRecord) {
     assert!(
@@ -544,8 +563,10 @@ fn smoke_matrix_writes_every_configuration_valid() {
     // failed would leave its latency configurations unrun, so the count
     // alone catches a half-run matrix.
     let count = count_json(&out_dir);
-    assert_eq!(count, 8, "expected 8 .json files, got {count}");
     let records = load_records(&out_dir);
+    assert_eq!(count, 8, "expected 8 .json files, got {count}; invalid records: {:?}", invalid_summary(&records));
+
+    let pressure_readable = fs::read_to_string(HOST_CPU_PRESSURE_PATH).is_ok();
 
     for (name, record) in &records {
         assert_eq!(record.profile, Profile::Smoke, "{name}: profile");
@@ -553,6 +574,10 @@ fn smoke_matrix_writes_every_configuration_valid() {
         assert_eq!(record.workers, 1, "{name}: workers");
         assert_eq!(record.schema, SCHEMA_VERSION, "{name}: schema");
         assert_eq!(record.attempt, 1, "{name}: smoke stops at attempt 1");
+        assert!(
+            !pressure_readable || record.cpu.is_none() || record.host_cpu_pressure.is_some(),
+            "{name}: {HOST_CPU_PRESSURE_PATH} is readable and the run took its window samples, so the record must carry host_cpu_pressure"
+        );
     }
 
     // The matrix must cover exactly the four §9.1 configurations of this
@@ -577,6 +602,9 @@ fn smoke_matrix_writes_every_configuration_valid() {
         "the smoke matrix must run throughput, latency 50 %, latency 80 % \
          and connections at both repetitions"
     );
+
+    let invalid = invalid_summary(&records);
+    assert!(invalid.is_empty(), "every smoke record must be valid; invalid records: {invalid:?}");
 
     for (name, record) in &records {
         assert_record_valid(name, record);

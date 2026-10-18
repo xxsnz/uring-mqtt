@@ -214,6 +214,7 @@ fn passing_record(
             server_ticks: 22_800,
             generator_ticks: 24_000,
         }),
+        host_cpu_pressure: None,
         started_at_unix: 1_791_273_600,
         harness_errors: Vec::new(),
         valid: true,
@@ -1672,6 +1673,7 @@ fn stub_host(dir: &Path, syscalls: SyscallMethod) -> HostSetup {
             tools: Vec::new(),
         },
         scratch_dir: dir.join(".scratch"),
+        cpu_pressure_path: PathBuf::from(bench::runner::HOST_CPU_PRESSURE_PATH),
         cancel: std::sync::Arc::new(AtomicBool::new(false)),
     }
 }

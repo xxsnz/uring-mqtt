@@ -125,6 +125,18 @@ pub struct CpuUsage {
     pub generator_ticks: u64,
 }
 
+/// Host-wide CPU pressure over the interval the run's CPU samples bracket:
+/// growth of `/proc/pressure/cpu`'s `some` line `total=` counter, the
+/// microseconds during which at least one runnable task waited for a CPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostCpuPressure {
+    /// Monotonic nanoseconds between the start and the end sample — the
+    /// same interval as `CpuUsage.sampled_ns`.
+    pub sampled_ns: u64,
+    /// Growth of the `some` line's `total=` counter, in microseconds.
+    pub some_stall_us: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Env {
     pub kernel: String,
@@ -190,6 +202,13 @@ pub struct RunRecord {
     pub cpu_sets: CpuSets,
     pub env: Env,
     pub cpu: Option<CpuUsage>,
+    /// Host CPU pressure over the interval `cpu` covers (the window, or less
+    /// for a run cancelled before its window ended); `None` when the pressure
+    /// file was unreadable or unparsable at either sample, or the run returned
+    /// before its window samples. Records written before this field existed
+    /// read as `None`.
+    #[serde(default)]
+    pub host_cpu_pressure: Option<HostCpuPressure>,
     pub started_at_unix: u64,
     pub harness_errors: Vec<String>,
     pub valid: bool,

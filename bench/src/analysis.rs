@@ -23,7 +23,8 @@ use std::path::Path;
 use crate::gen::{scheduled_slots, slot_counts};
 use crate::record::LATENCY_BUCKET_MAX_NS;
 use crate::run_record::{
-    CounterExit, DriverFds, LatencySummary, RunKind, RunRecord, ServerKind, SyscallMethod,
+    CounterExit, DriverFds, HostCpuPressure, LatencySummary, RunKind, RunRecord, ServerKind,
+    SyscallMethod,
 };
 // The protocol constants the reconciliation rows read belong to the runner
 // (`PLAN.md ## Interface Contracts`, `Protocol constants`). They are used
@@ -48,6 +49,14 @@ const SIGINT: i32 = nix::sys::signal::Signal::SIGINT as i32;
 /// One second in nanoseconds: the record stores durations in seconds and
 /// instants in monotonic nanoseconds.
 const ONE_SECOND_NS: u64 = 1_000_000_000;
+
+/// Nanoseconds per microsecond: the kernel's pressure counter counts
+/// microseconds, the record's intervals nanoseconds.
+const NS_PER_US: u64 = 1_000;
+
+/// Tenths per unit: the host-condition clause prints its percentage
+/// rounded to one decimal place.
+const PCT_TENTHS: f64 = 10.0;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Derived {
@@ -756,9 +765,10 @@ pub fn config_failure(
     }
     if let Some(invalid) = runs.iter().find(|r| !r.valid) {
         return Some(format!(
-            "repetition {} is invalid: {}",
+            "repetition {} is invalid: {}; {}",
             invalid.repetition,
-            invalid.invalid_reasons.join("; ")
+            invalid.invalid_reasons.join("; "),
+            host_pressure_note(invalid)
         ));
     }
     if !enforce_spread {
@@ -805,6 +815,19 @@ pub fn matched_rates(throughput_medians: &[f64]) -> Option<(u64, u64)> {
     let half = (0.5 * min).floor() as u64;
     let eighty = (0.8 * min).floor() as u64;
     Some((half, eighty))
+}
+
+/// `total=` value of the `some` line of `/proc/pressure/cpu`: the
+/// microseconds during which at least one runnable task waited for a CPU.
+/// `None` when no line whose first field is `some` carries a `total=`
+/// field that parses as a `u64`.
+pub fn parse_cpu_pressure_some_total(text: &str) -> Option<u64> {
+    let line = text
+        .lines()
+        .find(|line| line.split_whitespace().next() == Some("some"))?;
+    line.split_whitespace()
+        .find_map(|field| field.strip_prefix("total="))
+        .and_then(|value| value.parse::<u64>().ok())
 }
 
 /// Counter value of the `raw_syscalls:sys_enter` line of `perf stat -x ,`
@@ -949,6 +972,32 @@ pub fn cpu_percent(ticks: u64, clk_tck: u64, sampled_ns: u64, cpus: u32) -> Opti
         .saturating_mul(u128::from(ONE_SECOND_NS)) as f64
         / denom as f64;
     Some(pct)
+}
+
+/// `100 × some_stall_us × NS_PER_US / sampled_ns`: the share of the sampled
+/// interval during which at least one runnable task waited for a CPU.
+/// `None` when `sampled_ns` is 0.
+fn host_cpu_pressure_pct(pressure: &HostCpuPressure) -> Option<f64> {
+    if pressure.sampled_ns == 0 {
+        return None;
+    }
+    let stall_ns = u128::from(pressure.some_stall_us).saturating_mul(u128::from(NS_PER_US));
+    Some(stall_ns.saturating_mul(100) as f64 / pressure.sampled_ns as f64)
+}
+
+/// The host-condition clause [`config_failure`] appends to an invalid
+/// repetition: the host CPU pressure over the run's sampled interval,
+/// rounded to one decimal place. It states what was measured, not what
+/// caused the failure; `bench/README.md` (`## Smoke`) gives the measured
+/// reference bands the operator compares it with.
+pub fn host_pressure_note(record: &RunRecord) -> String {
+    match record.host_cpu_pressure.as_ref().and_then(host_cpu_pressure_pct) {
+        Some(pct) => {
+            let pct = (pct * PCT_TENTHS).round() / PCT_TENTHS;
+            format!("host CPU pressure {pct:.1} % over the sampled interval")
+        }
+        None => "host CPU pressure was not measured".to_string(),
+    }
 }
 
 fn kind_label(kind: RunKind) -> &'static str {

@@ -114,6 +114,7 @@ fn make_host(dir: &Path, syscalls: SyscallMethod, counter: Option<PathBuf>) -> H
         },
         env: capture_env(&[], &AtomicBool::new(false)).expect("capture_env"),
         scratch_dir: dir.to_path_buf(),
+        cpu_pressure_path: PathBuf::from(bench::runner::HOST_CPU_PRESSURE_PATH),
         cancel: Arc::new(AtomicBool::new(false)),
     }
 }

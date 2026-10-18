@@ -496,6 +496,7 @@ fn dispatch_run(
         cpu_sets,
         env,
         scratch_dir,
+        cpu_pressure_path: PathBuf::from(runner::HOST_CPU_PRESSURE_PATH),
         cancel: cancel.clone(),
     };
 

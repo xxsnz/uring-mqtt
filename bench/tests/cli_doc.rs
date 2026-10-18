@@ -150,6 +150,7 @@ fn smoke_throughput_record(repetition: u32) -> RunRecord {
             server_ticks: SERVER_TICKS,
             generator_ticks: GENERATOR_TICKS,
         }),
+        host_cpu_pressure: None,
         started_at_unix: STARTED_AT_UNIX,
         harness_errors: Vec::new(),
         valid: true,

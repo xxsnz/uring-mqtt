@@ -10,15 +10,16 @@ use std::path::PathBuf;
 
 use bench::analysis::{
     config_failure, config_passes, count_driver_fds, cpu_count, cpu_percent, derive, interleave,
-    matched_rates, median, metric, parse_perf_count, parse_strace_total, percentile, reconcile,
-    recompute,
+    matched_rates, median, metric, parse_cpu_pressure_some_total, parse_perf_count,
+    parse_strace_total, percentile, reconcile, recompute,
     spread, GENERATOR_LATENESS_FRACTION, SYSCALL_FRACTION_PCT,
 };
 use bench::gen::slot_counts;
 use bench::record::{Timeline, Window, LATENCY_BUCKET_MAX_NS};
 use bench::run_record::{
     Build, ConfigKey, CounterExit, Counts, CpuSets, CpuUsage, DriverFds, Env, GeneratorErrors,
-    LatencySummary, Profile, RunKind, RunRecord, ServerKind, SyscallMethod, Syscalls, SCHEMA_VERSION,
+    HostCpuPressure, LatencySummary, Profile, RunKind, RunRecord, ServerKind, SyscallMethod,
+    Syscalls, SCHEMA_VERSION,
 };
 
 /// Smoke-protocol window: 2 s warm-up + 5 s window (PLAN.md ## Data Model).
@@ -238,6 +239,7 @@ fn baseline_record(kind: RunKind, server: ServerKind) -> RunRecord {
             server_ticks: 22_800,
             generator_ticks: 24_000,
         }),
+        host_cpu_pressure: None,
         started_at_unix: 1_791_273_600,
         harness_errors: Vec::new(),
         valid: true,
@@ -1168,6 +1170,323 @@ fn config_failure_names_the_gate_condition_that_refused_the_attempt() {
     assert_eq!(config_failure(&wide, 5, false), None);
 }
 
+/// Five `valid_record(RunKind::Throughput)` runs with `repetition` 1..=5,
+/// `runs[2]` marked invalid with `invalid_reasons: ["stalled connections 3"]`.
+fn invalid_pressure_runs() -> Vec<RunRecord> {
+    let mut runs: Vec<RunRecord> = (1u32..=5)
+        .map(|rep| {
+            let mut r = valid_record(RunKind::Throughput);
+            r.repetition = rep;
+            r
+        })
+        .collect();
+    runs[2].valid = false;
+    runs[2].invalid_reasons = vec!["stalled connections 3".to_string()];
+    runs
+}
+
+#[test]
+fn an_invalid_repetition_names_the_host_pressure_it_was_measured_under() {
+    let mut runs = invalid_pressure_runs();
+
+    runs[2].host_cpu_pressure = Some(HostCpuPressure {
+        sampled_ns: 5_000_000_000,
+        some_stall_us: 2_885_000,
+    });
+    assert_eq!(
+        config_failure(&runs, 5, true),
+        Some(
+            "repetition 3 is invalid: stalled connections 3; host CPU pressure 57.7 % over the sampled interval"
+                .to_string()
+        )
+    );
+
+    runs[2].host_cpu_pressure = Some(HostCpuPressure {
+        sampled_ns: 5_000_000_000,
+        some_stall_us: 20_000,
+    });
+    assert_eq!(
+        config_failure(&runs, 5, true),
+        Some(
+            "repetition 3 is invalid: stalled connections 3; host CPU pressure 0.4 % over the sampled interval"
+                .to_string()
+        )
+    );
+}
+
+#[test]
+fn an_invalid_repetition_rounds_host_pressure_to_one_decimal_place() {
+    let mut runs = invalid_pressure_runs();
+
+    runs[2].host_cpu_pressure = Some(HostCpuPressure {
+        sampled_ns: 5_000_000_000,
+        some_stall_us: 150_000,
+    });
+    assert_eq!(
+        config_failure(&runs, 5, true),
+        Some(
+            "repetition 3 is invalid: stalled connections 3; host CPU pressure 3.0 % over the sampled interval"
+                .to_string()
+        )
+    );
+
+    runs[2].host_cpu_pressure = Some(HostCpuPressure {
+        sampled_ns: 5_000_000_000,
+        some_stall_us: 150_500,
+    });
+    assert_eq!(
+        config_failure(&runs, 5, true),
+        Some(
+            "repetition 3 is invalid: stalled connections 3; host CPU pressure 3.0 % over the sampled interval"
+                .to_string()
+        )
+    );
+
+    runs[2].host_cpu_pressure = Some(HostCpuPressure {
+        sampled_ns: 5_000_000_000,
+        some_stall_us: 155_000,
+    });
+    assert_eq!(
+        config_failure(&runs, 5, true),
+        Some(
+            "repetition 3 is invalid: stalled connections 3; host CPU pressure 3.1 % over the sampled interval"
+                .to_string()
+        )
+    );
+}
+
+#[test]
+fn an_invalid_repetition_says_when_host_pressure_was_not_measured() {
+    let mut runs = invalid_pressure_runs();
+
+    runs[2].host_cpu_pressure = None;
+    assert_eq!(
+        config_failure(&runs, 5, true),
+        Some(
+            "repetition 3 is invalid: stalled connections 3; host CPU pressure was not measured"
+                .to_string()
+        )
+    );
+
+    runs[2].host_cpu_pressure = Some(HostCpuPressure {
+        sampled_ns: 0,
+        some_stall_us: 7,
+    });
+    assert_eq!(
+        config_failure(&runs, 5, true),
+        Some(
+            "repetition 3 is invalid: stalled connections 3; host CPU pressure was not measured"
+                .to_string()
+        )
+    );
+}
+
+/// The pressure every run of [`pressure_runs`] carries: 57.7 % of a 5 s
+/// interval, a value no other branch of `config_failure` may print.
+const WIDE_PRESSURE: HostCpuPressure = HostCpuPressure {
+    sampled_ns: 5_000_000_000,
+    some_stall_us: 2_885_000,
+};
+
+/// Five valid `valid_record(RunKind::Throughput)` runs with the given
+/// throughput metrics and repetition numbers, each carrying [`WIDE_PRESSURE`].
+fn pressure_runs(values: [f64; 5], reps: [u32; 5]) -> Vec<RunRecord> {
+    values
+        .iter()
+        .zip(reps.iter())
+        .map(|(&value, &rep)| {
+            let mut r = valid_record(RunKind::Throughput);
+            r.throughput_msgs_per_sec = Some(value);
+            r.repetition = rep;
+            r.host_cpu_pressure = Some(WIDE_PRESSURE);
+            r
+        })
+        .collect()
+}
+
+#[test]
+fn only_the_invalid_repetition_branch_names_the_host_pressure() {
+    // The clause is evidence about an invalid run. The other refusals read no
+    // single run's record, so none of them may claim a host condition.
+    let tight = [100.0, 102.0, 98.0, 101.0, 99.0];
+    let reps = [1, 2, 3, 4, 5];
+    assert_eq!(config_failure(&pressure_runs(tight, reps), 5, true), None);
+
+    let gap = config_failure(&pressure_runs(tight, [1, 2, 3, 4, 6]), 5, true)
+        .expect("a gap must fail");
+    assert!(
+        !gap.contains("host CPU pressure"),
+        "an incomplete repetition set must name no host pressure: {gap}"
+    );
+
+    let wide = config_failure(
+        &pressure_runs([100.0, 105.0, 110.0, 95.0, 100.0], reps),
+        5,
+        true,
+    )
+    .expect("a wide spread must fail");
+    assert!(
+        !wide.contains("host CPU pressure"),
+        "a wide spread must name no host pressure: {wide}"
+    );
+
+    let mut no_metric = pressure_runs(tight, reps);
+    no_metric[4].throughput_msgs_per_sec = None;
+    let missing = config_failure(&no_metric, 5, true).expect("a missing metric must fail");
+    assert!(
+        !missing.contains("host CPU pressure"),
+        "a missing metric must name no host pressure: {missing}"
+    );
+}
+
+#[test]
+fn an_invalid_repetition_rounds_host_pressure_to_the_nearest_tenth() {
+    let mut runs = invalid_pressure_runs();
+
+    // 2.96 %: a clause that cut the digit instead of rounding prints 2.9.
+    runs[2].host_cpu_pressure = Some(HostCpuPressure {
+        sampled_ns: 5_000_000_000,
+        some_stall_us: 148_000,
+    });
+    assert_eq!(
+        config_failure(&runs, 5, true),
+        Some(
+            "repetition 3 is invalid: stalled connections 3; host CPU pressure 3.0 % over the sampled interval"
+                .to_string()
+        )
+    );
+
+    // 0.96 %: the same distinction below one percent.
+    runs[2].host_cpu_pressure = Some(HostCpuPressure {
+        sampled_ns: 5_000_000_000,
+        some_stall_us: 48_000,
+    });
+    assert_eq!(
+        config_failure(&runs, 5, true),
+        Some(
+            "repetition 3 is invalid: stalled connections 3; host CPU pressure 1.0 % over the sampled interval"
+                .to_string()
+        )
+    );
+
+    // 0.04 %: a pressure below the printed precision still prints a value.
+    runs[2].host_cpu_pressure = Some(HostCpuPressure {
+        sampled_ns: 5_000_000_000,
+        some_stall_us: 2_000,
+    });
+    assert_eq!(
+        config_failure(&runs, 5, true),
+        Some(
+            "repetition 3 is invalid: stalled connections 3; host CPU pressure 0.0 % over the sampled interval"
+                .to_string()
+        )
+    );
+}
+
+#[test]
+fn an_invalid_repetition_ends_with_the_host_pressure_after_every_reason() {
+    let mut runs = invalid_pressure_runs();
+    runs[2].invalid_reasons = vec![
+        "stalled connections 3".to_string(),
+        "unresolved 11".to_string(),
+    ];
+    runs[2].host_cpu_pressure = Some(HostCpuPressure {
+        sampled_ns: 5_000_000_000,
+        some_stall_us: 20_000,
+    });
+    assert_eq!(
+        config_failure(&runs, 5, true),
+        Some(
+            "repetition 3 is invalid: stalled connections 3; unresolved 11; host CPU pressure 0.4 % over the sampled interval"
+                .to_string()
+        )
+    );
+}
+
+#[test]
+fn an_invalid_repetition_names_a_zero_a_full_and_an_overflowing_host_pressure() {
+    let mut runs = invalid_pressure_runs();
+
+    // No stall over the whole interval.
+    runs[2].host_cpu_pressure = Some(HostCpuPressure {
+        sampled_ns: 5_000_000_000,
+        some_stall_us: 0,
+    });
+    assert_eq!(
+        config_failure(&runs, 5, true),
+        Some(
+            "repetition 3 is invalid: stalled connections 3; host CPU pressure 0.0 % over the sampled interval"
+                .to_string()
+        )
+    );
+
+    // A stall over all of it.
+    runs[2].host_cpu_pressure = Some(HostCpuPressure {
+        sampled_ns: 5_000_000_000,
+        some_stall_us: 5_000_000,
+    });
+    assert_eq!(
+        config_failure(&runs, 5, true),
+        Some(
+            "repetition 3 is invalid: stalled connections 3; host CPU pressure 100.0 % over the sampled interval"
+                .to_string()
+        )
+    );
+
+    // A counter growth no interval could hold: the clause states a number,
+    // never `inf`, `NaN` or a panic.
+    runs[2].host_cpu_pressure = Some(HostCpuPressure {
+        sampled_ns: 1,
+        some_stall_us: u64::MAX,
+    });
+    let message = config_failure(&runs, 5, true).expect("an invalid run must fail");
+    assert!(
+        message.starts_with("repetition 3 is invalid: stalled connections 3; host CPU pressure "),
+        "an unbounded pressure must keep the clause's shape: {message}"
+    );
+    assert!(
+        message.ends_with(" % over the sampled interval"),
+        "an unbounded pressure must keep the clause's shape: {message}"
+    );
+    assert!(
+        !message.contains("inf") && !message.contains("NaN"),
+        "the clause must state a number: {message}"
+    );
+}
+
+#[test]
+fn cpu_pressure_reads_a_some_total_in_sparse_text() {
+    // No trailing newline, as a file without one gives it.
+    assert_eq!(
+        parse_cpu_pressure_some_total("some avg10=0.00 avg60=0.00 avg300=0.00 total=42"),
+        Some(42)
+    );
+    // Only the two fields the counter needs.
+    assert_eq!(parse_cpu_pressure_some_total("some total=42\n"), Some(42));
+    // A `some` line without a `total=` is unmeasured, never the next line's.
+    assert_eq!(
+        parse_cpu_pressure_some_total("some avg10=0.00\nfull total=9\n"),
+        None
+    );
+}
+
+#[test]
+fn a_some_total_outside_a_u64_is_unmeasured() {
+    assert_eq!(
+        parse_cpu_pressure_some_total("some avg10=0.00 total=18446744073709551615\n"),
+        Some(u64::MAX)
+    );
+    let cases = [
+        "some avg10=0.00 total=18446744073709551616\n",
+        "some avg10=0.00 total=\n",
+        "some avg10=0.00 total=-1\n",
+        "some avg10=0.00 total=1.5\n",
+    ];
+    for text in cases {
+        assert_eq!(parse_cpu_pressure_some_total(text), None, "{text:?}");
+    }
+}
+
 #[test]
 fn perf_count_reads_the_csv_counter() {
     let counted = "31000000,,raw_syscalls:sys_enter,60001234567,100.00,,\n";
@@ -1502,4 +1821,79 @@ fn reconcile_rejects_a_timeline_whose_bins_it_cannot_sum() {
         vec!["timeline deliveries overflow a u64".to_string()]
     );
     assert_eq!(rec.timeline.total(), None);
+}
+
+#[test]
+fn a_record_keeps_the_host_cpu_pressure_it_was_given() {
+    let mut value = serde_json::to_value(valid_record(RunKind::Latency)).expect("serialize the run");
+    value
+        .as_object_mut()
+        .expect("run is a JSON object")
+        .insert(
+            "host_cpu_pressure".to_string(),
+            serde_json::json!({"sampled_ns": 5_000_000_000_u64, "some_stall_us": 20_417_u64}),
+        );
+    let record: RunRecord = serde_json::from_value(value).expect("deserialize the run");
+    let back = serde_json::to_value(&record).expect("serialize the run");
+    assert_eq!(
+        back["host_cpu_pressure"],
+        serde_json::json!({"sampled_ns": 5_000_000_000_u64, "some_stall_us": 20_417_u64})
+    );
+}
+
+#[test]
+fn cpu_pressure_reads_the_some_line_total() {
+    let first = "some avg10=1.23 avg60=0.50 avg300=0.23 total=737911155\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n";
+    assert_eq!(parse_cpu_pressure_some_total(first), Some(737_911_155));
+    let swapped =
+        "full avg10=0.00 avg60=0.00 avg300=0.00 total=5\nsome avg10=0.10 avg60=0.20 avg300=0.30 total=9\n";
+    assert_eq!(parse_cpu_pressure_some_total(swapped), Some(9));
+}
+
+#[test]
+fn cpu_pressure_without_a_some_total_is_unmeasured() {
+    let cases = [
+        "",
+        "full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+        "some avg10=1.23 avg60=0.50 avg300=0.23\n",
+        "some avg10=1.23 avg60=0.50 avg300=0.23 total=abc\n",
+        "something avg10=1.23 total=7\n",
+    ];
+    for text in cases {
+        assert_eq!(parse_cpu_pressure_some_total(text), None, "{text:?}");
+    }
+}
+
+#[test]
+fn a_record_written_before_host_pressure_reads_it_as_unmeasured() {
+    let mut value = serde_json::to_value(valid_record(RunKind::Latency)).expect("serialize the run");
+    let removed = value
+        .as_object_mut()
+        .expect("run is a JSON object")
+        .remove("host_cpu_pressure");
+    assert!(removed.is_some(), "host_cpu_pressure was serialized");
+    let record: RunRecord = serde_json::from_value(value).expect("deserialize the run");
+    assert_eq!(record.host_cpu_pressure, None);
+}
+
+#[test]
+fn host_cpu_pressure_does_not_change_the_reconciliation_verdict() {
+    let baseline = valid_record(RunKind::Latency);
+    let mut with_pressure = baseline.clone();
+    with_pressure.host_cpu_pressure = Some(HostCpuPressure {
+        sampled_ns: WINDOW_SECS * ONE_SECOND_NS,
+        some_stall_us: 4_500_000,
+    });
+    assert_eq!(reconcile(&with_pressure), Vec::<String>::new());
+
+    let mut invalid = valid_record(RunKind::Latency);
+    invalid.counts.duplicates = 2;
+    let before = reconcile(&invalid);
+    invalid.host_cpu_pressure = Some(HostCpuPressure {
+        sampled_ns: WINDOW_SECS * ONE_SECOND_NS,
+        some_stall_us: 4_500_000,
+    });
+    let after = reconcile(&invalid);
+    assert_eq!(before, after);
+    assert!(!before.is_empty(), "duplicates=2 must surface as a reconciliation reason");
 }

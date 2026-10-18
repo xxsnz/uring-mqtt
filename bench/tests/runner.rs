@@ -6,17 +6,21 @@
 
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
+use nix::fcntl::OFlag;
 use nix::sys::signal::{kill, Signal};
+use nix::sys::stat::Mode;
 use nix::sys::wait::waitpid;
-use nix::unistd::{getpgid, getpgrp, getpid, getppid, setpgid, Pid};
+use nix::unistd::{getpgid, getpgrp, getpid, getppid, mkfifo, setpgid, Pid};
 
 use bench::record::DeliveryReport;
 use bench::run_record::{
@@ -136,6 +140,7 @@ fn real_host_setup(scratch_dir: PathBuf, cancel: Arc<AtomicBool>) -> HostSetup {
         },
         env: capture_env(&[], &AtomicBool::new(false)).expect("capture_env"),
         scratch_dir,
+        cpu_pressure_path: PathBuf::from(bench::runner::HOST_CPU_PRESSURE_PATH),
         cancel,
     }
 }
@@ -151,6 +156,89 @@ fn temp_dir(name: &str) -> PathBuf {
     ));
     fs::create_dir_all(&dir).expect("create temp dir");
     dir
+}
+
+/// The kernel's host-wide CPU pressure file, named here rather than through
+/// `bench::runner` so the test's bound does not depend on the code under test.
+const KERNEL_PRESSURE_PATH: &str = "/proc/pressure/cpu";
+
+/// How long the pressure FIFO fixture waits for the runner to open each
+/// read: the smoke run's startup, warm-up and window, with headroom.
+const PRESSURE_FIFO_SERVE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often the pressure FIFO fixture retries opening its write end.
+const PRESSURE_FIFO_POLL: Duration = Duration::from_millis(1);
+/// How far the time between the fixture's two deliveries may differ from
+/// the record's `sampled_ns`: far below the 5 s smoke window, so two reads
+/// taken together fail, and far above the fixture's scheduling delay.
+const PRESSURE_PLACEMENT_SLACK: Duration = Duration::from_secs(1);
+
+/// `total=` of the `some` line of the pressure file at `path`, parsed here
+/// rather than through `bench::analysis` so the bound is independent of
+/// the code under test.
+fn some_total(path: &Path) -> Option<u64> {
+    let text = fs::read_to_string(path).ok()?;
+    let line = text
+        .lines()
+        .find(|line| line.split_whitespace().next() == Some("some"))?;
+    line.split_whitespace()
+        .find_map(|field| field.strip_prefix("total="))
+        .and_then(|value| value.parse().ok())
+}
+
+/// Serve each of `totals`, in order, as the `some` counter of one read of
+/// the FIFO at `path`: create the FIFO, wait for a reader to open it, write
+/// one kernel-format pressure text, remove the path and only then close the
+/// write end, so no later open can reach a FIFO without a writer; the next
+/// read meets a fresh FIFO or, after the last total, no file at all. Sends
+/// on `ready` once the first FIFO exists. Returns the instant each total
+/// was delivered. Stops early when no reader opens the FIFO within
+/// [`PRESSURE_FIFO_SERVE_TIMEOUT`], first opening the FIFO itself so a
+/// reader that arrived at that instant reads end-of-file instead of
+/// blocking.
+fn serve_pressure_fifo(path: &Path, totals: &[u64], ready: &mpsc::Sender<()>) -> Vec<Instant> {
+    let mut delivered = Vec::with_capacity(totals.len());
+    for total in totals {
+        mkfifo(path, Mode::S_IRUSR | Mode::S_IWUSR).expect("create the pressure FIFO");
+        if delivered.is_empty() {
+            ready.send(()).expect("signal that the pressure FIFO exists");
+        }
+        let deadline = Instant::now() + PRESSURE_FIFO_SERVE_TIMEOUT;
+        let opened = loop {
+            match fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(OFlag::O_NONBLOCK.bits())
+                .open(path)
+            {
+                Ok(fifo) => break Some(fifo),
+                Err(err)
+                    if err.raw_os_error() == Some(Errno::ENXIO as i32)
+                        && Instant::now() < deadline =>
+                {
+                    sleep(PRESSURE_FIFO_POLL);
+                }
+                Err(_) => break None,
+            }
+        };
+        let Some(mut fifo) = opened else {
+            let release = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .expect("open the unread pressure FIFO");
+            fs::remove_file(path).expect("remove the unread pressure FIFO");
+            drop(release);
+            return delivered;
+        };
+        write!(
+            fifo,
+            "some avg10=0.00 avg60=0.00 avg300=0.00 total={total}\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
+        )
+        .expect("write the pressure text");
+        delivered.push(Instant::now());
+        fs::remove_file(path).expect("remove the served pressure FIFO");
+        drop(fifo);
+    }
+    delivered
 }
 
 fn make_script(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
@@ -577,6 +665,233 @@ fn smoke_uring_connections_run_is_valid() {
 }
 
 #[test]
+fn a_run_records_the_host_cpu_pressure_over_its_window() {
+    let dir = temp_dir("pressure-real");
+    let cancel = Arc::new(AtomicBool::new(false));
+    let host = real_host_setup(dir.clone(), cancel);
+    let spec = RunSpec {
+        profile: Profile::Smoke,
+        server: ServerKind::Uring,
+        workers: 1,
+        qos: None,
+        kind: RunKind::Connections,
+        rate_fraction_pct: None,
+        offered_rate: None,
+        repetition: 1,
+        attempt: 1,
+    };
+
+    let before = some_total(Path::new(KERNEL_PRESSURE_PATH));
+    let record = run_one(&spec, &host);
+    let after = some_total(Path::new(KERNEL_PRESSURE_PATH));
+
+    let _ = fs::remove_dir_all(&dir);
+
+    let (Some(before), Some(after)) = (before, after) else {
+        assert!(
+            record.host_cpu_pressure.is_none(),
+            "no pressure file readable on this host, so host_cpu_pressure must be None; got {:?}",
+            record.host_cpu_pressure
+        );
+        return;
+    };
+
+    let pressure = record
+        .host_cpu_pressure
+        .expect("a readable pressure file must produce host_cpu_pressure");
+    let cpu = record
+        .cpu
+        .expect("a run that samples pressure must also sample cpu");
+    assert!(
+        pressure.sampled_ns > 0,
+        "host_cpu_pressure must cover a nonzero window; got {pressure:?}, before {before}, after {after}"
+    );
+    assert_eq!(
+        pressure.sampled_ns, cpu.sampled_ns,
+        "host_cpu_pressure must cover the same window as cpu; got {pressure:?}, before {before}, after {after}"
+    );
+    assert!(
+        pressure.some_stall_us <= after - before,
+        "host_cpu_pressure must not exceed the enclosing window's growth; got {pressure:?}, before {before}, after {after}"
+    );
+}
+
+#[test]
+fn a_run_records_the_growth_of_the_pressure_counter_between_its_window_samples() {
+    let scratch = temp_dir("pressure-fifo-run");
+    let fifo_dir = temp_dir("pressure-fifo");
+    let fifo = fifo_dir.join("pressure");
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut host = real_host_setup(scratch.clone(), cancel);
+    let spec = RunSpec {
+        profile: Profile::Smoke,
+        server: ServerKind::Uring,
+        workers: 1,
+        qos: None,
+        kind: RunKind::Connections,
+        rate_fraction_pct: None,
+        offered_rate: None,
+        repetition: 1,
+        attempt: 1,
+    };
+
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let server_fifo = fifo.clone();
+    let server = std::thread::spawn(move || {
+        serve_pressure_fifo(&server_fifo, &[1_000_000, 1_000_250], &ready_tx)
+    });
+    ready_rx.recv().expect("pressure FIFO fixture ready");
+    host.cpu_pressure_path = fifo.clone();
+    let record = run_one(&spec, &host);
+    let delivered = server.join().expect("pressure FIFO fixture");
+
+    let _ = fs::remove_dir_all(&scratch);
+    let _ = fs::remove_dir_all(&fifo_dir);
+
+    assert_eq!(
+        delivered.len(),
+        2,
+        "the fixture must have served both samples; got delivered {delivered:?}, record.host_cpu_pressure {:?}",
+        record.host_cpu_pressure
+    );
+    let Some(pressure) = record.host_cpu_pressure else {
+        panic!(
+            "a FIFO served twice must produce host_cpu_pressure; got record.host_cpu_pressure {:?}, delivered {delivered:?}",
+            record.host_cpu_pressure
+        )
+    };
+    let cpu = record
+        .cpu
+        .expect("a run that samples pressure must also sample cpu");
+    assert_eq!(
+        pressure.some_stall_us, 250,
+        "the counter's growth between the two reads must be the exact delta; got {pressure:?}, delivered {delivered:?}"
+    );
+    assert_eq!(
+        pressure.sampled_ns, cpu.sampled_ns,
+        "host_cpu_pressure must cover the same window as cpu; got {pressure:?}, delivered {delivered:?}"
+    );
+    let gap_ns = delivered[1]
+        .duration_since(delivered[0])
+        .as_nanos();
+    let slack = u128::from(pressure.sampled_ns).abs_diff(gap_ns);
+    assert!(
+        slack <= PRESSURE_PLACEMENT_SLACK.as_nanos(),
+        "the two reads must be the window's start and end samples, not two reads taken together; \
+         got pressure.sampled_ns {}, delivery gap {} ns, slack {} ns, delivered {delivered:?}",
+        pressure.sampled_ns,
+        gap_ns,
+        slack,
+    );
+}
+
+#[test]
+fn a_run_whose_pressure_file_is_gone_at_the_end_sample_records_none_and_stays_valid() {
+    let scratch = temp_dir("pressure-fifo-end-missing");
+    let fifo_dir = temp_dir("pressure-fifo");
+    let fifo = fifo_dir.join("pressure");
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut host = real_host_setup(scratch.clone(), cancel);
+    let spec = RunSpec {
+        profile: Profile::Smoke,
+        server: ServerKind::Uring,
+        workers: 1,
+        qos: None,
+        kind: RunKind::Connections,
+        rate_fraction_pct: None,
+        offered_rate: None,
+        repetition: 1,
+        attempt: 1,
+    };
+
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let server_fifo = fifo.clone();
+    let server = std::thread::spawn(move || {
+        serve_pressure_fifo(&server_fifo, &[1_000_000], &ready_tx)
+    });
+    ready_rx.recv().expect("pressure FIFO fixture ready");
+    host.cpu_pressure_path = fifo.clone();
+    let record = run_one(&spec, &host);
+    let delivered = server.join().expect("pressure FIFO fixture");
+
+    let _ = fs::remove_dir_all(&scratch);
+    let _ = fs::remove_dir_all(&fifo_dir);
+
+    assert_eq!(
+        delivered.len(),
+        1,
+        "the fixture must have served only the start sample; got delivered {delivered:?}, record.host_cpu_pressure {:?}",
+        record.host_cpu_pressure
+    );
+    assert!(
+        record.host_cpu_pressure.is_none(),
+        "no end sample must mean no host_cpu_pressure; got {:?}, invalid_reasons {:?}, harness_errors {:?}",
+        record.host_cpu_pressure,
+        record.invalid_reasons,
+        record.harness_errors
+    );
+    assert!(
+        record.valid,
+        "missing end-sample pressure must not invalidate the run; invalid_reasons {:?}, harness_errors {:?}",
+        record.invalid_reasons,
+        record.harness_errors
+    );
+    assert!(
+        record.harness_errors.iter().all(|e| !e.contains("pressure")),
+        "a missing pressure file must not produce a harness error; got {:?}",
+        record.harness_errors
+    );
+}
+
+#[test]
+fn a_run_without_a_pressure_file_records_none_and_stays_valid() {
+    // A kernel built without PSI has no pressure file at either sample.
+    // Host pressure is evidence, so its absence must leave the verdict alone.
+    let dir = temp_dir("pressure-absent");
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut host = real_host_setup(dir.clone(), cancel);
+    host.cpu_pressure_path = dir.join("no-such-pressure-file");
+    let spec = RunSpec {
+        profile: Profile::Smoke,
+        server: ServerKind::Uring,
+        workers: 1,
+        qos: None,
+        kind: RunKind::Connections,
+        rate_fraction_pct: None,
+        offered_rate: None,
+        repetition: 1,
+        attempt: 1,
+    };
+
+    let record = run_one(&spec, &host);
+
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(
+        record.host_cpu_pressure.is_none(),
+        "no pressure file at either sample must mean no host_cpu_pressure; got {:?}",
+        record.host_cpu_pressure
+    );
+    assert!(
+        record.cpu.is_some(),
+        "the run must still take its CPU samples; invalid_reasons {:?}, harness_errors {:?}",
+        record.invalid_reasons,
+        record.harness_errors
+    );
+    assert!(
+        record.valid,
+        "an absent pressure file must not invalidate the run; invalid_reasons {:?}, harness_errors {:?}",
+        record.invalid_reasons,
+        record.harness_errors
+    );
+    assert!(
+        record.harness_errors.iter().all(|e| !e.contains("pressure")),
+        "an absent pressure file must not produce a harness error; got {:?}",
+        record.harness_errors
+    );
+}
+
+#[test]
 fn run_one_invalidates_a_run_whose_children_write_no_reports() {
     let dir = temp_dir("no-reports");
     let cancel = Arc::new(AtomicBool::new(false));
@@ -599,6 +914,7 @@ fn run_one_invalidates_a_run_whose_children_write_no_reports() {
         },
         env: capture_env(&[], &AtomicBool::new(false)).expect("capture_env"),
         scratch_dir: dir.clone(),
+        cpu_pressure_path: PathBuf::from(bench::runner::HOST_CPU_PRESSURE_PATH),
         cancel,
     };
     let spec = RunSpec {
@@ -675,6 +991,7 @@ fn run_one_with_records_a_child_its_cleanup_could_not_end() {
         },
         env: capture_env(&[], &AtomicBool::new(false)).expect("capture_env"),
         scratch_dir: dir.clone(),
+        cpu_pressure_path: PathBuf::from(bench::runner::HOST_CPU_PRESSURE_PATH),
         cancel,
     };
     let spec = RunSpec {
@@ -800,6 +1117,7 @@ fn run_one_succeeds_when_the_endpoint_starts_slower_than_the_lead() {
         },
         env: capture_env(&[], &AtomicBool::new(false)).expect("capture_env"),
         scratch_dir: dir.clone(),
+        cpu_pressure_path: PathBuf::from(bench::runner::HOST_CPU_PRESSURE_PATH),
         cancel: Arc::new(AtomicBool::new(false)),
     };
     let spec = RunSpec {
@@ -2358,6 +2676,7 @@ fn _shape_references() {
             tools: Vec::new(),
         },
         cpu: None,
+        host_cpu_pressure: None,
         started_at_unix: 0,
         harness_errors: Vec::new(),
         valid: false,

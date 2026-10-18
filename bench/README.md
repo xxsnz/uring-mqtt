@@ -547,6 +547,36 @@ grep -q '| uring |' /tmp/bench-smoke-doc.md
 grep -q '| tokio |' /tmp/bench-smoke-doc.md
 ```
 
+When an attempt fails because one of its repetitions is invalid, `bench run`
+prints `attempt <n> of … failed: repetition <n> is invalid: <reasons>; <host clause>`.
+A cancelled repetition, or one that left a child running after cleanup,
+fails with its own message and no host clause.
+
+The host clause is `host CPU pressure <pct> % over the sampled interval`:
+the share of the interval that run's CPU samples bracket — its window, or
+less for a run cancelled before its window ended — during which some
+runnable task waited for a CPU (`/proc/pressure/cpu`, `some` line). It
+measures contention, not its cause: the benchmark's own pinned threads
+count, and it does not name the process behind the contention. It counts
+only waits inside this Linux guest. On WSL2 or another VM, load on the
+host operating system or the hypervisor does not show in it, so a low
+value does not prove the host was idle.
+
+Values measured on the WSL2 development host (18 CPUs) with no other
+workload: smoke at workers 1 up to 3.0 % (debug build up to 2.0 %), smoke
+at workers 4 up to 8.9 %. Beside 18 busy loops, a workers-1 smoke run
+measured 21-75 %. A value far above the band for its settings is a reason
+to look for a competing workload: stop what you find and run the smoke
+again. A harness defect can fail at any value, so a failure that repeats
+on a quiet host is real.
+
+`host CPU pressure was not measured` means the record holds no
+contention evidence: `/proc/pressure/cpu` was unreadable or unparsable
+at a sample, or the run returned before its window samples.
+
+Every record keeps the raw value as `host_cpu_pressure`
+(`sampled_ns`, `some_stall_us`). It never changes a record's validity.
+
 Do not commit anything under `/tmp/bench-smoke`. The smoke output
 directory is local scratch. The committed `BENCHMARKS.md` is produced
 by a recorded run, not by `bench doc --smoke`.

@@ -30,12 +30,16 @@ use nix::sys::stat::Mode;
 use nix::sys::wait::{waitid, Id, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
 
-use crate::analysis::{count_driver_fds, derive, parse_perf_count, parse_strace_total, reconcile};
+use crate::analysis::{
+    count_driver_fds, derive, parse_cpu_pressure_some_total, parse_perf_count, parse_strace_total,
+    reconcile,
+};
 use crate::payload::{monotonic_now_ns, PAYLOAD_BYTES};
 use crate::record::{DeliveryReport, Window};
 use crate::run_record::{
-    Build, Counts, CounterExit, CpuSets, CpuUsage, DriverFds, Env, GeneratorErrors, LatencySummary,
-    Profile, RunKind, RunRecord, SCHEMA_VERSION, ServerKind, SyscallMethod, Syscalls,
+    Build, Counts, CounterExit, CpuSets, CpuUsage, DriverFds, Env, GeneratorErrors, HostCpuPressure,
+    LatencySummary, Profile, RunKind, RunRecord, SCHEMA_VERSION, ServerKind, SyscallMethod,
+    Syscalls,
 };
 
 /// Connection count every benchmark run sizes its endpoint and generator for
@@ -160,6 +164,10 @@ pub const DEFAULT_SERVER_CPUS: &str = "0,2,4,6";
 
 /// Taskset CPU set used when the caller does not override `HostSetup.cpu_sets.generator`.
 pub const DEFAULT_GENERATOR_CPUS: &str = "8-17";
+
+/// The kernel's host-wide CPU pressure file (PSI) `bench run` points
+/// `HostSetup.cpu_pressure_path` at; a kernel without PSI has no such file.
+pub const HOST_CPU_PRESSURE_PATH: &str = "/proc/pressure/cpu";
 
 /// Latency rates the runner derives from the slowest throughput competitor:
 /// 50 % and 80 % (§9.1).
@@ -298,6 +306,9 @@ pub struct HostSetup {
     pub cpu_sets: CpuSets,
     pub env: Env,
     pub scratch_dir: PathBuf,
+    /// The CPU pressure file the runner reads at both window samples;
+    /// [`HOST_CPU_PRESSURE_PATH`] for `bench run`.
+    pub cpu_pressure_path: PathBuf,
     pub cancel: Arc<AtomicBool>,
 }
 
@@ -1127,6 +1138,16 @@ fn read_cpu_ticks(pid: u32) -> Result<(u64, u64), String> {
     Ok((utime, stime))
 }
 
+/// The `some` line's `total=` counter of the pressure file at `path`, in
+/// microseconds. `None` when the file cannot be read or holds no such
+/// counter: host pressure is evidence, so its absence is never a harness
+/// error.
+fn read_cpu_pressure_total(path: &Path) -> Option<u64> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| parse_cpu_pressure_some_total(&text))
+}
+
 /// Start time of `pid` in clock ticks since boot (`/proc/<pid>/stat` field
 /// 22). `Ok(None)` is the one answer that proves no process holds the pid:
 /// its `/proc` entry is gone. Every other failure is `Err`, because a live
@@ -1327,6 +1348,7 @@ fn build_minimal_record(spec: &RunSpec) -> RunRecord {
             tools: Vec::new(),
         },
         cpu: None,
+        host_cpu_pressure: None,
         started_at_unix: 0,
         harness_errors: Vec::new(),
         valid: false,
@@ -2884,6 +2906,7 @@ fn run_guarded(spec: &RunSpec, host: &HostSetup, guards: &mut ChildGuard) -> Run
     let driver_pid = endpoint.server_pid;
     let server_start = read_cpu_ticks(driver_pid).ok();
     let gen_start = read_cpu_ticks(gen_pid).ok();
+    let pressure_start = read_cpu_pressure_total(&host.cpu_pressure_path);
     let sample_start_ns = monotonic_now_ns();
 
     // Driver proof.
@@ -2915,6 +2938,7 @@ fn run_guarded(spec: &RunSpec, host: &HostSetup, guards: &mut ChildGuard) -> Run
     // window actually reached.
     let server_end = read_cpu_ticks(driver_pid).ok();
     let gen_end = read_cpu_ticks(gen_pid).ok();
+    let pressure_end = read_cpu_pressure_total(&host.cpu_pressure_path);
     // The observed interval, not `window_secs`: under the CPU contention
     // these runs measure, `sleep_until` can resume late and the start
     // sample can be delayed, and a percentage computed against the declared
@@ -2924,7 +2948,7 @@ fn run_guarded(spec: &RunSpec, host: &HostSetup, guards: &mut ChildGuard) -> Run
     let sampled_ns = monotonic_now_ns().saturating_sub(sample_start_ns);
 
     // Strace's `disabled_ns` is this reap, so it stays at the window end,
-    // two `/proc` reads later.
+    // three `/proc` reads later.
     if counting {
         if let Some(c) = counter.as_mut() {
             reap_counter(c, guards, host, &mut harness_errors);
@@ -2939,6 +2963,13 @@ fn run_guarded(spec: &RunSpec, host: &HostSetup, guards: &mut ChildGuard) -> Run
         sampled_ns,
         &mut harness_errors,
     );
+    let host_cpu_pressure = match (pressure_start, pressure_end) {
+        (Some(start), Some(end)) => Some(HostCpuPressure {
+            sampled_ns,
+            some_stall_us: end.saturating_sub(start),
+        }),
+        _ => None,
+    };
 
     // Wait for generator to exit, with drain slack.
     let gen_deadline = Instant::now()
@@ -3032,7 +3063,7 @@ fn run_guarded(spec: &RunSpec, host: &HostSetup, guards: &mut ChildGuard) -> Run
         }
     };
 
-    finalize_record(
+    let mut record = finalize_record(
         spec,
         host,
         constants,
@@ -3044,7 +3075,9 @@ fn run_guarded(spec: &RunSpec, host: &HostSetup, guards: &mut ChildGuard) -> Run
         delivery,
         gen_report,
         Some(syscalls),
-    )
+    );
+    record.host_cpu_pressure = host_cpu_pressure;
+    record
 }
 
 /// Origin and window captured at ARM time. The record stores these
@@ -3241,6 +3274,7 @@ fn finalize_record(
         cpu_sets: host.cpu_sets.clone(),
         env: host.env.clone(),
         cpu,
+        host_cpu_pressure: None,
         started_at_unix: now,
         harness_errors: harness_errors.to_vec(),
         valid: false,
