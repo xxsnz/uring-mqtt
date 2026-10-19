@@ -179,6 +179,15 @@ const SUBACK_QOS1: [u8; 5] = [0x90, 0x03, 0x00, 0x01, 0x01];
 /// MQTT v3 SUBACK refusing the subscription (return code 0x80).
 const SUBACK_REFUSED: [u8; 5] = [0x90, 0x03, 0x00, 0x01, 0x80];
 
+/// CONNACK immediately followed by a whole SUBACK, sent before any
+/// SUBSCRIBE: a complete unsolicited frame.
+const CONNACK_THEN_SUBACK: [u8; 9] = [0x20, 0x02, 0x00, 0x00, 0x90, 0x03, 0x00, 0x01, 0x01];
+/// CONNACK immediately followed by a bare SUBACK fixed header whose body is
+/// withheld — the shape a codec poll would still swallow.
+const CONNACK_THEN_SUBACK_HEADER: [u8; 6] = [0x20, 0x02, 0x00, 0x00, 0x90, 0x03];
+/// CONNACK immediately followed by a single unsolicited byte.
+const CONNACK_THEN_ONE_BYTE: [u8; 5] = [0x20, 0x02, 0x00, 0x00, 0x90];
+
 /// Fixed-header first bytes of the two requests the fake broker reads.
 const CONNECT_FIRST_BYTE: u8 = 0x10;
 const SUBSCRIBE_FIRST_BYTE: u8 = 0x82;
@@ -690,4 +699,70 @@ fn sub_exits_nonzero_when_the_connack_claims_a_session() {
     );
 
     let _ = std::fs::remove_file(&report);
+}
+
+/// AC-8: broker bytes that reach `bench sub` after its CONNACK but before
+/// any SUBSCRIBE must be refused without writing SUBSCRIBE, whether they
+/// form a whole frame, a bare fixed header, or a single byte.
+#[test]
+fn sub_fails_before_subscribing_when_bytes_arrive_ahead_of_its_subscribe() {
+    for (reply, tag) in [
+        (&CONNACK_THEN_SUBACK[..], "early-suback"),
+        (&CONNACK_THEN_SUBACK_HEADER[..], "early-header"),
+        (&CONNACK_THEN_ONE_BYTE[..], "early-byte"),
+    ] {
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel::<bool>();
+        let reply = reply.to_vec();
+        let broker = spawn_fake_broker("sub-test-early-bytes", move |mut stream| {
+            let Some(connect) = read_frame(&mut stream) else { return };
+            if connect.first() != Some(&CONNECT_FIRST_BYTE) {
+                return;
+            }
+            if stream.write_all(&reply).is_err() {
+                return;
+            }
+            let subscribed = read_frame(&mut stream)
+                .is_some_and(|frame| frame.first() == Some(&SUBSCRIBE_FIRST_BYTE));
+            let _ = seen_tx.send(subscribed);
+            if subscribed {
+                let _ = stream.write_all(&SUBACK_QOS1);
+                std::thread::sleep(Duration::from_secs(5));
+            }
+        });
+
+        let port = broker.addr();
+        let report = report_path(tag);
+        let _ = std::fs::remove_file(&report);
+
+        let (mut child, rx, _stdin) = spawn_sub(1, &port, &report);
+
+        wait_exit_code(&mut child, EXIT_TIMEOUT, 1);
+
+        let mut seen = Vec::new();
+        loop {
+            match rx.recv_timeout(READY_TIMEOUT) {
+                Ok(line) => seen.push(line),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("stdout forwarding did not end within {READY_TIMEOUT:?}")
+                }
+            }
+        }
+
+        assert_eq!(
+            seen_rx.recv_timeout(EXIT_TIMEOUT),
+            Ok(false),
+            "bench sub must refuse before writing SUBSCRIBE ({tag})"
+        );
+        assert!(
+            !seen.iter().any(|line| line == "READY"),
+            "early bytes before SUBSCRIBE must never print READY ({tag}), saw {seen:?}"
+        );
+        assert!(
+            !report.exists(),
+            "early bytes before SUBSCRIBE must write no report ({tag})"
+        );
+
+        let _ = std::fs::remove_file(&report);
+    }
 }

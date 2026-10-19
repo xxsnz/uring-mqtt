@@ -19,6 +19,10 @@ use bench::server::{run_server, ServerArgs, ServerImpl};
 use bench::sub::{run_sub, SubArgs};
 use clap::{Parser, Subcommand, ValueEnum};
 
+/// How long `dispatch_gen` waits for its failure text to reach stderr
+/// before it exits anyway. Same bound as every other generator I/O wait,
+/// so an operator who reads stderr still sees the cause.
+const GEN_FAILURE_PRINT_GRACE: Duration = Duration::from_secs(gen::IO_TIMEOUT_SECS);
 /// The `--profile smoke` default matrix: the single `uring/1/1` row
 /// decision Q10 names, so a smoke run needs no matrix flags at all.
 /// The recorded profile defaults to `RECORDED_SERVERS`/`RECORDED_WORKERS`/
@@ -337,10 +341,30 @@ fn dispatch_gen(
     match result {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("{e}");
+            eprint_without_waiting_forever(&e);
             1
         }
     }
+}
+
+/// Print a generator failure to stderr without letting that stderr hold
+/// the process. A session reader blocked in its own diagnostic write is
+/// one of the failures `gen` reports here, and that reader blocks because
+/// nobody drains this very stderr: a plain `eprintln!` would then block
+/// too and `bench gen` would never exit. The text is written from a
+/// thread instead, and the exit status follows once the write is done or
+/// `GEN_FAILURE_PRINT_GRACE` passed — `main` exits the process, so a
+/// thread still blocked in that write cannot delay it.
+fn eprint_without_waiting_forever(message: &str) {
+    let (written_tx, written_rx) = std::sync::mpsc::channel::<()>();
+    let text = message.to_string();
+    std::thread::spawn(move || {
+        eprintln!("{text}");
+        let _ = written_tx.send(());
+    });
+    // A panicking write (stderr erroring rather than blocking) drops the
+    // sender, so this returns at once instead of waiting out the grace.
+    let _ = written_rx.recv_timeout(GEN_FAILURE_PRINT_GRACE);
 }
 
 fn dispatch_sub(addr: String, qos: u8, connections: u32, report: PathBuf) -> i32 {

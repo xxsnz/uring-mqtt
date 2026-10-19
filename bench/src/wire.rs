@@ -5,6 +5,8 @@
 
 use std::num::NonZeroU16;
 
+use rmqtt_codec::v3::Packet;
+
 use crate::payload::{PAYLOAD_BYTES, TOPIC};
 
 /// Largest MQTT Remaining Length a bench client accepts from the broker.
@@ -86,6 +88,28 @@ pub fn encode_puback(packet_id: NonZeroU16) -> [u8; 4] {
 }
 
 pub const DISCONNECT: [u8; 2] = [0xE0, 0x00];
+
+/// MQTT control packet name of a decoded frame, for diagnostics. A
+/// refusal names the packet with this, never with `{:?}`, which
+/// prints every field of a CONNECT and is longer than the name.
+pub fn packet_kind(packet: &Packet) -> &'static str {
+    match packet {
+        Packet::Connect(_) => "CONNECT",
+        Packet::ConnectAck(_) => "CONNACK",
+        Packet::Publish(_) => "PUBLISH",
+        Packet::PublishAck { .. } => "PUBACK",
+        Packet::PublishReceived { .. } => "PUBREC",
+        Packet::PublishRelease { .. } => "PUBREL",
+        Packet::PublishComplete { .. } => "PUBCOMP",
+        Packet::Subscribe { .. } => "SUBSCRIBE",
+        Packet::SubscribeAck { .. } => "SUBACK",
+        Packet::Unsubscribe { .. } => "UNSUBSCRIBE",
+        Packet::UnsubscribeAck { .. } => "UNSUBACK",
+        Packet::PingRequest => "PINGREQ",
+        Packet::PingResponse => "PINGRESP",
+        Packet::Disconnect => "DISCONNECT",
+    }
+}
 
 /// Encode an MQTT variable-length integer (1..4 bytes, continuation bit = 0x80).
 /// Validated against the spec: values above `0x0FFF_FFFF` (268 MiB) cannot be

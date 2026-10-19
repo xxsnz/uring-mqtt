@@ -8,16 +8,20 @@
 use std::io::{self, BufRead, Read, Write};
 use std::net::SocketAddr;
 use std::num::NonZeroU16;
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use bytes::BytesMut;
 use futures_util::StreamExt;
+use nix::errno::Errno;
+use nix::sys::socket::{recv, MsgFlags};
 use rmqtt_codec::types::QoS;
 use rmqtt_codec::v3::{Codec, Packet, SubscribeReturnCode};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::{oneshot, watch};
-use tokio_util::codec::FramedRead;
+use tokio_util::codec::{Decoder, FramedRead};
 
 use crate::gen::IO_TIMEOUT_SECS;
 use crate::payload::monotonic_now_ns;
@@ -37,6 +41,11 @@ const SUBSCRIBE_PACKET_ID: u16 = 1;
 
 /// Return codes a SUBACK for this one-filter SUBSCRIBE may carry.
 const SUBACK_RETURN_CODES: usize = 1;
+
+/// Bytes the one non-blocking `recv` before SUBSCRIBE takes from the socket.
+/// Any byte refuses the session; this many hold a whole SUBACK (5 bytes) or
+/// any other acknowledgement-sized frame, so the refusal can name it.
+const PRE_SUBSCRIBE_PROBE_BYTES: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct SubArgs {
@@ -202,6 +211,7 @@ async fn connect_and_subscribe(
     stream
         .set_nodelay(true)
         .map_err(|e| format!("set TCP_NODELAY: {e}"))?;
+    let socket_fd = stream.as_raw_fd();
     let (read_half, mut write_half) = tokio::io::split(stream);
 
     write_with_timeout(
@@ -239,6 +249,7 @@ async fn connect_and_subscribe(
     if ack.session_present {
         return Err("CONNACK claims a stored session on a clean-session CONNECT".to_string());
     }
+    refuse_unsolicited_bytes(read.read_buffer(), socket_fd)?;
 
     let packet_id = NonZeroU16::new(SUBSCRIBE_PACKET_ID).expect("non-zero");
     write_with_timeout(
@@ -482,6 +493,39 @@ async fn read_packet(
     }
 }
 
+/// Refuses the session when the broker sent anything after its CONNACK
+/// before this client wrote SUBSCRIBE. A clean-session client is owed
+/// nothing yet, so such bytes cannot answer the request. `buffered` is
+/// what the CONNACK read left in the codec buffer; `socket_fd` is then
+/// probed once with a non-blocking `recv`, which asks the kernel
+/// directly — Tokio's cached readiness can still hide bytes that are
+/// already queued. The codec is not polled: it consumes a complete
+/// fixed header even while the body is missing. Every byte taken here
+/// refuses the session, so taking it loses nothing. A byte that arrives
+/// after this probe cannot be told apart from a reply and passes.
+fn refuse_unsolicited_bytes(buffered: &[u8], socket_fd: RawFd) -> Result<(), String> {
+    let mut early = BytesMut::from(buffered);
+    let mut probe = [0u8; PRE_SUBSCRIBE_PROBE_BYTES];
+    match recv(socket_fd, &mut probe, MsgFlags::MSG_DONTWAIT) {
+        Ok(0) => return Err("peer closed before SUBSCRIBE".to_string()),
+        Ok(n) => early.extend_from_slice(&probe[..n]),
+        Err(Errno::EAGAIN) => {}
+        Err(e) => return Err(format!("read before SUBSCRIBE: {e}")),
+    }
+    if early.is_empty() {
+        return Ok(());
+    }
+    let unsolicited = early.len();
+    Err(match Codec::new(INBOUND_REMAINING_LENGTH_MAX).decode(&mut early) {
+        Ok(Some((packet, _))) => {
+            format!("broker sent {} before SUBSCRIBE", wire::packet_kind(&packet))
+        }
+        Ok(None) | Err(_) => format!(
+            "CONNACK was followed by {unsolicited} unsolicited bytes before SUBSCRIBE"
+        ),
+    })
+}
+
 /// Map a `qos` byte (0 or 1) to the `rmqtt_codec::types::QoS` variant. The
 /// CLI check above keeps this total.
 fn qos_into_enum(qos: u8) -> QoS {
@@ -551,4 +595,166 @@ fn write_report(path: &std::path::Path, report: &DeliveryReport) -> Result<(), S
     serde_json::to_writer_pretty(&mut writer, report).map_err(|e| format!("write report: {e}"))?;
     writer.flush().map_err(|e| format!("flush report: {e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{refuse_unsolicited_bytes, Errno};
+    use crate::wire::INBOUND_REMAINING_LENGTH_MAX;
+    use futures_util::{FutureExt, StreamExt};
+    use rmqtt_codec::v3::Codec;
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+    use tokio_util::codec::FramedRead;
+
+    /// CONNACK with Return Code 0 and Session Present 0.
+    const CONNACK_ACCEPTED: [u8; 4] = [0x20, 0x02, 0x00, 0x00];
+    /// Whole SUBACK for packet id 1 (5 bytes).
+    const BUFFERED_SUBACK: [u8; 5] = [0x90, 0x03, 0x00, 0x01, 0x01];
+    /// Time the test's only runtime thread blocks in `std::thread::sleep` so
+    /// loopback queues the byte while the reactor cannot see it.
+    const LOOPBACK_SETTLE: Duration = Duration::from_millis(50);
+    /// One whole frame of every MQTT 3.1.1 control packet type, beside the
+    /// name `wire::packet_kind` must give it. A broker sends only some of
+    /// them, but the refusal names whatever decodes, and a wrong arm of the
+    /// mapping would otherwise name the wrong packet to the operator.
+    const EVERY_PACKET_KIND: [(&[u8], &str); 14] = [
+        (b"\x10\x0C\x00\x04MQTT\x04\x02\x00\x00\x00\x00", "CONNECT"),
+        (b"\x20\x02\x00\x00", "CONNACK"),
+        (b"\x30\x03\x00\x01t", "PUBLISH"),
+        (b"\x40\x02\x00\x01", "PUBACK"),
+        (b"\x50\x02\x00\x01", "PUBREC"),
+        (b"\x62\x02\x00\x01", "PUBREL"),
+        (b"\x70\x02\x00\x01", "PUBCOMP"),
+        (b"\x82\x06\x00\x01\x00\x01t\x00", "SUBSCRIBE"),
+        (b"\x90\x03\x00\x01\x00", "SUBACK"),
+        (b"\xA2\x05\x00\x01\x00\x01t", "UNSUBSCRIBE"),
+        (b"\xB0\x02\x00\x01", "UNSUBACK"),
+        (b"\xC0\x00", "PINGREQ"),
+        (b"\xD0\x00", "PINGRESP"),
+        (b"\xE0\x00", "DISCONNECT"),
+    ];
+
+    /// A connected loopback pair: a blocking `std` peer and a client
+    /// registered with the test's runtime.
+    fn loopback_pair() -> (std::net::TcpStream, tokio::net::TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let client = std::net::TcpStream::connect(listener.local_addr().expect("local addr"))
+            .expect("connect");
+        let (peer, _) = listener.accept().expect("accept");
+        peer.set_nodelay(true).expect("peer TCP_NODELAY");
+        client.set_nonblocking(true).expect("non-blocking client");
+        (
+            peer,
+            tokio::net::TcpStream::from_std(client).expect("register client"),
+        )
+    }
+
+    #[tokio::test]
+    async fn refuse_unsolicited_bytes_names_what_the_codec_buffer_holds() {
+        let (_peer, client) = loopback_pair();
+        let socket_fd = client.as_raw_fd();
+        // The peer writes nothing, so `recv` returns `EAGAIN`.
+        assert_eq!(refuse_unsolicited_bytes(&[], socket_fd), Ok(()));
+        assert_eq!(
+            refuse_unsolicited_bytes(&BUFFERED_SUBACK, socket_fd),
+            Err("broker sent SUBACK before SUBSCRIBE".to_string())
+        );
+        // A fixed header without its body.
+        assert_eq!(
+            refuse_unsolicited_bytes(&BUFFERED_SUBACK[..2], socket_fd),
+            Err("CONNACK was followed by 2 unsolicited bytes before SUBSCRIBE".to_string())
+        );
+        assert_eq!(
+            refuse_unsolicited_bytes(&BUFFERED_SUBACK[..1], socket_fd),
+            Err("CONNACK was followed by 1 unsolicited bytes before SUBSCRIBE".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn refuse_unsolicited_bytes_finds_a_queued_byte_tokio_has_not_seen() {
+        let (mut peer, client) = loopback_pair();
+        let socket_fd = client.as_raw_fd();
+        let (read_half, _write_half) = tokio::io::split(client);
+        let mut read = FramedRead::new(read_half, Codec::new(INBOUND_REMAINING_LENGTH_MAX));
+        peer.write_all(&CONNACK_ACCEPTED).expect("peer writes CONNACK");
+        read.next().await.expect("a frame").expect("a CONNACK");
+        assert_eq!(
+            refuse_unsolicited_bytes(read.read_buffer(), socket_fd),
+            Ok(()),
+            "nothing follows the CONNACK yet"
+        );
+        peer.write_all(&BUFFERED_SUBACK[..1])
+            .expect("peer writes one byte");
+        std::thread::sleep(LOOPBACK_SETTLE);
+        assert!(
+            read.next().now_or_never().is_none(),
+            "precondition: Tokio's cached readiness still hides the queued byte"
+        );
+        assert!(
+            read.read_buffer().is_empty(),
+            "the byte is only in the kernel queue"
+        );
+        assert_eq!(
+            refuse_unsolicited_bytes(read.read_buffer(), socket_fd),
+            Err(
+                "CONNACK was followed by 1 unsolicited bytes before SUBSCRIBE".to_string()
+            )
+        );
+    }
+
+    /// AC-8 — the refusal names the packet by its MQTT control packet name
+    /// for every type the codec decodes, so no refusal carries wire bytes or
+    /// a `{:?}` of a decoded frame.
+    #[tokio::test]
+    async fn refuse_unsolicited_bytes_names_every_packet_kind_it_can_decode() {
+        let (_peer, client) = loopback_pair();
+        let socket_fd = client.as_raw_fd();
+        // The peer writes nothing, so every case comes from `buffered`.
+        for (frame, kind) in EVERY_PACKET_KIND {
+            assert_eq!(
+                refuse_unsolicited_bytes(frame, socket_fd),
+                Err(format!("broker sent {kind} before SUBSCRIBE")),
+                "the refusal must name the {kind} the broker sent"
+            );
+        }
+    }
+
+    /// AC-8 — a peer that closes between its CONNACK and this client's
+    /// SUBSCRIBE is refused by that cause: the probe reads end of file, which
+    /// is neither nothing queued nor a frame.
+    #[tokio::test]
+    async fn refuse_unsolicited_bytes_reports_a_peer_that_closed_before_subscribe() {
+        let (peer, client) = loopback_pair();
+        let socket_fd = client.as_raw_fd();
+        drop(peer);
+        std::thread::sleep(LOOPBACK_SETTLE);
+        assert_eq!(
+            refuse_unsolicited_bytes(&[], socket_fd),
+            Err("peer closed before SUBSCRIBE".to_string())
+        );
+    }
+
+    /// AC-8 — a probe that fails names the read and its cause instead of
+    /// passing the session through. Linux answers a close that leaves unread
+    /// bytes with a reset, so the probe fails rather than reading end of file.
+    #[tokio::test]
+    async fn refuse_unsolicited_bytes_names_a_failed_read_before_subscribe() {
+        let (peer, client) = loopback_pair();
+        let socket_fd = client.as_raw_fd();
+        let (_read_half, mut write_half) = tokio::io::split(client);
+        write_half
+            .write_all(&CONNACK_ACCEPTED)
+            .await
+            .expect("client writes bytes the peer never reads");
+        std::thread::sleep(LOOPBACK_SETTLE);
+        drop(peer);
+        std::thread::sleep(LOOPBACK_SETTLE);
+        assert_eq!(
+            refuse_unsolicited_bytes(&[], socket_fd),
+            Err(format!("read before SUBSCRIBE: {}", Errno::ECONNRESET))
+        );
+    }
 }
