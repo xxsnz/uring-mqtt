@@ -356,28 +356,54 @@ pub fn run_generator(config: &GenConfig) -> Result<GenReport, String> {
         let hard_deadline = tokio::time::Instant::now()
             + Duration::from_nanos(hard_deadline_ns.saturating_sub(monotonic_now_ns()))
             + Duration::from_secs(IO_TIMEOUT_SECS);
-        let drain = async {
-            while let Some(res) = set.join_next().await {
-                if let Err(join_err) = res {
-                    if join_err.is_panic() {
-                        return Err(format!("connection task panicked: {join_err}"));
-                    }
-                }
-            }
-            Ok(())
-        };
-        let drained = tokio::time::timeout_at(hard_deadline, drain).await;
-        let stalled_now = set.len() as u64;
-        if drained.is_err() {
-            set.abort_all();
-            while set.join_next().await.is_some() {}
-            counters.add_stalled(stalled_now);
-        }
-        Ok(build_report(config, &counters))
+        join_and_report(&mut set, hard_deadline, config, &counters).await
     });
 
     runtime.shutdown_timeout(Duration::from_secs(1));
     report
+}
+
+/// Join every connection task by `hard_deadline` and build the report.
+/// Tasks still running at the deadline are aborted, joined and counted
+/// `stalled`. A task that panicked fails the run instead, once every
+/// other task has been aborted and joined: it leaves counters no report
+/// may be built from (`bench gen` then exits 1 with no report, and the
+/// runner's harness errors reject the record through reconcile row 28).
+async fn join_and_report(
+    set: &mut JoinSet<()>,
+    hard_deadline: tokio::time::Instant,
+    config: &GenConfig,
+    counters: &Counters,
+) -> Result<GenReport, String> {
+    let drain = async {
+        while let Some(res) = set.join_next().await {
+            if let Err(join_err) = res {
+                if join_err.is_panic() {
+                    return Err(format!("connection task panicked: {join_err}"));
+                }
+            }
+        }
+        Ok(())
+    };
+    let drained = tokio::time::timeout_at(hard_deadline, drain).await;
+    let (still_running, mut failure) = match drained {
+        Ok(Ok(())) => (0, None),
+        Ok(Err(cause)) => (0, Some(cause)),
+        Err(_) => (set.len() as u64, None),
+    };
+    set.abort_all();
+    while let Some(res) = set.join_next().await {
+        if let Err(join_err) = res {
+            if join_err.is_panic() && failure.is_none() {
+                failure = Some(format!("connection task panicked: {join_err}"));
+            }
+        }
+    }
+    if let Some(cause) = failure {
+        return Err(cause);
+    }
+    counters.add_stalled(still_running);
+    Ok(build_report(config, counters))
 }
 
 fn validate(config: &GenConfig) -> Result<(), String> {
@@ -536,9 +562,9 @@ async fn run_throughput_connection(task: ConnectionTask) -> Result<(), String> {
 enum OpenError {
     Connect,
     /// Why the reply is not a valid CONNACK for this CONNECT. Every reason
-    /// is built from a fixed set of short texts — the codec's non-`Io`
-    /// `DecodeError`s and `ConnectAckReason` both print a constant — so the
-    /// diagnostic a caller prints stays bounded.
+    /// is a fixed short text with at most one integer — the codec's
+    /// non-`Io` `DecodeError`s and `ConnectAckReason` both print a
+    /// constant — so the diagnostic a caller prints stays bounded.
     Protocol(String),
 }
 
@@ -568,13 +594,13 @@ async fn open_session(
         return Err(OpenError::Connect);
     }
     let mut framed = FramedRead::new(read_half, Codec::new(wire::INBOUND_REMAINING_LENGTH_MAX));
-    let connack = match tokio::time::timeout(
+    let (connack, remaining_length) = match tokio::time::timeout(
         Duration::from_secs(IO_TIMEOUT_SECS),
         framed.next(),
     )
     .await
     {
-        Ok(Some(Ok((Packet::ConnectAck(ack), _)))) => ack,
+        Ok(Some(Ok((Packet::ConnectAck(ack), remaining_length)))) => (ack, remaining_length),
         Ok(Some(Ok(_))) => {
             return Err(OpenError::Protocol(
                 "first packet was not a CONNACK".to_string(),
@@ -589,6 +615,15 @@ async fn open_session(
         }
         _ => return Err(OpenError::Connect),
     };
+    // The pinned codec checks only that a CONNACK body holds at least
+    // two bytes (`rmqtt-codec` 0.2.2 `v3/decode.rs:93`) and ignores the
+    // rest, so a longer body would pass every check below.
+    if remaining_length != wire::CONNACK_REMAINING_LENGTH {
+        return Err(OpenError::Protocol(format!(
+            "CONNACK remaining length was {remaining_length}, expected {}",
+            wire::CONNACK_REMAINING_LENGTH
+        )));
+    }
     if !matches!(
         connack.return_code,
         rmqtt_codec::v3::ConnectAckReason::ConnectionAccepted
@@ -613,9 +648,18 @@ async fn open_session(
         .saturating_add(u64::try_from(config.drain_grace.as_nanos()).unwrap_or(0));
     let deadline_instant = tokio::time::Instant::now()
         + Duration::from_nanos(hard_deadline_ns.saturating_sub(now).max(1));
-    // The CONNACK read consumed 4 bytes from `read_half`; the codec's read
-    // buffer is empty unless a partial next frame already arrived. Returning
-    // the half lets the session reader rebuild its own `FramedRead`.
+    // Bytes read past the CONNACK sit in the codec's buffer, which
+    // `into_inner` discards. Before its first PUBLISH this client is owed
+    // no frame — CleanSession, no subscription — so any such byte, a
+    // whole frame or part of one, is the broker's violation. Refusing it
+    // here covers bytes that arrive with the CONNACK on every publishing
+    // path; QoS 0 latency has no reader to count them later.
+    let read_ahead = framed.read_buffer().len();
+    if read_ahead > 0 {
+        return Err(OpenError::Protocol(format!(
+            "CONNACK was followed by {read_ahead} unsolicited bytes"
+        )));
+    }
     let read_half = framed.into_inner();
     Ok((read_half, write_half, deadline_instant))
 }
@@ -696,17 +740,25 @@ async fn run_qos0_throughput(
             // socket and can still count a protocol error after the
             // report is built.
             reader_handle.abort();
-            let _ = reader_handle.await;
+            reraise_reader_panic(reader_handle.await);
             return Err(cause);
         }
     }
-    let _ = tokio::time::timeout(
-        Duration::from_secs(IO_TIMEOUT_SECS),
-        write_half.write_all(&wire::DISCONNECT),
-    )
-    .await;
+    // Bounded by the hard deadline, not `IO_TIMEOUT_SECS` after it: the
+    // time AC-24 allows past the deadline belongs to `run_generator`'s
+    // backstop, which counts an unfinished connection `stalled`
+    // (`qos1_drain_and_disconnect` bounds its DISCONNECT the same way).
+    let _ =
+        tokio::time::timeout_at(deadline_instant, write_half.write_all(&wire::DISCONNECT))
+            .await;
     let _ = write_half.shutdown().await;
-    let _ = reader_handle.await;
+    // A peer that keeps its socket open after DISCONNECT never sends
+    // the EOF the reader waits for, so an unbounded join would outlast
+    // the deadline and leave the backstop to count the whole
+    // connection `stalled`. The reader can still count a protocol
+    // error, so the aborted handle is awaited before the report is
+    // built (as in `qos1_drain_and_disconnect`).
+    join_reader_by(reader_handle, deadline_instant).await;
     Ok(())
 }
 
@@ -793,6 +845,33 @@ async fn run_qos1_throughput(
     write_failure.map_or(Ok(()), Err)
 }
 
+/// Carry a session reader's panic into the connection task that joined
+/// it. `run_connection` only prints a connection's `Err`, so a reader
+/// panic returned as an error would leave the run reconciling;
+/// re-raised, it panics the connection task and `join_and_report`
+/// fails the run with its message. A reader ended by `abort` carries no
+/// evidence.
+fn reraise_reader_panic(joined: Result<(), tokio::task::JoinError>) {
+    if let Err(join_err) = joined {
+        if join_err.is_panic() {
+            std::panic::resume_unwind(join_err.into_panic());
+        }
+    }
+}
+
+/// Join a session reader by `deadline`, abort it when it is still
+/// running then, and re-raise its panic ([`reraise_reader_panic`]).
+async fn join_reader_by(mut handle: tokio::task::JoinHandle<()>, deadline: tokio::time::Instant) {
+    let joined = match tokio::time::timeout_at(deadline, &mut handle).await {
+        Ok(joined) => joined,
+        Err(_) => {
+            handle.abort();
+            handle.await
+        }
+    };
+    reraise_reader_panic(joined);
+}
+
 /// Drain every in-flight packet id up to the deadline, then write
 /// DISCONNECT unless a publish write failed (a partial PUBLISH may be on
 /// the wire), shut the writer half down and end the reader. Ids still in
@@ -820,7 +899,7 @@ async fn qos1_drain_and_disconnect(
         // running — at most the end of the poll it is in.
         if let Some(handle) = reader_handle.take() {
             handle.abort();
-            let _ = handle.await;
+            reraise_reader_panic(handle.await);
         }
         let leaked = in_flight.load(Ordering::Relaxed);
         if leaked > 0 {
@@ -838,17 +917,14 @@ async fn qos1_drain_and_disconnect(
                 .await;
     }
     let _ = write_half.shutdown().await;
-    if let Some(mut handle) = reader_handle {
+    if let Some(handle) = reader_handle {
         // A peer that keeps its socket open after DISCONNECT never sends
         // the EOF the reader waits for, so an unbounded join would
         // outlast the deadline and leave the backstop to count the whole
         // connection `stalled`. The reader can still count a protocol
         // error, so the aborted handle is awaited before the report is
         // built (as in `latency_teardown`).
-        if tokio::time::timeout_at(deadline_instant, &mut handle).await.is_err() {
-            handle.abort();
-            let _ = handle.await;
-        }
+        join_reader_by(handle, deadline_instant).await;
     }
 }
 
@@ -1587,7 +1663,7 @@ async fn latency_teardown(
             // no longer running — at most the end of the poll it is in.
             if let Some(handle) = reader_handle.take() {
                 handle.abort();
-                let _ = handle.await;
+                reraise_reader_panic(handle.await);
             }
             let leaked = in_flight.load(Ordering::Relaxed);
             if leaked > 0 {
@@ -1606,15 +1682,12 @@ async fn latency_teardown(
             .await;
     }
     let _ = write_half.shutdown().await;
-    if let Some(mut handle) = reader_handle {
+    if let Some(handle) = reader_handle {
         // A peer that holds its socket open while withholding PUBACK never
         // sends the EOF the reader is waiting for, so an unbounded join would
         // outlast the deadline above. Dropping the handle would only detach
         // the reader, so abort what the bounded join leaves running.
-        if tokio::time::timeout_at(deadline_instant, &mut handle).await.is_err() {
-            handle.abort();
-            let _ = handle.await;
-        }
+        join_reader_by(handle, deadline_instant).await;
     }
 }
 
@@ -1745,8 +1818,9 @@ async fn qos1_latency_reader(
 #[cfg(test)]
 mod tests {
     use super::{
-        latency_teardown, qos1_drain_and_disconnect, qos1_latency_reader, qos1_reader_task, wire,
-        Counters, GenConfig, Mode, PacketIds, Window,
+        join_and_report, latency_teardown, qos1_drain_and_disconnect, qos1_latency_reader,
+        qos1_reader_task, run_qos0_throughput, wire, ConnectionTask, Counters, GenConfig, Mode,
+        PacketIds, Window,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
@@ -1754,6 +1828,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::Semaphore;
+    use tokio::task::JoinSet;
 
     /// Deadline handed to the teardown under test — long enough that the
     /// clean path never meets it.
@@ -1772,6 +1847,132 @@ mod tests {
     /// after the teardown returned — long enough to cover `PUBACK_DELAY` and
     /// the polls that follow it.
     const ABORT_GRACE: Duration = Duration::from_millis(400);
+    /// Message of the panic the `join_and_report` tests plant in a
+    /// connection task.
+    const CONNECTION_PANIC: &str = "connection panic fixture";
+
+    /// A connection task body that panics. Synchronous: an `async fn`
+    /// with no `.await` fails `clippy::unused_async`.
+    fn panicking_connection() {
+        panic!("{CONNECTION_PANIC}");
+    }
+
+    /// Message of the panic the reader-panic tests plant in a reader task.
+    const READER_PANIC: &str = "reader panic fixture";
+
+    /// A reader task body that panics. Synchronous for the same
+    /// `clippy::unused_async` reason as `panicking_connection`.
+    fn panicking_reader() {
+        panic!("{READER_PANIC}");
+    }
+
+    /// Counts its own drop, so a test can prove a task's future was
+    /// destroyed (aborted and joined) rather than detached.
+    struct DropFlag(Arc<AtomicU64>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A task body that never finishes and holds a `DropFlag` from the
+    /// moment it is created — captured, not built on first poll, so a
+    /// task aborted before it ever ran still counts.
+    fn held_until_dropped(
+        dropped: &Arc<AtomicU64>,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let flag = DropFlag(Arc::clone(dropped));
+        async move {
+            let _flag = flag;
+            std::future::pending::<()>().await;
+        }
+    }
+
+    /// Message of the panic a task plants in the drop of its own future —
+    /// one panic `join_and_report` can see after `abort_all`, since
+    /// tokio turns a panic while a cancelled future is destroyed into a
+    /// panicking `JoinError` (1.53.2 `runtime/task/harness.rs:502-507`).
+    const DROP_PANIC: &str = "connection drop panic fixture";
+    /// Tasks spawned by the clean-drain test; more than one, so a report
+    /// that counted collected tasks as stalled would be visible.
+    const FINISHED_TASKS: usize = 3;
+
+    /// A guard that panics while it is dropped.
+    struct PanicOnDrop;
+
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            panic!("{DROP_PANIC}");
+        }
+    }
+
+    /// A task body that never finishes and panics when its future is
+    /// destroyed, so the panic reaches `join_and_report` only in the join
+    /// that follows `abort_all` — the path a task still running at the
+    /// hard deadline takes.
+    fn panics_when_dropped() -> impl std::future::Future<Output = ()> + Send + 'static {
+        let guard = PanicOnDrop;
+        async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        }
+    }
+
+    /// A throughput configuration for tests that call `join_and_report`
+    /// directly; no connection is opened from it.
+    fn join_test_config() -> GenConfig {
+        GenConfig {
+            addr: "127.0.0.1:1".parse().expect("parse addr"),
+            mode: Mode::Throughput,
+            qos: 1,
+            connections: 1,
+            qos1_window: 1,
+            origin_ns: 0,
+            window: Window {
+                start_ns: 0,
+                end_ns: 0,
+            },
+            drain_grace: Duration::ZERO,
+        }
+    }
+    /// Bytes per write while a test fills a socket's send buffer.
+    const FILL_CHUNK: usize = 65_536;
+    /// How long one write may make no progress before the send buffer
+    /// counts as full.
+    const FILL_STALL: Duration = Duration::from_millis(100);
+    /// Watchdog over the whole fill, so a peer that keeps draining
+    /// fails the test instead of hanging it.
+    const FILL_WATCHDOG: Duration = Duration::from_secs(10);
+    /// Scheduling tolerance past a teardown deadline — far below
+    /// `IO_TIMEOUT_SECS`, so a wait bounded by that timeout fails it.
+    const TEARDOWN_TOLERANCE: Duration = Duration::from_secs(1);
+    /// A PINGRESP — any frame a QoS 0 publisher's reader counts as a
+    /// protocol error.
+    const PINGRESP: [u8; 2] = [0xD0, 0x00];
+
+    /// Fill `write_half`'s send buffer against a peer that never reads:
+    /// write `FILL_CHUNK`s until one makes no progress for `FILL_STALL`,
+    /// then prove the condition the test needs — a two-byte write (the
+    /// size of DISCONNECT) blocks for `FILL_STALL` too. Kernel
+    /// back-pressure, not tokio's cached readiness, decides both.
+    async fn fill_send_buffer(write_half: &mut tokio::net::tcp::OwnedWriteHalf) {
+        let chunk = vec![0u8; FILL_CHUNK];
+        tokio::time::timeout(FILL_WATCHDOG, async {
+            while matches!(
+                tokio::time::timeout(FILL_STALL, write_half.write_all(&chunk)).await,
+                Ok(Ok(()))
+            ) {}
+        })
+        .await
+        .expect("the send buffer must fill within FILL_WATCHDOG");
+        assert!(
+            tokio::time::timeout(FILL_STALL, write_half.write_all(&wire::DISCONNECT))
+                .await
+                .is_err(),
+            "a two-byte write must block once the send buffer is full"
+        );
+    }
 
     async fn connected_pair() -> (
         tokio::net::tcp::OwnedReadHalf,
@@ -1987,5 +2188,294 @@ mod tests {
             acked_when_counted,
             "the teardown must leave no reader running: a detached reader keeps counting PUBACKs after the report is built"
         );
+    }
+
+    #[tokio::test]
+    async fn qos1_drain_carries_a_reader_panic_into_the_connection_task() {
+        for (ids_in_flight, deadline) in [(0, TEARDOWN_DEADLINE), (LEFTOVER_IDS, LEFTOVER_DEADLINE)] {
+            let (read_half, mut write_half, peer) = connected_pair().await;
+            let joined = tokio::spawn(async move {
+                let in_flight = AtomicU64::new(ids_in_flight);
+                let counters = Counters::new(1, Mode::Throughput);
+                let reader_handle = tokio::spawn(async { panicking_reader() });
+                qos1_drain_and_disconnect(
+                    &mut write_half,
+                    &in_flight,
+                    tokio::time::Instant::now() + deadline,
+                    &counters,
+                    reader_handle,
+                    false,
+                )
+                .await;
+            })
+            .await;
+            drop(read_half);
+            drop(peer);
+            let join_err =
+                joined.expect_err("a reader panic must panic the connection task that joined it");
+            assert!(join_err.is_panic());
+            assert!(
+                join_err.to_string().contains(READER_PANIC),
+                "the connection task must panic with the reader's message: {join_err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn latency_teardown_carries_a_reader_panic_into_the_connection_task() {
+        for (ids_in_flight, deadline) in [(0, TEARDOWN_DEADLINE), (LEFTOVER_IDS, LEFTOVER_DEADLINE)] {
+            let (read_half, mut write_half, peer) = connected_pair().await;
+            let config = GenConfig {
+                addr: "127.0.0.1:1".parse().expect("parse addr"),
+                mode: Mode::Latency { rate: 1 },
+                qos: 1,
+                connections: 1,
+                qos1_window: 1,
+                origin_ns: 0,
+                window: Window {
+                    start_ns: 0,
+                    end_ns: 0,
+                },
+                drain_grace: Duration::ZERO,
+            };
+            let joined = tokio::spawn(async move {
+                let counters = Arc::new(Counters::new(1, config.mode));
+                let in_flight = Arc::new(AtomicU64::new(ids_in_flight));
+                latency_teardown(
+                    &config,
+                    &counters,
+                    tokio::time::Instant::now() + deadline,
+                    &in_flight,
+                    Some(tokio::spawn(async { panicking_reader() })),
+                    &mut write_half,
+                    false,
+                )
+                .await;
+            })
+            .await;
+            drop(read_half);
+            drop(peer);
+            let join_err =
+                joined.expect_err("a reader panic must panic the connection task that joined it");
+            assert!(join_err.is_panic());
+            assert!(
+                join_err.to_string().contains(READER_PANIC),
+                "the connection task must panic with the reader's message: {join_err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn qos0_teardown_stops_waiting_at_its_deadline_when_disconnect_cannot_be_written() {
+        let (read_half, mut write_half, mut peer) = connected_pair().await;
+        fill_send_buffer(&mut write_half).await;
+        let config = GenConfig {
+            addr: "127.0.0.1:1".parse().expect("parse addr"),
+            mode: Mode::Throughput,
+            qos: 0,
+            connections: 1,
+            qos1_window: 1,
+            origin_ns: 0,
+            window: Window {
+                start_ns: 0,
+                end_ns: 0,
+            },
+            drain_grace: Duration::ZERO,
+        };
+        let counters = Arc::new(Counters::new(1, Mode::Throughput));
+        let task = ConnectionTask {
+            conn_id: 0,
+            config,
+            counters: Arc::clone(&counters),
+        };
+        let deadline = tokio::time::Instant::now() + LEFTOVER_DEADLINE;
+        let finished = tokio::time::timeout(
+            LEFTOVER_DEADLINE + TEARDOWN_TOLERANCE,
+            run_qos0_throughput(read_half, write_half, task, deadline),
+        )
+        .await;
+        assert!(
+            matches!(finished, Ok(Ok(()))),
+            "the teardown must stop waiting at its deadline, not after IO_TIMEOUT_SECS"
+        );
+        assert_eq!(counters.stalled.load(Ordering::Relaxed), 0);
+        peer.write_all(&PINGRESP).await.expect("peer write");
+        tokio::time::sleep(ABORT_GRACE).await;
+        assert_eq!(
+            counters.protocol_errors.load(Ordering::Relaxed),
+            0,
+            "the teardown must leave no reader running: a detached reader counts the frame after the report is built"
+        );
+    }
+
+    #[tokio::test]
+    async fn qos0_teardown_writes_disconnect_and_ends_when_the_peer_closes() {
+        let (read_half, write_half, peer) = connected_pair().await;
+        let config = GenConfig {
+            addr: "127.0.0.1:1".parse().expect("parse addr"),
+            mode: Mode::Throughput,
+            qos: 0,
+            connections: 1,
+            qos1_window: 1,
+            origin_ns: 0,
+            window: Window {
+                start_ns: 0,
+                end_ns: 0,
+            },
+            drain_grace: Duration::ZERO,
+        };
+        let counters = Arc::new(Counters::new(1, Mode::Throughput));
+        let task = ConnectionTask {
+            conn_id: 0,
+            config,
+            counters: Arc::clone(&counters),
+        };
+        let deadline = tokio::time::Instant::now() + TEARDOWN_DEADLINE;
+        let teardown = tokio::spawn(run_qos0_throughput(read_half, write_half, task, deadline));
+        let bytes = peer_bytes(peer).await;
+        assert_eq!(
+            bytes,
+            wire::DISCONNECT.to_vec(),
+            "a clean teardown must write exactly DISCONNECT, then EOF"
+        );
+        let joined = tokio::time::timeout(TEARDOWN_DEADLINE, teardown)
+            .await
+            .expect("the teardown must end once the peer closed");
+        assert!(matches!(joined, Ok(Ok(()))));
+    }
+
+    #[tokio::test]
+    async fn join_and_report_fails_the_run_with_the_cause_of_a_panicked_task() {
+        let config = join_test_config();
+        let counters = Counters::new(1, config.mode);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let mut set = JoinSet::new();
+        set.spawn(held_until_dropped(&dropped));
+        set.spawn(async { panicking_connection() });
+        let cause = join_and_report(
+            &mut set,
+            tokio::time::Instant::now() + TEARDOWN_DEADLINE,
+            &config,
+            &counters,
+        )
+        .await
+        .expect_err("a panicked connection task must fail the run, not build a report");
+        assert!(
+            cause.starts_with("connection task panicked: "),
+            "the cause must start with the panic prefix: {cause}"
+        );
+        assert!(
+            cause.contains(CONNECTION_PANIC),
+            "the cause must carry the panic's message: {cause}"
+        );
+        assert!(set.is_empty(), "every spawned task must be joined");
+        assert_eq!(
+            dropped.load(Ordering::Relaxed),
+            1,
+            "the pending task's future must be destroyed before join_and_report returns"
+        );
+        assert_eq!(
+            counters.stalled.load(Ordering::Relaxed),
+            0,
+            "a panic is not a stall"
+        );
+    }
+
+    #[tokio::test]
+    async fn join_and_report_counts_the_tasks_still_running_at_the_deadline_as_stalled() {
+        let config = join_test_config();
+        let counters = Counters::new(1, config.mode);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let mut set = JoinSet::new();
+        set.spawn(held_until_dropped(&dropped));
+        set.spawn(held_until_dropped(&dropped));
+        set.spawn(async {});
+        let report = join_and_report(
+            &mut set,
+            tokio::time::Instant::now() + LEFTOVER_DEADLINE,
+            &config,
+            &counters,
+        )
+        .await
+        .expect("no task panicked");
+        assert_eq!(report.stalled, 2, "each task still running at the deadline counts once");
+        assert!(set.is_empty());
+        assert_eq!(
+            dropped.load(Ordering::Relaxed),
+            2,
+            "both tasks still running must be aborted and joined before the report is built"
+        );
+    }
+
+    /// AC-3, AC-4 — the deadline and a panic together: a task still running
+    /// at the hard deadline whose panic surfaces only in the join after
+    /// `abort_all` fails the run, and the leftovers it would have been
+    /// counted for never reach `stalled`.
+    #[tokio::test]
+    async fn join_and_report_fails_the_run_when_a_task_aborted_at_the_deadline_panics() {
+        let config = join_test_config();
+        let counters = Counters::new(1, config.mode);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let mut set = JoinSet::new();
+        set.spawn(held_until_dropped(&dropped));
+        set.spawn(panics_when_dropped());
+        let cause = join_and_report(
+            &mut set,
+            tokio::time::Instant::now() + LEFTOVER_DEADLINE,
+            &config,
+            &counters,
+        )
+        .await
+        .expect_err("a panic seen after abort_all must fail the run, not build a report");
+        assert!(
+            cause.starts_with("connection task panicked: "),
+            "the cause must start with the panic prefix: {cause}"
+        );
+        assert!(
+            cause.contains(DROP_PANIC),
+            "the cause must carry the panic's message: {cause}"
+        );
+        assert!(set.is_empty(), "every spawned task must be joined");
+        assert_eq!(
+            dropped.load(Ordering::Relaxed),
+            1,
+            "the other task still running must be aborted and joined too"
+        );
+        assert_eq!(
+            counters.stalled.load(Ordering::Relaxed),
+            0,
+            "a run that failed on a panic must count no leftover as stalled"
+        );
+    }
+
+    /// AC-4 — the count added to `stalled` is what was still running at the
+    /// deadline, so a drain that finished before it builds a report with
+    /// nothing stalled.
+    #[tokio::test]
+    async fn join_and_report_reports_no_stall_when_every_task_finished() {
+        let config = join_test_config();
+        let counters = Counters::new(1, config.mode);
+        let mut set = JoinSet::new();
+        for _ in 0..FINISHED_TASKS {
+            set.spawn(async {});
+        }
+        let report = join_and_report(
+            &mut set,
+            tokio::time::Instant::now() + TEARDOWN_DEADLINE,
+            &config,
+            &counters,
+        )
+        .await
+        .expect("no task panicked");
+        assert_eq!(
+            report.stalled, 0,
+            "a task that finished before the deadline is not stalled"
+        );
+        assert_eq!(
+            counters.stalled.load(Ordering::Relaxed),
+            0,
+            "a clean drain must add nothing to stalled"
+        );
+        assert!(set.is_empty());
     }
 }

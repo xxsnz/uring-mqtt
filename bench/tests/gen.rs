@@ -55,6 +55,10 @@ const FAILED_BATCH_RATE: u64 = 100_000;
 /// `IO_TIMEOUT_SECS`, with room for process start-up.
 const GEN_CLI_EXIT_BOUND: Duration = Duration::from_secs(20);
 const WAIT_POLL: Duration = Duration::from_millis(50);
+/// Slack past `window.end_ns + drain_grace` for a teardown that the
+/// connection deadline bounds — scheduling and runtime shutdown, less
+/// than the `IO_TIMEOUT_SECS` backstop such a teardown must not reach.
+const TEARDOWN_SLACK: Duration = Duration::from_secs(2);
 
 const CONNACK_OK: [u8; 4] = [0x20, 0x02, 0x00, 0x00];
 const CONNACK_SESSION_PRESENT: [u8; 4] = [0x20, 0x02, 0x01, 0x00];
@@ -62,6 +66,15 @@ const CONNACK_RESERVED_FLAG: [u8; 4] = [0x20, 0x02, 0x02, 0x00];
 /// Session Present, then two reserved bits — every one must be refused in
 /// connections mode.
 const NONZERO_ACK_FLAGS: [u8; 3] = [0x01, 0x02, 0x80];
+/// A CONNACK whose Remaining Length (3) is one past the two bytes MQTT
+/// 3.1.1 defines; the pinned codec ignores the extra byte.
+const CONNACK_LONG_BODY: [u8; 5] = [0x20, 0x03, 0x00, 0x00, 0xFF];
+/// A valid CONNACK and, in the same write, a PUBACK for packet id 1 — a
+/// frame no client is owed before its first PUBLISH.
+const CONNACK_THEN_PUBACK: [u8; 8] = [0x20, 0x02, 0x00, 0x00, 0x40, 0x02, 0x00, 0x01];
+/// A valid CONNACK and, in the same write, the first byte of another
+/// frame — a partial frame must be refused like a whole one.
+const CONNACK_THEN_ONE_BYTE: [u8; 5] = [0x20, 0x02, 0x00, 0x00, 0x40];
 
 /// Next whole second at or after `ns`.
 fn next_whole_second_at_or_after(ns: u64) -> u64 {
@@ -193,12 +206,13 @@ fn closes_after_connack_peer() -> SocketAddr {
     addr
 }
 
-/// A test-local peer that answers a complete CONNECT with `connack`, reads
+/// A test-local peer that answers a complete CONNECT with `reply`, reads
 /// once more and closes — a process-boundary stand-in for a broker sending a
 /// malformed or session-claiming CONNACK. The CONNECT goes through the same
 /// `Codec` as in `acking_peer`, so a fragmented one cannot make the peer
 /// reply and close while part of the request is still unread.
-fn connack_peer(connack: [u8; 4]) -> SocketAddr {
+fn connack_peer(reply: &[u8]) -> SocketAddr {
+    let reply = reply.to_vec();
     let port = bench::free_port();
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("parse addr");
     let listener = TcpListener::bind(addr).expect("bind connack peer");
@@ -208,6 +222,7 @@ fn connack_peer(connack: [u8; 4]) -> SocketAddr {
         .spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
+                let reply = reply.clone();
                 std::thread::spawn(move || {
                     let mut buf = [0u8; 256];
                     let mut codec = Codec::default();
@@ -224,7 +239,7 @@ fn connack_peer(connack: [u8; 4]) -> SocketAddr {
                             Err(_) => return,
                         }
                     }
-                    if stream.write_all(&connack).is_err() {
+                    if stream.write_all(&reply).is_err() {
                         return;
                     }
                     let _ = stream.read(&mut buf);
@@ -1307,6 +1322,54 @@ fn qos1_throughput_returns_by_its_deadline_when_the_peer_withholds_eof() {
     assert_eq!(report.protocol_errors, 0);
 }
 
+/// AC-1, AC-2 — a clean QoS 0 throughput connection against a peer that
+/// reads every PUBLISH and withholds EOF ends at its own deadline, with
+/// nothing stalled.
+#[test]
+fn qos0_throughput_returns_by_its_deadline_when_the_peer_withholds_eof() {
+    let (report, elapsed, bound) =
+        run_bounded(
+            "gen-qos0-throughput-withholds-eof",
+            DEADLINE_WATCHDOG,
+            move || {
+                let addr = acking_peer(None);
+                let before_ns = monotonic_now_ns();
+                let wall_start = Instant::now();
+                let origin_ns = origin_with_lead(LEAD_SECS);
+                let window = Window {
+                    start_ns: origin_ns,
+                    end_ns: origin_ns + NS_PER_SEC,
+                };
+                let config = gen::GenConfig {
+                    addr,
+                    mode: Mode::Throughput,
+                    qos: 0,
+                    connections: 1,
+                    qos1_window: QOS1_WINDOW,
+                    origin_ns,
+                    window,
+                    drain_grace: Duration::from_secs(1),
+                };
+                let report: GenReport =
+                    gen::run_generator(&config).map_err(|e| format!("run_generator: {e}"))?;
+                let elapsed = wall_start.elapsed();
+                let bound = Duration::from_nanos(origin_ns.saturating_sub(before_ns))
+                    + Duration::from_nanos(NS_PER_SEC)
+                    + config.drain_grace
+                    + TEARDOWN_SLACK;
+                Ok((report, elapsed, bound))
+            },
+        );
+
+    assert!(
+        elapsed <= bound,
+        "a QoS 0 teardown must end by its connection deadline, not the backstop: {elapsed:?} > {bound:?}"
+    );
+    assert_eq!(report.stalled, 0, "a peer withholding EOF must cost no stalled connection");
+    assert_eq!(report.protocol_errors, 0);
+    assert!(report.offered > 0, "the connection must have published inside the window");
+}
+
 /// AC-23 — a QoS 1 slot whose packet id cannot be allocated counts in
 /// `missed_slots`; offered saturates at the `PacketIds` ceiling.
 #[test]
@@ -1478,7 +1541,7 @@ fn generator_refuses_a_window_starting_before_its_origin() {
 #[test]
 fn throughput_refuses_a_connack_that_claims_a_session() {
     let report: GenReport = run_bounded("gen-session-present", DEADLINE_WATCHDOG, move || {
-        let addr = connack_peer(CONNACK_SESSION_PRESENT);
+        let addr = connack_peer(&CONNACK_SESSION_PRESENT);
         let origin_ns = origin_with_lead(LEAD_SECS);
         let window = Window {
             start_ns: origin_ns,
@@ -1508,7 +1571,7 @@ fn throughput_refuses_a_connack_that_claims_a_session() {
 #[test]
 fn throughput_counts_a_connack_with_reserved_flags_as_a_protocol_error() {
     let report: GenReport = run_bounded("gen-reserved-flag", DEADLINE_WATCHDOG, move || {
-        let addr = connack_peer(CONNACK_RESERVED_FLAG);
+        let addr = connack_peer(&CONNACK_RESERVED_FLAG);
         let origin_ns = origin_with_lead(LEAD_SECS);
         let window = Window {
             start_ns: origin_ns,
@@ -1532,6 +1595,183 @@ fn throughput_counts_a_connack_with_reserved_flags_as_a_protocol_error() {
     assert_eq!(report.offered, 0);
 }
 
+/// AC-7 — a CONNACK whose Remaining Length is not 2 is refused as a
+/// protocol error in throughput mode, even though the pinned codec accepts
+/// the longer body and ignores its tail.
+#[test]
+fn throughput_refuses_a_connack_whose_body_is_not_two_bytes() {
+    let report: GenReport = run_bounded("gen-connack-long-body", DEADLINE_WATCHDOG, move || {
+        let addr = connack_peer(&CONNACK_LONG_BODY);
+        let origin_ns = origin_with_lead(LEAD_SECS);
+        let window = Window {
+            start_ns: origin_ns,
+            end_ns: origin_ns + NS_PER_SEC,
+        };
+        let config = gen::GenConfig {
+            addr,
+            mode: Mode::Throughput,
+            qos: 1,
+            connections: 2,
+            qos1_window: QOS1_WINDOW,
+            origin_ns,
+            window,
+            drain_grace: Duration::from_secs(1),
+        };
+        gen::run_generator(&config).map_err(|e| format!("run_generator: {e}"))
+    });
+
+    assert_eq!(report.protocol_errors, 2);
+    assert_eq!(report.connect_errors, 2);
+    assert_eq!(report.offered, 0);
+}
+
+/// AC-6 — any byte the codec read past the CONNACK, a whole frame or part
+/// of one, is the broker's violation and refuses the session as a protocol
+/// error in throughput mode.
+#[test]
+fn throughput_refuses_a_session_whose_connack_arrives_with_more_bytes() {
+    for reply in [&CONNACK_THEN_PUBACK[..], &CONNACK_THEN_ONE_BYTE[..]] {
+        let report: GenReport =
+            run_bounded("gen-connack-read-ahead", DEADLINE_WATCHDOG, move || {
+                let addr = connack_peer(reply);
+                let origin_ns = origin_with_lead(LEAD_SECS);
+                let window = Window {
+                    start_ns: origin_ns,
+                    end_ns: origin_ns + NS_PER_SEC,
+                };
+                let config = gen::GenConfig {
+                    addr,
+                    mode: Mode::Throughput,
+                    qos: 1,
+                    connections: 2,
+                    qos1_window: QOS1_WINDOW,
+                    origin_ns,
+                    window,
+                    drain_grace: Duration::from_secs(1),
+                };
+                gen::run_generator(&config).map_err(|e| format!("run_generator: {e}"))
+            });
+
+        assert_eq!(
+            report.protocol_errors, 2,
+            "reply {reply:02x?} must count 2 protocol errors"
+        );
+        assert_eq!(
+            report.connect_errors, 2,
+            "reply {reply:02x?} must count 2 connect errors"
+        );
+        assert_eq!(report.offered, 0, "reply {reply:02x?} must offer nothing");
+    }
+}
+
+/// AC-7 — a CONNACK whose Remaining Length is not 2 is refused on the QoS 0
+/// latency path too. That path drops its read half, so no reader could count
+/// the reply later: `open_session` is the only place the refusal can happen.
+#[test]
+fn latency_qos0_refuses_a_connack_whose_body_is_not_two_bytes() {
+    const RATE: u64 = 1;
+    let report: GenReport =
+        run_bounded("gen-latency-connack-long-body", DEADLINE_WATCHDOG, move || {
+            let addr = connack_peer(&CONNACK_LONG_BODY);
+            let origin_ns = origin_with_lead(LEAD_SECS);
+            let window = Window {
+                start_ns: origin_ns,
+                end_ns: origin_ns + NS_PER_SEC,
+            };
+            let config = gen::GenConfig {
+                addr,
+                mode: Mode::Latency { rate: RATE },
+                qos: 0,
+                connections: 2,
+                qos1_window: QOS1_WINDOW,
+                origin_ns,
+                window,
+                drain_grace: Duration::from_secs(1),
+            };
+            gen::run_generator(&config).map_err(|e| format!("run_generator: {e}"))
+        });
+
+    assert_eq!(report.protocol_errors, 2);
+    assert_eq!(report.connect_errors, 2);
+    assert_eq!(report.offered, 0);
+}
+
+/// AC-6 — any byte the codec read past the CONNACK refuses the session on
+/// the QoS 0 latency path too, the path with no reader to count it later.
+#[test]
+fn latency_qos0_refuses_a_session_whose_connack_arrives_with_more_bytes() {
+    const RATE: u64 = 1;
+    for reply in [&CONNACK_THEN_PUBACK[..], &CONNACK_THEN_ONE_BYTE[..]] {
+        let report: GenReport =
+            run_bounded("gen-latency-connack-read-ahead", DEADLINE_WATCHDOG, move || {
+                let addr = connack_peer(reply);
+                let origin_ns = origin_with_lead(LEAD_SECS);
+                let window = Window {
+                    start_ns: origin_ns,
+                    end_ns: origin_ns + NS_PER_SEC,
+                };
+                let config = gen::GenConfig {
+                    addr,
+                    mode: Mode::Latency { rate: RATE },
+                    qos: 0,
+                    connections: 2,
+                    qos1_window: QOS1_WINDOW,
+                    origin_ns,
+                    window,
+                    drain_grace: Duration::from_secs(1),
+                };
+                gen::run_generator(&config).map_err(|e| format!("run_generator: {e}"))
+            });
+
+        assert_eq!(
+            report.protocol_errors, 2,
+            "reply {reply:02x?} must count 2 protocol errors"
+        );
+        assert_eq!(
+            report.connect_errors, 2,
+            "reply {reply:02x?} must count 2 connect errors"
+        );
+        assert_eq!(report.offered, 0, "reply {reply:02x?} must offer nothing");
+    }
+}
+
+/// AC-7 — connections mode needs no new length check: the exact
+/// `20 02 00 00` comparison it already makes counts a longer CONNACK body as
+/// a protocol error and completes no cycle.
+#[test]
+fn connections_mode_refuses_a_connack_whose_body_is_not_two_bytes() {
+    let report: GenReport =
+        run_bounded("gen-connections-long-body", DEADLINE_WATCHDOG, move || {
+            let addr = connack_peer(&CONNACK_LONG_BODY);
+            let origin_ns = origin_with_lead(LEAD_SECS);
+            let window = Window {
+                start_ns: origin_ns,
+                end_ns: origin_ns + NS_PER_SEC,
+            };
+            let config = gen::GenConfig {
+                addr,
+                mode: Mode::Connections,
+                qos: 0,
+                connections: 1,
+                qos1_window: QOS1_WINDOW,
+                origin_ns,
+                window,
+                drain_grace: Duration::from_secs(1),
+            };
+            gen::run_generator(&config).map_err(|e| format!("run_generator: {e}"))
+        });
+
+    assert!(
+        report.protocol_errors >= 1,
+        "a longer CONNACK body must count a protocol error"
+    );
+    assert_eq!(
+        report.cycles_in_window,
+        Some(0),
+        "a longer CONNACK body must complete no cycle"
+    );
+}
+
 /// AC-9 — connections mode must refuse a CONNACK whose acknowledge-flags
 /// byte sets Session Present or either reserved bit, counting a protocol
 /// error and completing no cycle.
@@ -1540,7 +1780,7 @@ fn connections_mode_refuses_a_connack_with_session_present_or_reserved_flags() {
     for &flags in &NONZERO_ACK_FLAGS {
         let report: GenReport =
             run_bounded("gen-connections-refuses", DEADLINE_WATCHDOG, move || {
-                let addr = connack_peer([0x20, 0x02, flags, 0x00]);
+                let addr = connack_peer(&[0x20, 0x02, flags, 0x00]);
                 let origin_ns = origin_with_lead(LEAD_SECS);
                 let window = Window {
                     start_ns: origin_ns,

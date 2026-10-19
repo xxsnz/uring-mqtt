@@ -212,10 +212,20 @@ async fn connect_and_subscribe(
     .await?;
 
     let mut read = FramedRead::new(read_half, Codec::new(INBOUND_REMAINING_LENGTH_MAX));
-    let connack_packet = read_packet(&mut read, io_timeout, "CONNACK").await?;
+    let (connack_packet, connack_remaining_length) =
+        read_packet(&mut read, io_timeout, "CONNACK").await?;
     let Packet::ConnectAck(ack) = connack_packet else {
         return Err(format!("expected CONNACK, got {connack_packet:?}"));
     };
+    // The pinned codec checks only that a CONNACK body holds at least
+    // two bytes and ignores the rest, so a longer body would pass every
+    // check below (`gen::open_session` refuses it the same way).
+    if connack_remaining_length != wire::CONNACK_REMAINING_LENGTH {
+        return Err(format!(
+            "CONNACK remaining length was {connack_remaining_length}, expected {}",
+            wire::CONNACK_REMAINING_LENGTH
+        ));
+    }
     if ack.return_code != rmqtt_codec::v3::ConnectAckReason::ConnectionAccepted {
         return Err(format!(
             "CONNACK refused: {:?}",
@@ -238,7 +248,7 @@ async fn connect_and_subscribe(
     )
     .await?;
 
-    let suback_packet = read_packet(&mut read, io_timeout, "SUBACK").await?;
+    let (suback_packet, _) = read_packet(&mut read, io_timeout, "SUBACK").await?;
     let Packet::SubscribeAck {
         packet_id: acked_id,
         status,
@@ -451,15 +461,18 @@ where
     }
 }
 
-/// Read exactly one packet from the framed broker stream, treating a peer
-/// close and a decode failure as run-level errors with their own labels.
+/// Read exactly one packet, with its Remaining Length, from the framed broker
+/// stream, treating a peer close and a decode failure as run-level errors with
+/// their own labels. The Remaining Length lets the CONNACK check in
+/// `connect_and_subscribe` refuse a frame the codec would otherwise let
+/// through, as the parallel read in `gen::open_session` does.
 async fn read_packet(
     read: &mut FramedRead<tokio::io::ReadHalf<TcpStream>, Codec>,
     timeout: Duration,
     what: &'static str,
-) -> Result<Packet, String> {
+) -> Result<(Packet, u32), String> {
     match tokio::time::timeout(timeout, read.next()).await {
-        Ok(Some(Ok((packet, _consumed)))) => Ok(packet),
+        Ok(Some(Ok((packet, remaining_length)))) => Ok((packet, remaining_length)),
         Ok(Some(Err(e))) => Err(format!("decode {what}: {e}")),
         Ok(None) => Err(format!("peer closed before {what}")),
         Err(_) => Err(format!(

@@ -16,6 +16,11 @@ use crate::payload::{PAYLOAD_BYTES, TOPIC};
 /// payload = 78 bytes); 1 KiB leaves slack for any control packet.
 pub const INBOUND_REMAINING_LENGTH_MAX: u32 = 1024;
 
+/// Remaining Length of every MQTT 3.1.1 CONNACK: the acknowledge-flags
+/// byte and the return code. `rmqtt-codec` 0.2.2 accepts a longer body
+/// and ignores its tail, so each bench client checks this itself.
+pub const CONNACK_REMAINING_LENGTH: u32 = 2;
+
 /// MQTT 3.1.1 CONNECT (clean session = 1, keep-alive = 0). The body is
 /// `2 + 4 + 1 + 1 + 2 + 2 + client_id.len()` = `12 + client_id.len()` bytes.
 ///
