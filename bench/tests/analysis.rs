@@ -22,6 +22,11 @@ use bench::run_record::{
     Syscalls, SCHEMA_VERSION,
 };
 
+/// Bound on counting a CPU list that names billions of CPUs: far above the
+/// arithmetic count's microseconds, far below a CPU-by-CPU walk's billions
+/// of steps.
+const CPU_COUNT_BOUND: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Smoke-protocol window: 2 s warm-up + 5 s window (PLAN.md ## Data Model).
 const WARMUP_SECS: u64 = 2;
 const WINDOW_SECS: u64 = 5;
@@ -419,7 +424,7 @@ fn reconcile_reports_one_reason_per_violated_rule() {
             "row 12",
             RunKind::Throughput,
             Box::new(|r| r.generator_errors.stalled = 1),
-            "stalled connections 1".to_string(),
+            "stalled 1 (publishes whose write did not complete or whose PUBACK never arrived, plus connection tasks still running at the hard deadline)".to_string(),
         ),
         // Row 13 — QoS 1 throughput/latency: acked = offered.
         (
@@ -798,7 +803,7 @@ fn reconcile_reports_every_rule_a_record_violates_at_once() {
         vec![
             "duplicates 2".to_string(),
             "foreign payloads 1".to_string(),
-            "stalled connections 1".to_string(),
+            "stalled 1 (publishes whose write did not complete or whose PUBACK never arrived, plus connection tasks still running at the hard deadline)".to_string(),
         ]
     );
 }
@@ -1608,6 +1613,78 @@ fn cpu_percent_scales_ticks_by_the_cpu_set_size() {
     assert_eq!(cpu_percent(22_800, 100, 60 * ONE_SECOND_NS, 4), Some(95.0));
     assert_eq!(cpu_percent(22_800, 100, 76 * ONE_SECOND_NS, 4), Some(75.0));
     assert_eq!(cpu_percent(22_800, 100, 0, 4), None);
+}
+
+#[test]
+fn cpu_count_counts_every_cpu_a_stride_names() {
+    assert_eq!(cpu_count("0-10:2"), Some(6));
+    assert_eq!(cpu_count("0-3:1"), Some(4));
+    assert_eq!(cpu_count("1-1:3"), Some(1));
+    assert_eq!(cpu_count("0-2:5"), Some(1));
+    assert_eq!(cpu_count("0-10:2,1"), Some(7));
+    assert_eq!(cpu_count("0-10:2,4-6"), Some(7));
+    assert_eq!(cpu_count("0-12:3,0-12:4"), Some(7));
+    assert_eq!(cpu_count("0-1000000:2,1-999999:2"), Some(1_000_001));
+    // The last stride step would pass u32::MAX.
+    assert_eq!(cpu_count("4294967290-4294967295:2"), Some(3));
+}
+
+#[test]
+fn cpu_count_counts_a_stride_across_billions_of_cpus_without_walking_it() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        tx.send(cpu_count("0-4000000000:2,0-99")).unwrap();
+    });
+    assert_eq!(rx.recv_timeout(CPU_COUNT_BOUND), Ok(Some(2_000_000_051)));
+}
+
+#[test]
+fn cpu_count_counts_each_cpu_once_when_several_strides_name_it() {
+    // Three strides over the same range: the union of the multiples of 2, 3
+    // and 5 up to 30 is 16 + 11 + 7 − 6 − 4 − 3 + 2 = 23 CPUs.
+    assert_eq!(cpu_count("0-30:2,0-30:3,0-30:5"), Some(23));
+    // The same stride twice names the same CPUs, so the count is one stride's.
+    assert_eq!(cpu_count("0-10:2,0-10:2"), Some(6));
+    // Strides that overlap over part of their ranges and start on different
+    // CPUs: {0,2,4,6,8,10} ∪ {5,8,11,14} is 9 CPUs.
+    assert_eq!(cpu_count("0-10:2,5-15:3"), Some(9));
+    // A plain range covering part of a stride: {2,7,12,17} ∪ {0..=6} is 10.
+    assert_eq!(cpu_count("2-20:5,0-6"), Some(10));
+}
+
+#[test]
+fn cpu_count_rejects_a_cpu_number_past_u32() {
+    // taskset truncates a larger number to 32 bits (`4294967296` names CPU
+    // 0); `cpu_count` does not copy that truncation, for a plain CPU id, a
+    // range bound or a stride.
+    assert_eq!(cpu_count("4294967296"), None);
+    assert_eq!(cpu_count("0-4294967296"), None);
+    assert_eq!(cpu_count("0-10:4294967296"), None);
+    assert_eq!(cpu_count("0-3,4294967296"), None);
+}
+
+#[test]
+fn cpu_count_counts_the_whole_cpu_line_without_overflowing() {
+    // `0-4294967295` names 2^32 CPUs, one past `u32`: the count saturates
+    // instead of overflowing.
+    assert_eq!(cpu_count("0-4294967295"), Some(u32::MAX));
+}
+
+#[test]
+fn cpu_count_rejects_stride_forms_outside_the_documented_grammar() {
+    assert_eq!(cpu_count("0-3:0"), None);
+    assert_eq!(cpu_count("0:2"), None);
+    assert_eq!(cpu_count("0-3:"), None);
+    assert_eq!(cpu_count("0-3:x"), None);
+    assert_eq!(cpu_count("0-3:2:1"), None);
+    assert_eq!(cpu_count("0:2,1"), None);
+    assert_eq!(cpu_count("0-3:2:1,4"), None);
+    // AC-5 holds wherever the faulty element sits: the same forms after a
+    // well-formed element are refused too, and so is a trailing empty one.
+    assert_eq!(cpu_count("1,0:2"), None);
+    assert_eq!(cpu_count("4,0-3:2:1"), None);
+    assert_eq!(cpu_count("0-3,4-7:0"), None);
+    assert_eq!(cpu_count("0-3:2,"), None);
 }
 
 #[test]

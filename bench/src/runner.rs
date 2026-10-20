@@ -1542,6 +1542,25 @@ fn take_handshake(guards: &mut ChildGuard, label: &'static str) -> Result<Handsh
     })
 }
 
+/// The file a child's stderr is kept in: `<scratch>/<label>.stderr`.
+fn stderr_path(scratch: &Path, label: &str) -> PathBuf {
+    scratch.join(format!("{label}.stderr"))
+}
+
+/// Where a harness error about a failed child points for its cause:
+/// the stderr file [`stderr_file`] kept for `label`, or — when that
+/// file is absent, because its creation fell back to `/dev/null` —
+/// a statement that none was kept, so a record never cites a file
+/// that does not exist.
+fn stderr_note(scratch: &Path, label: &str) -> String {
+    let path = stderr_path(scratch, label);
+    if path.is_file() {
+        format!("(stderr: {})", path.display())
+    } else {
+        format!("(stderr not retained: {} does not exist)", path.display())
+    }
+}
+
 /// Where a child's stderr goes: `<scratch>/<label>.stderr`, so a startup
 /// rejection — a `taskset` CPU set the host does not have, a mosquitto
 /// option the packaged build does not know — keeps its cause next to the
@@ -1549,7 +1568,7 @@ fn take_handshake(guards: &mut ChildGuard, label: &'static str) -> Result<Handsh
 /// directory that cannot hold the file falls back to `/dev/null` rather
 /// than failing the run for a diagnostic.
 fn stderr_file(scratch: &Path, label: &str) -> Stdio {
-    match std::fs::File::create(scratch.join(format!("{label}.stderr"))) {
+    match std::fs::File::create(stderr_path(scratch, label)) {
         Ok(file) => Stdio::from(file),
         Err(_) => Stdio::null(),
     }
@@ -1798,13 +1817,18 @@ fn terminate_and_wait(
 }
 
 /// Describe a child that did not exit successfully: its code when it exited
-/// on its own, its signal when it was killed. A `bench` child writes its
-/// report before it fails, so this note is the only thing that keeps a
-/// failed child from leaving a valid record.
-fn exit_note(label: &str, status: ExitStatus) -> String {
+/// on its own, its signal when it was killed, and where its stderr is
+/// ([`stderr_note`]). A `bench` child writes its report before it fails, so
+/// this note is the only thing that keeps a failed child from leaving a
+/// valid record, and the stderr file is where its cause is.
+fn exit_note(label: &str, status: ExitStatus, scratch: &Path) -> String {
+    let note = stderr_note(scratch, label);
     match status.code() {
-        Some(c) => format!("{label} exited with code {c}"),
-        None => format!("{label} exited with signal {}", status.signal().unwrap_or(0)),
+        Some(c) => format!("{label} exited with code {c} {note}"),
+        None => format!(
+            "{label} exited with signal {} {note}",
+            status.signal().unwrap_or(0)
+        ),
     }
 }
 
@@ -2853,8 +2877,8 @@ fn run_guarded(spec: &RunSpec, host: &HostSetup, guards: &mut ChildGuard) -> Run
         let ready_deadline = Instant::now() + Duration::from_secs(STARTUP_TIMEOUT_SECS);
         if let Err(e) = wait_for_line(host, guards, handshake, ready_deadline, "READY") {
             harness_errors.push(format!(
-                "endpoint startup failed: READY: {e} (stderr: {})",
-                dir.join(format!("{}.stderr", handshake.label)).display()
+                "endpoint startup failed: READY: {e} {}",
+                stderr_note(&dir, handshake.label)
             ));
             return finalize_record(
                 spec,
@@ -2925,8 +2949,8 @@ fn run_guarded(spec: &RunSpec, host: &HostSetup, guards: &mut ChildGuard) -> Run
         }
         if let Err(e) = wait_for_line(host, guards, handshake, arm_deadline, "ARMED") {
             harness_errors.push(format!(
-                "endpoint startup failed: ARM handshake: {e} (stderr: {})",
-                dir.join(format!("{}.stderr", handshake.label)).display()
+                "endpoint startup failed: ARM handshake: {e} {}",
+                stderr_note(&dir, handshake.label)
             ));
             return finalize_record(
                 spec,
@@ -3097,7 +3121,7 @@ fn run_guarded(spec: &RunSpec, host: &HostSetup, guards: &mut ChildGuard) -> Run
             .and_then(|child| child.try_wait().ok().flatten());
         if let Some(status) = exited {
             if !status.success() {
-                harness_errors.push(exit_note(GENERATOR_LABEL, status));
+                harness_errors.push(exit_note(GENERATOR_LABEL, status, &dir));
             }
             break;
         }
@@ -3137,7 +3161,7 @@ fn run_guarded(spec: &RunSpec, host: &HostSetup, guards: &mut ChildGuard) -> Run
         };
         match terminate_and_wait(host, label, child) {
             Ok(status) if is_bench && !status.success() => {
-                harness_errors.push(exit_note(label, status));
+                harness_errors.push(exit_note(label, status, &dir));
             }
             Ok(_) => {}
             Err(e) => harness_errors.push(e),

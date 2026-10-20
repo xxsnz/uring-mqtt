@@ -294,10 +294,11 @@ pub fn render(records: &[RunRecord], smoke: bool) -> Result<String, DocError> {
             )));
         }
         // `## Environment` prints the shared pair as one cell for every
-        // figure, and the CPU % columns divide by the CPUs it names. A
-        // set that `cell` renders blank identifies no CPU and leaves every
-        // CPU figure `n/a`, so the field is named instead. Checked after
-        // the pair check, so a set that disagrees still reports as mixed.
+        // figure, and each CPU % column divides by the CPUs its own set
+        // names. A set that `cell` renders blank identifies no CPU, so its
+        // column alone would read `n/a` — the other set's column is
+        // unaffected — and the field is named instead. Checked after the
+        // pair check, so a set that disagrees still reports as mixed.
         if let Some((server, generator)) = cpu_set_pairs.iter().next() {
             if cell(server).trim().is_empty() {
                 return Err(DocError::BlankCpuSet("server".to_string()));

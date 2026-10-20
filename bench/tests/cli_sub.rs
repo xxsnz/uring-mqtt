@@ -24,6 +24,9 @@ use bench::record::DeliveryReport;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long the drain test's sender waits before its last line — long enough
+/// that a collector which stops at an empty channel misses it.
+const DRAIN_LAST_LINE_DELAY: Duration = Duration::from_millis(200);
 const WAIT_POLL: Duration = Duration::from_millis(50);
 const ONE_SEC_NS: u64 = 1_000_000_000;
 /// Matches `bench::record::WINDOW_MAX_SPAN_NS` exactly, so the window the
@@ -117,6 +120,23 @@ fn recv_line(rx: &Receiver<String>, timeout: Duration, expect: &str) {
         .recv_timeout(timeout)
         .unwrap_or_else(|e| panic!("expected {expect:?} within {timeout:?}: {e}"));
     assert_eq!(line, expect, "expected {expect:?}, got {line:?}");
+}
+
+/// Every stdout line `bench sub` printed, read until its forwarding
+/// thread ends because the child closed stdout, so a line still in
+/// transit is never missed. A stdout still open after `READY_TIMEOUT`
+/// with no line fails the test instead of hanging it.
+fn drain_stdout(rx: &Receiver<String>) -> Vec<String> {
+    let mut seen = Vec::new();
+    loop {
+        match rx.recv_timeout(READY_TIMEOUT) {
+            Ok(line) => seen.push(line),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return seen,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("stdout forwarding did not end within {READY_TIMEOUT:?}")
+            }
+        }
+    }
 }
 
 fn wait_exit_success(child: &mut Child, timeout: Duration) {
@@ -443,7 +463,7 @@ fn sub_reports_and_exits_on_sigterm_during_setup() {
     send_sigterm(&child);
     wait_exit_success(&mut child, EXIT_TIMEOUT);
 
-    let seen: Vec<String> = rx.try_iter().collect();
+    let seen = drain_stdout(&rx);
     assert!(
         !seen.iter().any(|line| line == "READY"),
         "the handshake never completed, so READY must not appear, saw {seen:?}"
@@ -606,16 +626,7 @@ fn sub_exits_nonzero_when_the_connack_body_is_not_two_bytes() {
 
     wait_exit_code(&mut child, EXIT_TIMEOUT, 1);
 
-    let mut seen = Vec::new();
-    loop {
-        match rx.recv_timeout(READY_TIMEOUT) {
-            Ok(line) => seen.push(line),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                panic!("stdout forwarding did not end within {READY_TIMEOUT:?}")
-            }
-        }
-    }
+    let seen = drain_stdout(&rx);
     assert!(
         !seen.iter().any(|line| line == "READY"),
         "a long CONNACK body must never print READY, saw {seen:?}"
@@ -648,7 +659,7 @@ fn sub_exits_nonzero_when_the_broker_refuses_the_subscription() {
 
     wait_exit_code(&mut child, EXIT_TIMEOUT, 1);
 
-    let seen: Vec<String> = rx.try_iter().collect();
+    let seen = drain_stdout(&rx);
     assert!(
         !seen.iter().any(|line| line == "READY"),
         "a refused subscription must never print READY, saw {seen:?}"
@@ -688,7 +699,7 @@ fn sub_exits_nonzero_when_the_connack_claims_a_session() {
 
     wait_exit_code(&mut child, EXIT_TIMEOUT, 1);
 
-    let seen: Vec<String> = rx.try_iter().collect();
+    let seen = drain_stdout(&rx);
     assert!(
         !seen.iter().any(|line| line == "READY"),
         "a session-claiming CONNACK must never print READY, saw {seen:?}"
@@ -738,16 +749,7 @@ fn sub_fails_before_subscribing_when_bytes_arrive_ahead_of_its_subscribe() {
 
         wait_exit_code(&mut child, EXIT_TIMEOUT, 1);
 
-        let mut seen = Vec::new();
-        loop {
-            match rx.recv_timeout(READY_TIMEOUT) {
-                Ok(line) => seen.push(line),
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    panic!("stdout forwarding did not end within {READY_TIMEOUT:?}")
-                }
-            }
-        }
+        let seen = drain_stdout(&rx);
 
         assert_eq!(
             seen_rx.recv_timeout(EXIT_TIMEOUT),
@@ -765,4 +767,27 @@ fn sub_fails_before_subscribing_when_bytes_arrive_ahead_of_its_subscribe() {
 
         let _ = std::fs::remove_file(&report);
     }
+}
+
+/// `drain_stdout` returns every line its sender wrote until it disconnects,
+/// even when the last line lands after a quiet beat — a helper that stops at
+/// an empty channel or collects synchronously would miss the delayed line.
+#[test]
+fn drain_stdout_returns_every_line_until_the_sender_disconnects() {
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::Builder::new()
+        .name("cli-sub-drain-test".into())
+        .spawn(move || {
+            let _ = tx.send("first".to_string());
+            std::thread::sleep(DRAIN_LAST_LINE_DELAY);
+            let _ = tx.send("READY".to_string());
+        })
+        .expect("spawn drain sender");
+
+    let seen = drain_stdout(&rx);
+    assert_eq!(
+        seen,
+        vec!["first".to_string(), "READY".to_string()],
+        "drain_stdout must wait for the sender's last line and drop"
+    );
 }

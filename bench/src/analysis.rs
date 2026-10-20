@@ -16,6 +16,8 @@
 // (window_secs, rate fractions, p99 ns). Accept the loss of precision.
 #![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -265,10 +267,12 @@ pub fn reconcile(record: &RunRecord) -> Vec<String> {
         ));
     }
 
-    // Row 12 — all kinds: no stalled connections.
+    // Row 12 — all kinds: nothing stalled. The counter sums two units:
+    // publishes whose write did not complete or whose PUBACK never
+    // arrived, and connection tasks still running at the hard deadline.
     if record.generator_errors.stalled != 0 {
         reasons.push(format!(
-            "stalled connections {}",
+            "stalled {} (publishes whose write did not complete or whose PUBACK never arrived, plus connection tasks still running at the hard deadline)",
             record.generator_errors.stalled
         ));
     }
@@ -907,50 +911,101 @@ pub fn interleave<T: Clone>(configs: &[T], repetitions: u32) -> Vec<(T, u32)> {
 }
 
 /// Number of distinct CPUs in a taskset list. `"0,2,4,6"` → 4, `"8-17"` → 10,
-/// `"0,0"` → 1. `None` when any element is unparsable — an empty element, as
-/// in `"0,,2"`, included — or when `b < a` in an `a-b` range.
+/// `"0,0"` → 1, `"0-10:2"` → 6. An element is `n`, `a-b`, or taskset's
+/// stride form `a-b:s` — every `s`-th CPU from `a` up to `b`, `s ≥ 1`.
+/// `None` when any element is outside that grammar — an empty element, as
+/// in `"0,,2"`, a stride of 0, a stride on a single CPU (`"0:2"`), a second
+/// stride, an empty or non-numeric stride, and a number past `u32`
+/// included — or when `b < a`. util-linux's taskset also accepts some of
+/// those forms before a comma (`"0:2,1"`); they get `None` here too.
 ///
-/// A CPU list is an affinity mask, so a CPU named twice — directly or through
-/// two overlapping ranges — still gives the process one CPU. The ranges are
-/// merged instead of enumerated: a list may name a range far wider than the
-/// host has CPUs.
+/// A CPU list is an affinity mask, so a CPU named twice — directly, through
+/// overlapping ranges or through two strides — still gives the process one
+/// CPU. Nothing is expanded into a list: a list may name a range far wider
+/// than the host has CPUs (taskset accepts `0-4000000000:2`). The CPU line
+/// is cut at every element's bounds and each segment is counted by
+/// arithmetic; only a segment where two strides overlap with no plain range
+/// is walked CPU by CPU.
 pub fn cpu_count(set: &str) -> Option<u32> {
-    let mut ranges: Vec<(u32, u32)> = Vec::new();
+    // (first CPU, last CPU, stride); a plain `n` or `a-b` has stride 1.
+    let mut elements: Vec<(u32, u32, u32)> = Vec::new();
     for part in set.split(',') {
         let part = part.trim();
         if part.is_empty() {
             return None;
         }
-        if let Some((a_s, b_s)) = part.split_once('-') {
+        let (span, stride) = match part.split_once(':') {
+            Some((span, s)) => {
+                let s: u32 = s.trim().parse().ok()?;
+                if s == 0 || !span.contains('-') {
+                    return None;
+                }
+                (span, s)
+            }
+            None => (part, 1),
+        };
+        let (a, b) = if let Some((a_s, b_s)) = span.split_once('-') {
             let a: u32 = a_s.trim().parse().ok()?;
             let b: u32 = b_s.trim().parse().ok()?;
             if b < a {
                 return None;
             }
-            ranges.push((a, b));
+            (a, b)
         } else {
-            let n: u32 = part.parse().ok()?;
-            ranges.push((n, n));
-        }
+            let n: u32 = span.parse().ok()?;
+            (n, n)
+        };
+        elements.push((a, b, stride));
     }
-    ranges.sort_unstable();
-    let mut total: u32 = 0;
-    let mut current: Option<(u32, u32)> = None;
-    for (a, b) in ranges {
-        match current {
-            // Overlapping or adjacent: one run of CPUs, counted once.
-            Some((lo, hi)) if a <= hi.saturating_add(1) => current = Some((lo, hi.max(b))),
-            Some((lo, hi)) => {
-                total = total.saturating_add(hi - lo).saturating_add(1);
-                current = Some((a, b));
+    // Split the CPU line at every element's first CPU and one past its last,
+    // so each segment lies wholly inside or wholly outside every element.
+    let mut cuts: Vec<u64> = elements
+        .iter()
+        .flat_map(|&(a, b, _)| [u64::from(a), u64::from(b) + 1])
+        .collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    let mut total: u64 = 0;
+    for pair in cuts.windows(2) {
+        let (lo, hi) = (pair[0], pair[1]);
+        let active: Vec<(u64, u64)> = elements
+            .iter()
+            .filter(|&&(a, b, _)| u64::from(a) <= lo && hi <= u64::from(b) + 1)
+            .map(|&(a, _, s)| (u64::from(a), u64::from(s)))
+            .collect();
+        total += match active.as_slice() {
+            [] => 0,
+            // A plain range names every CPU of the segment.
+            _ if active.iter().any(|&(_, s)| s == 1) => hi - lo,
+            // One stride alone: its CPUs in the segment, counted arithmetically.
+            [(a, s)] => {
+                let first = a + (lo - a).div_ceil(*s) * s;
+                if first < hi { (hi - 1 - first) / s + 1 } else { 0 }
             }
-            None => current = Some((a, b)),
-        }
+            // Several strides overlap: walk their CPUs in a k-way merge,
+            // smallest first, so a CPU two strides share is counted once.
+            _ => {
+                let mut next: BinaryHeap<Reverse<(u64, u64)>> = active
+                    .iter()
+                    .map(|&(a, s)| Reverse((a + (lo - a).div_ceil(s) * s, s)))
+                    .collect();
+                let mut count = 0;
+                let mut last = None;
+                while let Some(Reverse((cpu, s))) = next.pop() {
+                    if cpu >= hi {
+                        continue;
+                    }
+                    if last != Some(cpu) {
+                        count += 1;
+                        last = Some(cpu);
+                    }
+                    next.push(Reverse((cpu + s, s)));
+                }
+                count
+            }
+        };
     }
-    if let Some((lo, hi)) = current {
-        total = total.saturating_add(hi - lo).saturating_add(1);
-    }
-    Some(total)
+    Some(u32::try_from(total).unwrap_or(u32::MAX))
 }
 
 /// `100 × ticks / (clk_tck × sampled_secs × cpus)`, where `sampled_secs` is

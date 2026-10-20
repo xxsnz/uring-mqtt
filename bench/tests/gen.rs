@@ -87,6 +87,13 @@ const CONNACK_THEN_PUBACK: [u8; 8] = [0x20, 0x02, 0x00, 0x00, 0x40, 0x02, 0x00, 
 /// A valid CONNACK and, in the same write, the first byte of another
 /// frame — a partial frame must be refused like a whole one.
 const CONNACK_THEN_ONE_BYTE: [u8; 5] = [0x20, 0x02, 0x00, 0x00, 0x40];
+/// A CONNACK refusing the session with return code 5, "not authorized".
+const CONNACK_NOT_AUTHORIZED: [u8; 4] = [0x20, 0x02, 0x00, 0x05];
+/// The one line connections mode prints for a task whose replies carry Session Present.
+const CONNECTIONS_SESSION_PRESENT_LINE: &str = "gen: connection 0: CONNACK was not 20 02 00 00: [20, 02, 01, 00]";
+/// Connections a refusal test runs, so each one's own line can be observed:
+/// two is the smallest count that tells a per-connection id from a literal 0.
+const REFUSED_CONNECTIONS: u32 = 2;
 /// A PINGREQ response — a frame no QoS 0 client is owed, unsolicited mid-session.
 const PINGRESP: [u8; 2] = [0xD0, 0x00];
 
@@ -145,22 +152,42 @@ fn run_bounded<T: Send + 'static>(
     result.expect("harness body failed")
 }
 
-/// Start an in-process uring `MqttBroker` on a fresh port with a `Recorder`
-/// armed for `origin_ns`/`window`, mirroring the task brief's fixed server
-/// setup (`MqttBroker::start_with_callback(... .num_workers(1), Some(recorder.callback()))`).
+/// Start an in-process uring `MqttBroker` on a fresh port with a
+/// `Recorder`, then choose the origin `LEAD_SECS` ahead of the clock and
+/// arm the recorder for it — the order `bench server` follows (start,
+/// `READY`, then `ARM`), so a broker slow to start under the test
+/// binary's parallelism spends none of the generator's lead.
+/// `window_from_origin` builds the window from the chosen origin.
 fn start_broker_and_recorder(
     connections: u32,
-    origin_ns: u64,
-    window: Window,
-) -> (BrokerHandle, Recorder, SocketAddr) {
+    window_from_origin: fn(u64) -> Window,
+) -> (BrokerHandle, Recorder, SocketAddr, u64, Window) {
     let port = bench::free_port();
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("parse addr");
     let recorder = Recorder::new(connections);
-    recorder.arm(origin_ns, window).expect("arm recorder");
     let config = BrokerConfig::new(addr.to_string()).num_workers(1);
     let handle = MqttBroker::start_with_callback(config, Some(recorder.callback()))
         .expect("start broker");
-    (handle, recorder, addr)
+    let origin_ns = origin_with_lead(LEAD_SECS);
+    let window = window_from_origin(origin_ns);
+    recorder.arm(origin_ns, window).expect("arm recorder");
+    (handle, recorder, addr, origin_ns, window)
+}
+
+/// `WARMUP_SECS` of warm-up after the origin, then a `WINDOW_SECS` window.
+fn warmed_window(origin_ns: u64) -> Window {
+    Window {
+        start_ns: origin_ns + WARMUP_SECS * NS_PER_SEC,
+        end_ns: origin_ns + (WARMUP_SECS + WINDOW_SECS) * NS_PER_SEC,
+    }
+}
+
+/// A `WINDOW_SECS` window starting at the origin.
+fn immediate_window(origin_ns: u64) -> Window {
+    Window {
+        start_ns: origin_ns,
+        end_ns: origin_ns + WINDOW_SECS * NS_PER_SEC,
+    }
 }
 
 /// A test-local TCP peer that answers CONNACK once, then never reads again
@@ -780,12 +807,8 @@ fn packet_ids_never_hand_out_an_id_still_in_flight() {
 #[test]
 fn qos1_throughput_offers_exactly_what_the_server_delivers() {
     let (report, delivery) = run_bounded("gen-qos1-throughput", HARNESS_TIMEOUT, move || {
-        let origin_ns = origin_with_lead(LEAD_SECS);
-        let window = Window {
-            start_ns: origin_ns + WARMUP_SECS * NS_PER_SEC,
-            end_ns: origin_ns + (WARMUP_SECS + WINDOW_SECS) * NS_PER_SEC,
-        };
-        let (handle, recorder, addr) = start_broker_and_recorder(CONNECTIONS, origin_ns, window);
+        let (handle, recorder, addr, origin_ns, window) =
+            start_broker_and_recorder(CONNECTIONS, warmed_window);
 
         let config = gen::GenConfig {
             addr,
@@ -830,12 +853,8 @@ fn qos1_throughput_offers_exactly_what_the_server_delivers() {
 #[test]
 fn qos0_throughput_offers_exactly_what_the_server_delivers() {
     let (report, delivery) = run_bounded("gen-qos0-throughput", HARNESS_TIMEOUT, move || {
-        let origin_ns = origin_with_lead(LEAD_SECS);
-        let window = Window {
-            start_ns: origin_ns + WARMUP_SECS * NS_PER_SEC,
-            end_ns: origin_ns + (WARMUP_SECS + WINDOW_SECS) * NS_PER_SEC,
-        };
-        let (handle, recorder, addr) = start_broker_and_recorder(CONNECTIONS, origin_ns, window);
+        let (handle, recorder, addr, origin_ns, window) =
+            start_broker_and_recorder(CONNECTIONS, warmed_window);
 
         let config = gen::GenConfig {
             addr,
@@ -872,13 +891,8 @@ fn qos0_throughput_offers_exactly_what_the_server_delivers() {
 #[test]
 fn connections_mode_completes_cycles_without_errors() {
     let report = run_bounded("gen-connections-mode", HARNESS_TIMEOUT, move || {
-        let origin_ns = origin_with_lead(LEAD_SECS);
-        let window = Window {
-            start_ns: origin_ns + WARMUP_SECS * NS_PER_SEC,
-            end_ns: origin_ns + (WARMUP_SECS + WINDOW_SECS) * NS_PER_SEC,
-        };
-        let (handle, _recorder, addr) =
-            start_broker_and_recorder(CONNECTIONS, origin_ns, window);
+        let (handle, _recorder, addr, origin_ns, window) =
+            start_broker_and_recorder(CONNECTIONS, warmed_window);
 
         let config = gen::GenConfig {
             addr,
@@ -998,12 +1012,8 @@ fn generator_returns_by_its_deadline_when_puback_is_withheld() {
 fn latency_mode_sends_every_scheduled_slot_at_a_modest_rate() {
     const RATE: u64 = 2_000;
     let (report, delivery) = run_bounded("gen-latency-modest", HARNESS_TIMEOUT, move || {
-        let origin_ns = origin_with_lead(LEAD_SECS);
-        let window = Window {
-            start_ns: origin_ns + WARMUP_SECS * NS_PER_SEC,
-            end_ns: origin_ns + (WARMUP_SECS + WINDOW_SECS) * NS_PER_SEC,
-        };
-        let (handle, recorder, addr) = start_broker_and_recorder(CONNECTIONS, origin_ns, window);
+        let (handle, recorder, addr, origin_ns, window) =
+            start_broker_and_recorder(CONNECTIONS, warmed_window);
 
         let config = gen::GenConfig {
             addr,
@@ -1056,12 +1066,8 @@ fn latency_mode_sends_every_scheduled_slot_at_a_modest_rate() {
 fn latency_mode_schedules_the_exact_count_for_a_non_divisible_rate() {
     const RATE: u64 = 7;
     let report = run_bounded("gen-latency-non-divisible", HARNESS_TIMEOUT, move || {
-        let origin_ns = origin_with_lead(LEAD_SECS);
-        let window = Window {
-            start_ns: origin_ns,
-            end_ns: origin_ns + WINDOW_SECS * NS_PER_SEC,
-        };
-        let (handle, _recorder, addr) = start_broker_and_recorder(3, origin_ns, window);
+        let (handle, _recorder, addr, origin_ns, window) =
+            start_broker_and_recorder(3, immediate_window);
 
         let config = gen::GenConfig {
             addr,
@@ -1266,6 +1272,14 @@ fn latency_mode_stops_pacing_after_the_first_failed_publish_write() {
 /// acknowledges every PUBLISH and then closes mid-stream prints the publish
 /// write diagnostic exactly once and reconciles the failed batch's ids:
 /// every id is either acked or counted stalled, and the two sum to offered.
+///
+/// Recorded limitation (decision Q6): the failed batch depends on host
+/// timing. The write failure needs the peer's close, `ACK_PHASE` after
+/// the first PUBLISH, to land while the generator still writes inside
+/// its window, and the acks sent before that close to be read before
+/// the reset ends the connection. A run that misses either fails the
+/// one-diagnostic assertion or `acked >= 1`; it cannot pass without a
+/// failed batch.
 #[test]
 fn qos1_throughput_reconciles_a_failed_batch_with_the_acks_it_received() {
     let addr = acking_peer(Some(ACK_PHASE));
@@ -1334,6 +1348,14 @@ fn qos1_throughput_reconciles_a_failed_batch_with_the_acks_it_received() {
 /// `qos1_throughput_reconciles_a_failed_batch_with_the_acks_it_received`, in
 /// latency mode: every scheduled slot is still offered or missed exactly
 /// once.
+///
+/// Recorded limitation (decision Q6): the failed batch depends on host
+/// timing. The write failure needs the peer's close, `ACK_PHASE` after
+/// the first PUBLISH, to land while the generator still writes inside
+/// its window, and the acks sent before that close to be read before
+/// the reset ends the connection. A run that misses either fails the
+/// one-diagnostic assertion or `acked >= 1`; it cannot pass without a
+/// failed batch.
 #[test]
 fn qos1_latency_reconciles_a_failed_batch_with_the_acks_it_received() {
     let addr = acking_peer(Some(ACK_PHASE));
@@ -2263,4 +2285,201 @@ fn open_failures_name_their_operation_and_cause() {
 #[test]
 fn latency_open_failures_name_their_operation_and_cause() {
     assert_open_failures_name_their_operation_and_cause("latency");
+}
+
+/// `cli_run_args` with `connections` connections instead of one, so a test
+/// can observe the line every connection id prints.
+fn cli_run_args_with_connections(
+    addr: SocketAddr,
+    mode: &str,
+    qos: u8,
+    connections: u32,
+) -> Vec<String> {
+    let mut args = cli_run_args(addr, mode, qos);
+    let value = args
+        .iter()
+        .position(|arg| arg == "--connections")
+        .expect("cli_run_args passes --connections")
+        + 1;
+    args[value] = connections.to_string();
+    args
+}
+
+/// Every `gen: connection {id}: ` line `stderr` holds, in id order, so a
+/// test can compare them against one line per connection whatever order the
+/// connection tasks printed them in.
+fn refusal_lines(stderr: &str) -> Vec<&str> {
+    let mut lines: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("gen: connection "))
+        .collect();
+    lines.sort_unstable();
+    lines
+}
+
+/// AC-6 for one publishing `mode` and one `reply`: the only line the
+/// refused connection prints is `gen: connection 0: {reason}`, and it
+/// counts one protocol error.
+fn assert_refusal_is_named(tag: &str, mode: &str, reply: &[u8], reason: &str) {
+    let (report, stderr) = run_gen_cli(tag, &cli_run_args(connack_peer(reply), mode, 1))
+        .expect("bench gen must exit 0");
+    let expected = format!("gen: connection 0: {reason}");
+    let lines: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("gen: connection 0: "))
+        .collect();
+    assert_eq!(
+        lines,
+        vec![expected.as_str()],
+        "connection 0 must print exactly the one refusal line for reply {reply:02x?}; stderr:\n{stderr}"
+    );
+    assert_eq!(report.protocol_errors, 1, "reply {reply:02x?} must count one protocol error");
+}
+
+/// AC-6 — the throughput path's `open_session` protocol refusals each print
+/// exactly one named line per CONNACK reason (`gen.rs:683-689`), and no
+/// other `gen: connection 0: ` line accompanies them. A removed or reworded
+/// print fails the assertion against the literal `reason`.
+#[test]
+fn publishing_refusals_name_the_reply_they_refused() {
+    assert_refusal_is_named(
+        "refusal-first-packet",
+        "throughput",
+        &PINGRESP,
+        "first packet was not a CONNACK",
+    );
+    assert_refusal_is_named(
+        "refusal-reserved-flag",
+        "throughput",
+        &CONNACK_RESERVED_FLAG,
+        "CONNACK decode failed: ConnectAck frame's reserved flag is set",
+    );
+    assert_refusal_is_named(
+        "refusal-long-body",
+        "throughput",
+        &CONNACK_LONG_BODY,
+        "CONNACK remaining length was 3, expected 2",
+    );
+    assert_refusal_is_named(
+        "refusal-not-authorized",
+        "throughput",
+        &CONNACK_NOT_AUTHORIZED,
+        "CONNACK refused the session: NotAuthorized",
+    );
+    assert_refusal_is_named(
+        "refusal-session-present",
+        "throughput",
+        &CONNACK_SESSION_PRESENT,
+        "CONNACK claimed Session Present for a CleanSession CONNECT",
+    );
+    assert_refusal_is_named(
+        "refusal-read-ahead",
+        "throughput",
+        &CONNACK_THEN_ONE_BYTE,
+        "CONNACK was followed by 1 unsolicited bytes",
+    );
+}
+
+/// AC-6 — the latency path's own `OpenError::Protocol` arm prints from a
+/// separate site (`gen.rs:1537-1543`); the throughput cases above cannot
+/// reach it, so a regression there stays green unless this test pins it.
+#[test]
+fn latency_refusal_names_the_reply_it_refused() {
+    assert_refusal_is_named(
+        "refusal-latency-session-present",
+        "latency",
+        &CONNACK_SESSION_PRESENT,
+        "CONNACK claimed Session Present for a CleanSession CONNECT",
+    );
+}
+
+/// AC-7 — connections mode prints one refusal per task, no matter how many
+/// bad cycles the task runs (`gen.rs:1340-1351` `if !connack_reported`
+/// guard); the `protocol_errors >= 2` check proves a second cycle ran after
+/// the first, so a guard that fell open would show more than one line.
+#[test]
+fn connections_mode_names_only_the_first_refused_reply_of_a_task() {
+    let (report, stderr) = run_gen_cli(
+        "refusal-connections",
+        &cli_run_args(connack_peer(&CONNACK_SESSION_PRESENT), "connections", 0),
+    )
+    .expect("bench gen must exit 0");
+    let lines: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("gen: connection 0: "))
+        .collect();
+    assert_eq!(
+        lines,
+        vec![CONNECTIONS_SESSION_PRESENT_LINE],
+        "connections mode must print exactly one refusal line for Session Present; stderr:\n{stderr}"
+    );
+    assert!(
+        report.protocol_errors >= 2,
+        "connections mode must observe at least two refused cycles (got {})",
+        report.protocol_errors
+    );
+}
+
+/// AC-6 — the refusal line names the connection that saw the reply, so a
+/// run with more than one connection prints one line per id. A print that
+/// hardcoded connection 0 would show the same id twice.
+#[test]
+fn refusals_name_every_connection_that_saw_them() {
+    let (report, stderr) = run_gen_cli(
+        "refusal-two-connections",
+        &cli_run_args_with_connections(
+            connack_peer(&CONNACK_SESSION_PRESENT),
+            "throughput",
+            1,
+            REFUSED_CONNECTIONS,
+        ),
+    )
+    .expect("bench gen must exit 0");
+    let expected: Vec<String> = (0..REFUSED_CONNECTIONS)
+        .map(|id| {
+            format!(
+                "gen: connection {id}: CONNACK claimed Session Present for a CleanSession CONNECT"
+            )
+        })
+        .collect();
+    assert_eq!(
+        refusal_lines(&stderr),
+        expected,
+        "each refused connection must print its own id; stderr:\n{stderr}"
+    );
+    assert_eq!(
+        report.protocol_errors,
+        u64::from(REFUSED_CONNECTIONS),
+        "each refused connection must count one protocol error"
+    );
+}
+
+/// AC-7 — the one-line limit is per task, not per run: with more than one
+/// connections-mode task each prints its own first refusal, and no task
+/// prints a second one however many bad cycles it runs.
+#[test]
+fn connections_mode_names_the_first_refused_reply_of_every_task() {
+    let (report, stderr) = run_gen_cli(
+        "refusal-connections-two",
+        &cli_run_args_with_connections(
+            connack_peer(&CONNACK_SESSION_PRESENT),
+            "connections",
+            0,
+            REFUSED_CONNECTIONS,
+        ),
+    )
+    .expect("bench gen must exit 0");
+    let expected: Vec<String> = (0..REFUSED_CONNECTIONS)
+        .map(|id| format!("gen: connection {id}: CONNACK was not 20 02 00 00: [20, 02, 01, 00]"))
+        .collect();
+    assert_eq!(
+        refusal_lines(&stderr),
+        expected,
+        "every task must print exactly its own first refusal; stderr:\n{stderr}"
+    );
+    assert!(
+        report.protocol_errors > u64::from(REFUSED_CONNECTIONS),
+        "the tasks must observe more refused cycles than they printed lines (got {})",
+        report.protocol_errors
+    );
 }

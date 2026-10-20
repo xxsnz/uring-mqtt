@@ -40,6 +40,10 @@ const PERF_COUNT: u64 = 6000;
 const THROUGHPUT_RATES: [u64; 5] = [100, 101, 99, 102, 100];
 const LAT_50_HIST: &[(u64, u64)] = &[(40_000, 3000)];
 const LAT_80_HIST: &[(u64, u64)] = &[(80_000, 4800)];
+/// `reconcile` row 12 for `generator_errors.stalled = 3`. `render` calls
+/// `recompute`, which re-derives `invalid_reasons` and compares string for
+/// string, so a fixture that has a stalled count of three must store this text.
+const STALLED_3_REASON: &str = "stalled 3 (publishes whose write did not complete or whose PUBACK never arrived, plus connection tasks still running at the hard deadline)";
 
 fn window_obj() -> Window {
     Window {
@@ -461,7 +465,7 @@ fn render_refuses_a_failed_configuration() {
         .expect("at least one throughput rep 1");
     target.generator_errors.stalled = 3;
     target.valid = false;
-    target.invalid_reasons = vec!["stalled connections 3".to_string()];
+    target.invalid_reasons = vec![STALLED_3_REASON.to_string()];
     match render(&records, false) {
         Err(DocError::FailedConfigurations(names)) => {
             assert!(!names.is_empty(), "expected non-empty names, got {names:?}");
@@ -677,7 +681,7 @@ fn render_ignores_a_failed_earlier_attempt_of_a_retried_configuration() {
             });
             failed.generator_errors.stalled = 3;
             failed.valid = false;
-            failed.invalid_reasons = vec!["stalled connections 3".to_string()];
+            failed.invalid_reasons = vec![STALLED_3_REASON.to_string()];
             first_attempt.push(failed);
             r.attempt = 2;
         }
@@ -1661,7 +1665,7 @@ fn smoke_render_marks_a_failed_connections_configuration() {
     ];
     records[1].generator_errors.stalled = 3;
     records[1].valid = false;
-    records[1].invalid_reasons = vec!["stalled connections 3".to_string()];
+    records[1].invalid_reasons = vec![STALLED_3_REASON.to_string()];
     let doc = render(&records, true).expect("smoke render ok");
     assert!(
         doc.contains("| uring | FAILED | FAILED |"),
@@ -1872,7 +1876,7 @@ fn render_refuses_a_failed_earlier_attempt_at_an_unmatched_rate() {
             failed.lateness = vec![(1000, window_scheduled)];
             failed.generator_errors.stalled = 3;
             failed.valid = false;
-            failed.invalid_reasons = vec!["stalled connections 3".to_string()];
+            failed.invalid_reasons = vec![STALLED_3_REASON.to_string()];
             first_attempt.push(failed);
             r.attempt = 2;
         }

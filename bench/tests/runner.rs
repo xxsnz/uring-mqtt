@@ -32,7 +32,7 @@ use bench::record::Window;
 
 use bench::runner::{
     capture_env, capture_env_with, check_provenance, head_sha, head_sha_with, mosquitto_conf,
-    run_one, run_one_with, HostSetup, RunSpec, CLEANUP_SURVIVOR_PREFIX,
+    run_one, run_one_with, stem_for, HostSetup, RunSpec, CLEANUP_SURVIVOR_PREFIX,
     GIT_HEAD_TIMEOUT_SECS, TOOL_VERSION_TIMEOUT_SECS,
 };
 
@@ -86,6 +86,12 @@ const SIGKILL_REAP_TIMEOUT_SECS: u64 = 1;
 
 /// Mirror of the runner's private guard reap bound (`GUARD_SIGKILL_REAP_TIMEOUT_SECS`).
 const GUARD_SIGKILL_REAP_TIMEOUT_SECS: u64 = 10;
+
+/// Exit code the failing fake `bench` children use.
+const FIXTURE_EXIT_CODE: i32 = 3;
+
+/// Signal the signal-killed fake `bench` children send themselves (SIGKILL).
+const FIXTURE_SIGNAL: i32 = 9;
 
 /// The probe bound of `bench/build.rs`, mirrored because the build script
 /// keeps it private.
@@ -955,6 +961,364 @@ fn run_one_invalidates_a_run_whose_children_write_no_reports() {
             String::from_utf8_lossy(&out.stdout)
         );
     }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_failed_child_names_the_stderr_file_it_left() {
+    let dir = temp_dir("stderr-named");
+    let cancel = Arc::new(AtomicBool::new(false));
+
+    // Every role prints READY/ARMED like a real `bench`, then writes its
+    // own cause to stderr before exiting non-zero, so the kept stderr file
+    // can be checked against the exit note that cites it.
+    let script = make_script(
+        &dir,
+        "fake-bench.sh",
+        &format!(
+            "echo READY\nread line\necho ARMED\necho \"fixture cause from $1\" >&2\nexit {FIXTURE_EXIT_CODE}\n"
+        ),
+    );
+
+    let host = HostSetup {
+        bench_exe: script.clone(),
+        mosquitto_bin: None,
+        syscalls: SyscallMethod::None,
+        perf_bin: None,
+        strace_bin: None,
+        cpu_sets: CpuSets {
+            server: bench::runner::DEFAULT_SERVER_CPUS.to_string(),
+            generator: bench::runner::DEFAULT_GENERATOR_CPUS.to_string(),
+        },
+        env: capture_env(&[], &AtomicBool::new(false)).expect("capture_env"),
+        scratch_dir: dir.clone(),
+        cpu_pressure_path: PathBuf::from(bench::runner::HOST_CPU_PRESSURE_PATH),
+        cancel,
+    };
+    let spec = RunSpec {
+        profile: Profile::Smoke,
+        server: ServerKind::Uring,
+        workers: 1,
+        qos: Some(1),
+        kind: RunKind::Throughput,
+        rate_fraction_pct: None,
+        offered_rate: None,
+        repetition: 1,
+        attempt: 1,
+    };
+
+    let record = run_one(&spec, &host);
+
+    let run_dir = dir.join(stem_for(&spec));
+    let gen_err = run_dir.join("generator.stderr");
+    let endpoint_err = run_dir.join("endpoint.stderr");
+
+    assert!(
+        record
+            .harness_errors
+            .contains(&format!("generator exited with code {FIXTURE_EXIT_CODE} (stderr: {})", gen_err.display())),
+        "expected a generator exit note citing {}; got {:?}",
+        gen_err.display(),
+        record.harness_errors
+    );
+    assert!(
+        record
+            .harness_errors
+            .contains(&format!("endpoint exited with code {FIXTURE_EXIT_CODE} (stderr: {})", endpoint_err.display())),
+        "expected an endpoint exit note citing {}; got {:?}",
+        endpoint_err.display(),
+        record.harness_errors
+    );
+    assert!(
+        fs::read_to_string(&gen_err)
+            .expect("read generator stderr")
+            .contains("fixture cause from gen"),
+        "the cited generator stderr file must hold the generator's own cause"
+    );
+    assert!(
+        fs::read_to_string(&endpoint_err)
+            .expect("read endpoint stderr")
+            .contains("fixture cause from server"),
+        "the cited endpoint stderr file must hold the endpoint's own cause"
+    );
+    assert!(!record.valid, "a run with a failed child must be invalid");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_failed_child_whose_stderr_file_is_gone_says_none_was_kept() {
+    let dir = temp_dir("stderr-gone");
+    let cancel = Arc::new(AtomicBool::new(false));
+
+    // Every role prints READY/ARMED, removes its own stderr file by the fd
+    // it was opened on, then exits non-zero: the runner must say plainly
+    // that no stderr file was kept rather than cite a path that is gone.
+    let script = make_script(
+        &dir,
+        "fake-bench.sh",
+        &format!(
+            "echo READY\nread line\necho ARMED\nrm -f \"$(readlink /proc/$$/fd/2)\"\nexit {FIXTURE_EXIT_CODE}\n"
+        ),
+    );
+
+    let host = HostSetup {
+        bench_exe: script.clone(),
+        mosquitto_bin: None,
+        syscalls: SyscallMethod::None,
+        perf_bin: None,
+        strace_bin: None,
+        cpu_sets: CpuSets {
+            server: bench::runner::DEFAULT_SERVER_CPUS.to_string(),
+            generator: bench::runner::DEFAULT_GENERATOR_CPUS.to_string(),
+        },
+        env: capture_env(&[], &AtomicBool::new(false)).expect("capture_env"),
+        scratch_dir: dir.clone(),
+        cpu_pressure_path: PathBuf::from(bench::runner::HOST_CPU_PRESSURE_PATH),
+        cancel,
+    };
+    let spec = RunSpec {
+        profile: Profile::Smoke,
+        server: ServerKind::Uring,
+        workers: 1,
+        qos: Some(1),
+        kind: RunKind::Throughput,
+        rate_fraction_pct: None,
+        offered_rate: None,
+        repetition: 1,
+        attempt: 1,
+    };
+
+    let record = run_one(&spec, &host);
+
+    let run_dir = dir.join(stem_for(&spec));
+    let gen_err = run_dir.join("generator.stderr");
+    let endpoint_err = run_dir.join("endpoint.stderr");
+
+    assert!(
+        record.harness_errors.contains(&format!(
+            "generator exited with code {FIXTURE_EXIT_CODE} (stderr not retained: {} does not exist)",
+            gen_err.display()
+        )),
+        "expected a generator exit note saying none was kept; got {:?}",
+        record.harness_errors
+    );
+    assert!(
+        record.harness_errors.contains(&format!(
+            "endpoint exited with code {FIXTURE_EXIT_CODE} (stderr not retained: {} does not exist)",
+            endpoint_err.display()
+        )),
+        "expected an endpoint exit note saying none was kept; got {:?}",
+        record.harness_errors
+    );
+    assert!(!gen_err.exists(), "the generator stderr file must be gone");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_child_killed_by_a_signal_names_the_stderr_file_it_left() {
+    let dir = temp_dir("stderr-signal");
+    let cancel = Arc::new(AtomicBool::new(false));
+
+    // Every role prints READY/ARMED, writes its cause to stderr, then kills
+    // itself with FIXTURE_SIGNAL instead of exiting, exercising the signal
+    // branch of the exit note.
+    let script = make_script(
+        &dir,
+        "fake-bench.sh",
+        &format!(
+            "echo READY\nread line\necho ARMED\necho \"fixture cause from $1\" >&2\nkill -{FIXTURE_SIGNAL} $$\n"
+        ),
+    );
+
+    let host = HostSetup {
+        bench_exe: script.clone(),
+        mosquitto_bin: None,
+        syscalls: SyscallMethod::None,
+        perf_bin: None,
+        strace_bin: None,
+        cpu_sets: CpuSets {
+            server: bench::runner::DEFAULT_SERVER_CPUS.to_string(),
+            generator: bench::runner::DEFAULT_GENERATOR_CPUS.to_string(),
+        },
+        env: capture_env(&[], &AtomicBool::new(false)).expect("capture_env"),
+        scratch_dir: dir.clone(),
+        cpu_pressure_path: PathBuf::from(bench::runner::HOST_CPU_PRESSURE_PATH),
+        cancel,
+    };
+    let spec = RunSpec {
+        profile: Profile::Smoke,
+        server: ServerKind::Uring,
+        workers: 1,
+        qos: Some(1),
+        kind: RunKind::Throughput,
+        rate_fraction_pct: None,
+        offered_rate: None,
+        repetition: 1,
+        attempt: 1,
+    };
+
+    let record = run_one(&spec, &host);
+
+    let run_dir = dir.join(stem_for(&spec));
+    let gen_err = run_dir.join("generator.stderr");
+
+    assert!(
+        record.harness_errors.contains(&format!(
+            "generator exited with signal {FIXTURE_SIGNAL} (stderr: {})",
+            gen_err.display()
+        )),
+        "expected a generator exit note citing {}; got {:?}",
+        gen_err.display(),
+        record.harness_errors
+    );
+    assert!(
+        fs::read_to_string(&gen_err)
+            .expect("read generator stderr")
+            .contains("fixture cause from gen"),
+        "the cited generator stderr file must hold the generator's own cause"
+    );
+    assert!(!record.valid, "a run with a signal-killed child must be invalid");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_ready_failure_whose_stderr_file_is_gone_says_none_was_kept() {
+    let dir = temp_dir("ready-stderr-gone");
+    let cancel = Arc::new(AtomicBool::new(false));
+
+    // The endpoint removes its own stderr file and exits before printing
+    // READY, so the handshake fails and the READY error must say plainly
+    // that no stderr file was kept.
+    let script = make_script(
+        &dir,
+        "fake-bench.sh",
+        &format!("rm -f \"$(readlink /proc/$$/fd/2)\"\nexit {FIXTURE_EXIT_CODE}\n"),
+    );
+
+    let host = HostSetup {
+        bench_exe: script.clone(),
+        mosquitto_bin: None,
+        syscalls: SyscallMethod::None,
+        perf_bin: None,
+        strace_bin: None,
+        cpu_sets: CpuSets {
+            server: bench::runner::DEFAULT_SERVER_CPUS.to_string(),
+            generator: bench::runner::DEFAULT_GENERATOR_CPUS.to_string(),
+        },
+        env: capture_env(&[], &AtomicBool::new(false)).expect("capture_env"),
+        scratch_dir: dir.clone(),
+        cpu_pressure_path: PathBuf::from(bench::runner::HOST_CPU_PRESSURE_PATH),
+        cancel,
+    };
+    let spec = RunSpec {
+        profile: Profile::Smoke,
+        server: ServerKind::Uring,
+        workers: 1,
+        qos: Some(1),
+        kind: RunKind::Throughput,
+        rate_fraction_pct: None,
+        offered_rate: None,
+        repetition: 1,
+        attempt: 1,
+    };
+
+    let record = run_one(&spec, &host);
+
+    let run_dir = dir.join(stem_for(&spec));
+    let endpoint_err = run_dir.join("endpoint.stderr");
+    let suffix = format!("(stderr not retained: {} does not exist)", endpoint_err.display());
+
+    let ready_errors: Vec<&String> = record
+        .harness_errors
+        .iter()
+        .filter(|e| e.starts_with("endpoint startup failed: READY: "))
+        .collect();
+    assert_eq!(
+        ready_errors.len(),
+        1,
+        "expected exactly one READY failure; got {:?}",
+        record.harness_errors
+    );
+    assert!(
+        ready_errors[0].ends_with(&suffix),
+        "expected READY failure to end with {suffix:?}; got {:?}",
+        ready_errors[0]
+    );
+    assert!(!endpoint_err.exists(), "the endpoint stderr file must be gone");
+    assert!(!record.valid, "a run with a failed READY handshake must be invalid");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_arm_failure_whose_stderr_file_is_gone_says_none_was_kept() {
+    let dir = temp_dir("arm-stderr-gone");
+    let cancel = Arc::new(AtomicBool::new(false));
+
+    // The endpoint prints READY, then removes its own stderr file and
+    // exits before printing ARMED, so the ARM handshake fails and the ARM
+    // error must say plainly that no stderr file was kept.
+    let script = make_script(
+        &dir,
+        "fake-bench.sh",
+        &format!("echo READY\nread line\nrm -f \"$(readlink /proc/$$/fd/2)\"\nexit {FIXTURE_EXIT_CODE}\n"),
+    );
+
+    let host = HostSetup {
+        bench_exe: script.clone(),
+        mosquitto_bin: None,
+        syscalls: SyscallMethod::None,
+        perf_bin: None,
+        strace_bin: None,
+        cpu_sets: CpuSets {
+            server: bench::runner::DEFAULT_SERVER_CPUS.to_string(),
+            generator: bench::runner::DEFAULT_GENERATOR_CPUS.to_string(),
+        },
+        env: capture_env(&[], &AtomicBool::new(false)).expect("capture_env"),
+        scratch_dir: dir.clone(),
+        cpu_pressure_path: PathBuf::from(bench::runner::HOST_CPU_PRESSURE_PATH),
+        cancel,
+    };
+    let spec = RunSpec {
+        profile: Profile::Smoke,
+        server: ServerKind::Uring,
+        workers: 1,
+        qos: Some(1),
+        kind: RunKind::Throughput,
+        rate_fraction_pct: None,
+        offered_rate: None,
+        repetition: 1,
+        attempt: 1,
+    };
+
+    let record = run_one(&spec, &host);
+
+    let run_dir = dir.join(stem_for(&spec));
+    let endpoint_err = run_dir.join("endpoint.stderr");
+    let suffix = format!("(stderr not retained: {} does not exist)", endpoint_err.display());
+
+    let arm_errors: Vec<&String> = record
+        .harness_errors
+        .iter()
+        .filter(|e| e.starts_with("endpoint startup failed: ARM handshake: "))
+        .collect();
+    assert_eq!(
+        arm_errors.len(),
+        1,
+        "expected exactly one ARM failure; got {:?}",
+        record.harness_errors
+    );
+    assert!(
+        arm_errors[0].ends_with(&suffix),
+        "expected ARM failure to end with {suffix:?}; got {:?}",
+        arm_errors[0]
+    );
+    assert!(!endpoint_err.exists(), "the endpoint stderr file must be gone");
+    assert!(!record.valid, "a run with a failed ARM handshake must be invalid");
 
     let _ = fs::remove_dir_all(&dir);
 }

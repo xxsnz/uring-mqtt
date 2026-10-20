@@ -878,14 +878,26 @@ fn session_result(failure: Option<String>, teardown: Option<String>) -> Result<(
 
 async fn run_qos0_throughput(
     read_half: OwnedReadHalf,
-    mut write_half: OwnedWriteHalf,
+    write_half: OwnedWriteHalf,
     task: ConnectionTask,
     deadline_instant: tokio::time::Instant,
 ) -> Result<(), String> {
     let reader_handle =
         task.counters
             .spawn_reader(qos0_reader_task(task.conn_id, read_half, Arc::clone(&task.counters)));
+    run_qos0_throughput_with_reader(reader_handle, write_half, task, deadline_instant).await
+}
 
+/// [`run_qos0_throughput`] once its session reader is running: publish
+/// until the window ends, then tear down. The reader's handle is taken
+/// rather than spawned here, so a test can hand in a reader that
+/// panics and observe both places its panic is re-raised.
+async fn run_qos0_throughput_with_reader(
+    reader_handle: AbortOnDropHandle<()>,
+    mut write_half: OwnedWriteHalf,
+    task: ConnectionTask,
+    deadline_instant: tokio::time::Instant,
+) -> Result<(), String> {
     let mut next_seq: u64 = 0;
     let mut write_buf = Vec::with_capacity(BATCH * PUBLISH_BYTES);
     while monotonic_now_ns() < task.config.window.end_ns {
@@ -2076,9 +2088,9 @@ async fn qos1_latency_reader(
 mod tests {
     use super::{
         join_and_report, latency_teardown, qos1_drain_and_disconnect, qos1_latency_reader,
-        qos1_reader_task, run_qos0_throughput, run_qos1_throughput, session_result,
-        spawn_progress_watchdog, teardown_failure, wire, ConnectionTask, Counters, GenConfig,
-        Mode, PacketIds, Window, READER_STOP_GRACE,
+        qos1_reader_task, run_qos0_throughput, run_qos0_throughput_with_reader, run_qos1_throughput,
+        session_result, spawn_progress_watchdog, teardown_failure, wire, ConnectionTask, Counters,
+        GenConfig, Mode, PacketIds, Window, READER_STOP_GRACE,
     };
     use std::io::ErrorKind;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2099,14 +2111,17 @@ mod tests {
     /// Deadline handed to a teardown whose drain cannot finish — short
     /// enough to meet inside a test, far longer than one scheduler poll.
     const LEFTOVER_DEADLINE: Duration = Duration::from_millis(200);
-    /// How long the leftover tests hold their peer's PUBACKs back — past
-    /// `LEFTOVER_DEADLINE`, so the drain meets the deadline with every id
-    /// still in flight and the teardown has already returned.
-    const PUBACK_DELAY: Duration = Duration::from_millis(400);
     /// Time the leftover tests give a reader that was never stopped to count
-    /// after the teardown returned — long enough to cover `PUBACK_DELAY` and
-    /// the polls that follow it.
+    /// the late PUBACKs after they reached the client socket.
     const ABORT_GRACE: Duration = Duration::from_millis(400);
+    /// Bytes of the PUBACKs a leftover test's peer sends: one four-byte
+    /// PUBACK for each of the `LEFTOVER_IDS` (3) ids.
+    const LEFTOVER_PUBACK_BYTES: usize = 12;
+    /// Bound on the late PUBACKs being written and then seen unread on the
+    /// client socket.
+    const STIMULUS_BOUND: Duration = Duration::from_secs(2);
+    /// Poll interval while a test waits for those bytes to arrive.
+    const PEEK_POLL: Duration = Duration::from_millis(10);
     /// Message of the panic the `join_and_report` tests plant in a
     /// connection task.
     const CONNECTION_PANIC: &str = "connection panic fixture";
@@ -2231,8 +2246,9 @@ mod tests {
     }
     /// Bytes per write while a test fills a socket's send buffer.
     const FILL_CHUNK: usize = 65_536;
-    /// How long one write may make no progress before the send buffer
-    /// counts as full.
+    /// How long one chunk's `write_all` may take before the send buffer
+    /// counts as full. A timeout proves only that the chunk did not finish
+    /// in that time — some of its bytes may have been written.
     const FILL_STALL: Duration = Duration::from_millis(100);
     /// Watchdog over the whole fill, so a peer that keeps draining
     /// fails the test instead of hanging it.
@@ -2248,10 +2264,10 @@ mod tests {
     const PUBLISH_FAILURE_FIXTURE: &str = "publish write failed: fixture";
 
     /// Fill `write_half`'s send buffer against a peer that never reads:
-    /// write `FILL_CHUNK`s until one makes no progress for `FILL_STALL`,
+    /// write `FILL_CHUNK`s until one does not finish within `FILL_STALL`,
     /// then prove the condition the test needs — a two-byte write (the
-    /// size of DISCONNECT) blocks for `FILL_STALL` too. Kernel
-    /// back-pressure, not tokio's cached readiness, decides both.
+    /// size of DISCONNECT) does not finish within `FILL_STALL` either.
+    /// Kernel back-pressure, not tokio's cached readiness, decides both.
     async fn fill_send_buffer(write_half: &mut tokio::net::tcp::OwnedWriteHalf) {
         let chunk = vec![0u8; FILL_CHUNK];
         tokio::time::timeout(FILL_WATCHDOG, async {
@@ -2518,26 +2534,65 @@ mod tests {
         );
     }
 
-    /// Allocate the ids a teardown's drain finds still in flight, and hand
-    /// the peer a task that writes one PUBACK per id only after the drain
-    /// deadline has passed. A teardown that detaches the production reader
-    /// instead of aborting and awaiting it counts those PUBACKs after the
-    /// report is built, which these tests make visible.
-    fn leftover_ids_acked_late(mut peer: TcpStream) -> Arc<std::sync::Mutex<PacketIds>> {
+    /// The peer's side of a leftover test: PUBACKs for the ids still in
+    /// flight, written only when `send` is called — after the teardown
+    /// under test returned — so the drain meets its deadline with every
+    /// id in flight. `sender` yields the write's result and the peer, which
+    /// the test keeps open until it has observed the client socket.
+    struct LatePubacks {
+        send: tokio::sync::oneshot::Sender<()>,
+        sender: tokio::task::JoinHandle<std::io::Result<TcpStream>>,
+    }
+
+    /// Allocate the ids a teardown's drain finds still in flight, and arm
+    /// the peer to acknowledge them late ([`LatePubacks`]). A teardown that
+    /// detaches the production reader instead of aborting and awaiting it
+    /// reads those PUBACKs and counts them after the report is built.
+    fn leftover_ids_acked_late(
+        mut peer: TcpStream,
+    ) -> (Arc<std::sync::Mutex<PacketIds>>, LatePubacks) {
         let mut ids = PacketIds::new();
         let mut pubacks = Vec::new();
         for _ in 0..LEFTOVER_IDS {
             let id = ids.allocate().expect("packet id available").get();
             pubacks.extend_from_slice(&[0x40, 0x02, (id >> 8) as u8, (id & 0xFF) as u8]);
         }
-        tokio::spawn(async move {
-            tokio::time::sleep(PUBACK_DELAY).await;
-            // A teardown that stopped its reader has already dropped the
-            // read half, so this write can draw a reset; the test's
-            // assertion is what the reader did, not what the peer wrote.
-            let _ = peer.write_all(&pubacks).await;
+        let (send, go) = tokio::sync::oneshot::channel::<()>();
+        let sender = tokio::spawn(async move {
+            let _ = go.await;
+            peer.write_all(&pubacks).await?;
+            Ok(peer)
         });
-        Arc::new(std::sync::Mutex::new(ids))
+        (Arc::new(std::sync::Mutex::new(ids)), LatePubacks { send, sender })
+    }
+
+    /// Send the late PUBACKs, prove they were written, and wait until every
+    /// byte of them sits unread on the client socket `write_half` belongs
+    /// to. Returns the peer so the caller keeps it open while it observes.
+    /// A reader still running would consume them, so the wait would fail.
+    async fn deliver_late_pubacks(
+        late: LatePubacks,
+        write_half: &tokio::net::tcp::OwnedWriteHalf,
+    ) -> TcpStream {
+        late.send.send(()).expect("the peer task waits for the late PUBACKs signal");
+        let peer = tokio::time::timeout(STIMULUS_BOUND, late.sender)
+            .await
+            .expect("the late PUBACKs must be written within STIMULUS_BOUND")
+            .expect("the peer task must not panic")
+            .expect("the late PUBACK write must succeed");
+        let mut buf = [0u8; LEFTOVER_PUBACK_BYTES];
+        tokio::time::timeout(STIMULUS_BOUND, async {
+            loop {
+                let seen = write_half.as_ref().peek(&mut buf).await.expect("peek the client socket");
+                if seen == LEFTOVER_PUBACK_BYTES {
+                    return;
+                }
+                tokio::time::sleep(PEEK_POLL).await;
+            }
+        })
+        .await
+        .expect("every late PUBACK byte must sit unread on the client socket: none arrived, or a reader still running consumed them");
+        peer
     }
 
     #[tokio::test]
@@ -2545,7 +2600,7 @@ mod tests {
         let (read_half, mut write_half, peer) = connected_pair().await;
         let in_flight = Arc::new(AtomicU64::new(LEFTOVER_IDS));
         let counters = Arc::new(Counters::new(1, Mode::Throughput));
-        let packet_ids = leftover_ids_acked_late(peer);
+        let (packet_ids, late) = leftover_ids_acked_late(peer);
         let semaphore = Arc::new(Semaphore::new(0));
         let reader_handle = AbortOnDropHandle::new(tokio::spawn(qos1_reader_task(
             0,
@@ -2572,6 +2627,7 @@ mod tests {
             "every id still in flight at the deadline counts once in stalled"
         );
         let acked_when_counted = counters.acked.load(Ordering::Relaxed);
+        let _peer = deliver_late_pubacks(late, &write_half).await;
         tokio::time::sleep(ABORT_GRACE).await;
         assert_eq!(
             counters.acked.load(Ordering::Relaxed),
@@ -2598,7 +2654,7 @@ mod tests {
         };
         let counters = Arc::new(Counters::new(1, config.mode));
         let in_flight = Arc::new(AtomicU64::new(LEFTOVER_IDS));
-        let packet_ids = leftover_ids_acked_late(peer);
+        let (packet_ids, late) = leftover_ids_acked_late(peer);
         let reader_handle = AbortOnDropHandle::new(tokio::spawn(qos1_latency_reader(
             0,
             read_half,
@@ -2624,6 +2680,7 @@ mod tests {
             "every id still in flight at the deadline counts once in stalled"
         );
         let acked_when_counted = counters.acked.load(Ordering::Relaxed);
+        let _peer = deliver_late_pubacks(late, &write_half).await;
         tokio::time::sleep(ABORT_GRACE).await;
         assert_eq!(
             counters.acked.load(Ordering::Relaxed),
@@ -2691,6 +2748,71 @@ mod tests {
                     Some(AbortOnDropHandle::new(tokio::spawn(async { panicking_reader() }))),
                     &mut write_half,
                     Ok(()),
+                )
+                .await;
+            })
+            .await;
+            drop(read_half);
+            drop(peer);
+            let join_err =
+                joined.expect_err("a reader panic must panic the connection task that joined it");
+            assert!(join_err.is_panic());
+            assert!(
+                join_err.to_string().contains(READER_PANIC),
+                "the connection task must panic with the reader's message: {join_err}"
+            );
+        }
+    }
+
+    /// AC-8 — a reader panic must panic the QoS 0 throughput connection
+    /// task on both reader-join sites: the clean teardown's bounded
+    /// `join_reader_by` and the failed-publish-write site's abort-and-reraise.
+    /// Without the `is_finished()` wait the failed-write case can `abort()`
+    /// a reader tokio never polled and the join returns a cancellation,
+    /// not the panic.
+    #[tokio::test]
+    async fn qos0_throughput_carries_a_reader_panic_into_the_connection_task() {
+        for (window_end_ns, deadline, fill) in [
+            (0u64, TEARDOWN_DEADLINE, false),
+            (u64::MAX, LEFTOVER_DEADLINE, true),
+        ] {
+            let (read_half, mut write_half, peer) = connected_pair().await;
+            if fill {
+                fill_send_buffer(&mut write_half).await;
+            }
+            let config = GenConfig {
+                addr: "127.0.0.1:1".parse().expect("parse addr"),
+                mode: Mode::Throughput,
+                qos: 0,
+                connections: 1,
+                qos1_window: 1,
+                origin_ns: 0,
+                window: Window {
+                    start_ns: 0,
+                    end_ns: window_end_ns,
+                },
+                drain_grace: Duration::ZERO,
+            };
+            let counters = Arc::new(Counters::new(1, Mode::Throughput));
+            let task = ConnectionTask {
+                conn_id: 0,
+                config,
+                counters: Arc::clone(&counters),
+            };
+            let reader = AbortOnDropHandle::new(tokio::spawn(async { panicking_reader() }));
+            tokio::time::timeout(TEARDOWN_DEADLINE, async {
+                while !reader.is_finished() {
+                    tokio::time::sleep(FINISH_POLL).await;
+                }
+            })
+            .await
+            .expect("the panicking reader must finish before the teardown starts");
+            let joined = tokio::spawn(async move {
+                let _ = run_qos0_throughput_with_reader(
+                    reader,
+                    write_half,
+                    task,
+                    tokio::time::Instant::now() + deadline,
                 )
                 .await;
             })
