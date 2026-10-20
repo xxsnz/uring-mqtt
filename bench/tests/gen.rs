@@ -62,6 +62,11 @@ const GEN_CLI_EXIT_BOUND: Duration = Duration::from_secs(20);
 /// its own blocked failure print.
 const GEN_CLI_BLOCKED_STDERR_EXIT_BOUND: Duration =
     Duration::from_secs(GEN_CLI_EXIT_BOUND.as_secs() + gen::IO_TIMEOUT_SECS);
+/// Slack past `main`'s `GEN_FAILURE_PRINT_GRACE` (`gen::IO_TIMEOUT_SECS`)
+/// for `bench gen`'s start-up and exit when its failure print is blocked.
+const FAILURE_PRINT_EXIT_SLACK: Duration = Duration::from_secs(2);
+/// An `--addr` value `dispatch_gen` cannot parse as a socket address.
+const UNPARSABLE_ADDR: &str = "not-an-address";
 /// Chunk the stderr pipe is filled in. A write of at most `PIPE_BUF` bytes
 /// into a pipe with that much room left never blocks, so the last chunk
 /// fills the pipe exactly instead of waiting for a reader.
@@ -1683,6 +1688,70 @@ fn gen_exits_without_a_report_when_nobody_drains_its_stderr() {
     assert!(
         !wrote_report,
         "a run that failed must leave no report behind"
+    );
+}
+
+/// `cli_run_args` for a throughput run whose `--addr` value is
+/// [`UNPARSABLE_ADDR`], so `dispatch_gen` fails before any connection.
+fn unparsable_addr_args() -> Vec<String> {
+    let mut args = cli_run_args(SocketAddr::from(([127, 0, 0, 1], 0)), "throughput", 0);
+    let value = args
+        .iter()
+        .position(|arg| arg == "--addr")
+        .expect("cli_run_args passes --addr")
+        + 1;
+    args[value] = UNPARSABLE_ADDR.to_string();
+    args
+}
+
+/// AC-3 (`features/bench-gen-exit-bound-contract-truth`) — `main`'s bounded
+/// failure print covers every `dispatch_gen` failure, not only a generator
+/// failure. An `--addr` that does not parse fails before any connection
+/// exists; with stderr full and never drained, the print blocks for the
+/// whole `GEN_FAILURE_PRINT_GRACE` and `bench gen` still exits 1 once it
+/// passes. A plain `eprintln!` would hold the process forever instead.
+#[test]
+fn gen_exits_1_by_its_print_grace_when_an_argument_failure_meets_a_full_stderr() {
+    let print_grace = Duration::from_secs(gen::IO_TIMEOUT_SECS);
+
+    let started = Instant::now();
+    let (status, wrote_report) =
+        run_gen_cli_with_full_stderr("unparsable-addr", &unparsable_addr_args())
+            .expect("bench gen must exit with its stderr blocked");
+    let elapsed = started.elapsed();
+
+    assert_eq!(status.code(), Some(1), "a failed dispatch must exit 1");
+    assert!(!wrote_report, "a failed dispatch must leave no report behind");
+    assert!(
+        elapsed >= print_grace,
+        "the failure print must wait out its grace on the full stderr, took {elapsed:?}"
+    );
+    assert!(
+        elapsed < print_grace + FAILURE_PRINT_EXIT_SLACK,
+        "bench gen must exit once its print grace passes, took {elapsed:?}"
+    );
+}
+
+/// AC-3 control — the same unparsable `--addr` against a drained stderr
+/// prints its `addr:` cause and fails without waiting out the print
+/// grace, so the full-stderr test's delay comes from the blocked print
+/// and not from a wait every failure pays.
+#[test]
+fn gen_prints_an_argument_failure_at_once_when_its_stderr_is_drained() {
+    let print_grace = Duration::from_secs(gen::IO_TIMEOUT_SECS);
+
+    let started = Instant::now();
+    let failure = run_gen_cli("unparsable-addr-drained", &unparsable_addr_args())
+        .expect_err("an unparsable --addr must fail bench gen");
+    let elapsed = started.elapsed();
+
+    assert!(
+        failure.contains("stderr:\naddr: "),
+        "the failure must print its addr: cause, got: {failure}"
+    );
+    assert!(
+        elapsed < print_grace,
+        "a print that is not blocked must not wait out the grace, took {elapsed:?}"
     );
 }
 

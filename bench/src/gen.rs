@@ -296,10 +296,11 @@ pub const IO_TIMEOUT_SECS: u64 = 5;
 /// It is the same budget `run_generator`'s `shutdown_timeout` already
 /// spends on the same thing — dropping task futures a cancel cannot
 /// interrupt — so the two share it: `run_generator` hands the shutdown
-/// only what this wait left (`run_generator`). The hard deadline the
-/// drain gets is therefore the whole of AC-24's `window.end_ns +
-/// drain_grace + IO_TIMEOUT_SECS`, unchanged, and `run_generator`'s own
-/// worst case stays the one it had before the wait existed.
+/// only what this wait left (`run_generator`). The drain therefore gets
+/// the whole hard deadline `window.end_ns + drain_grace +
+/// IO_TIMEOUT_SECS`, and `run_generator`'s worst case stays AC-24's
+/// `window.end_ns + drain_grace + IO_TIMEOUT_SECS + READER_STOP_GRACE`,
+/// the one it had before the wait existed.
 const READER_STOP_GRACE: Duration = Duration::from_secs(1);
 /// How long before a due slot the pacer stops sleeping and yields. Private:
 /// the pacer in this file is its only reader, and no caller can act on it.
