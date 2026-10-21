@@ -34,7 +34,7 @@ pub(crate) enum Reply {
 }
 
 impl Reply {
-    /// The `bounded_send` timeout context for this reply's flush. Returns the
+    /// The `queue_reply` timeout context for this reply. Returns the
     /// `super::handler::TIMEOUT_CTX_*` constant itself — never a copy of its
     /// text — so the wording lives in exactly one place.
     pub(crate) fn timeout_context(self) -> &'static str {
@@ -432,10 +432,10 @@ pub(crate) enum ReleaseOutcome {
 pub(crate) enum Disposition<'a> {
     /// Hand the payload to the event seam, then keep reading.
     Deliver(&'a rmqtt_codec::types::Publish),
-    /// Hand the payload to the event seam, THEN flush the reply (PUBACK for
+    /// Hand the payload to the event seam, THEN queue the reply (PUBACK for
     /// QoS 1, PUBREC for QoS 2). The variant name carries the ordering decision.
     DeliverThenReply(&'a rmqtt_codec::types::Publish, Reply),
-    /// Flush this reply, then keep reading.
+    /// Queue this reply, then keep reading.
     Reply(Reply),
     /// Client asked to close. The session reports `SessionOutcome::Served`.
     Close,

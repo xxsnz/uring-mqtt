@@ -28,6 +28,12 @@ pub enum SessionOutcome {
     Violation,
 }
 
+/// The write-buffer length at which both codecs write every queued byte
+/// before encoding the next item: monoio-codec 0.3.4 `BACKPRESSURE_BOUNDARY`
+/// and tokio-util 0.7.19's default `backpressure_boundary`. `queue_reply`
+/// flushes at this length itself, so neither codec writes inside `send`.
+const WRITE_BACKPRESSURE_BOUNDARY: usize = 8 * 1024;
+
 const TIMEOUT_CTX_CONNACK_FLUSH: &str = "handshake timeout during CONNACK flush";
 pub(super) const TIMEOUT_CTX_PINGRESP_FLUSH: &str = "idle timeout during PINGRESP flush";
 pub(super) const TIMEOUT_CTX_PUBACK_FLUSH: &str = "idle timeout during PUBACK flush";
@@ -343,8 +349,22 @@ async fn run_packet_loop<P: PacketIo, T: Timer>(
     // instead of refreshing it (spec §5.1). Bytes still in the kernel
     // socket buffer cannot be told apart and get a fresh anchor.
     let mut hold_debt = false;
+    // Replies queued for packets already decoded, written in one flush
+    // before the loop next waits on the socket or the event channel.
+    let mut unflushed: Option<UnflushedReplies> = None;
     loop {
-        let read_starts_fresh = packets.read_buffer_is_empty();
+        // A read that must reach the socket can wait on the peer, and a full
+        // event channel can hold the next PUBLISH, so every queued reply
+        // leaves before either wait — and before the decode, so no decoded
+        // PUBLISH waits on a write. A buffered whole packet with channel room
+        // decodes and is offered without waiting, so its reply joins the
+        // same flush.
+        if !crate::codec::mqtt::holds_complete_packet(packets.read_buffer())
+            || event_tx.would_hold()
+        {
+            flush_replies::<_, T>(packets, &mut unflushed, peer_addr).await?;
+        }
+        let read_starts_fresh = packets.read_buffer().is_empty();
         let remaining_idle = idle_timeout.saturating_sub(state.last_packet_time.elapsed());
         let packet_result = T::timeout(remaining_idle, packets.next_packet()).await;
         match packet_result {
@@ -355,7 +375,7 @@ async fn run_packet_loop<P: PacketIo, T: Timer>(
                 }
                 let disposition = super::packet::dispatch(&packet, &mut awaiting);
                 // The ingest effect happens per arm; the reply every arm owes,
-                // if any, leaves through the single gated send below.
+                // if any, is queued through the single gated `queue_reply` below.
                 let owed_reply = match disposition {
                     Disposition::Deliver(publish) => {
                         let idle_left =
@@ -388,6 +408,7 @@ async fn run_packet_loop<P: PacketIo, T: Timer>(
                     Disposition::Reply(reply) => Some(reply),
                     Disposition::Close => {
                         tracing::debug!("Client requested disconnect");
+                        flush_replies::<_, T>(packets, &mut unflushed, peer_addr).await?;
                         break Ok(SessionOutcome::Served);
                     }
                     Disposition::Violation(violation) => {
@@ -401,6 +422,7 @@ async fn run_packet_loop<P: PacketIo, T: Timer>(
                         }
                         break Ok(close_with_violation::<_, T>(
                             packets,
+                            &mut unflushed,
                             violation,
                             reply_deadline,
                             peer_addr,
@@ -412,7 +434,7 @@ async fn run_packet_loop<P: PacketIo, T: Timer>(
                 // Computed after any ingest wait: a held PUBLISH's acknowledgement,
                 // and every packet behind it, gets only the idle budget still left.
                 // With none left, close as an idle timeout and write nothing — a
-                // zero-deadline `bounded_send` would still try the write (spec §5.1).
+                // zero-deadline `queue_reply` would still try the encode (spec §5.1).
                 let reply_deadline = idle_timeout.saturating_sub(state.last_packet_time.elapsed());
                 if reply_deadline.is_zero() {
                     tracing::debug!("client idle timeout ({peer_addr})");
@@ -425,6 +447,7 @@ async fn run_packet_loop<P: PacketIo, T: Timer>(
                     {
                         break Ok(close_with_violation::<_, T>(
                             packets,
+                            &mut unflushed,
                             violation,
                             reply_deadline,
                             peer_addr,
@@ -432,8 +455,9 @@ async fn run_packet_loop<P: PacketIo, T: Timer>(
                         )
                         .await);
                     }
-                    bounded_send::<_, T>(
+                    queue_reply::<_, T>(
                         packets,
+                        &mut unflushed,
                         reply.render(version),
                         reply_deadline,
                         peer_addr,
@@ -454,6 +478,7 @@ async fn run_packet_loop<P: PacketIo, T: Timer>(
                     }
                     break Ok(close_with_violation::<_, T>(
                         packets,
+                        &mut unflushed,
                         violation,
                         reply_deadline,
                         peer_addr,
@@ -514,9 +539,12 @@ async fn deliver_publish<T: Timer>(
 /// failure to a dead peer must not convert a countable violation into an
 /// anonymous `Err`. `max_packet_size` is the client's declared receive limit:
 /// a DISCONNECT that does not fit under it is omitted rather than written, so
-/// the close never breaks the limit it may itself be enforcing.
+/// the close never breaks the limit it may itself be enforcing. Replies queued
+/// before the violation are written ahead of the DISCONNECT in the same
+/// best-effort flush.
 async fn close_with_violation<P: PacketIo, T: Timer>(
     packets: &mut P,
+    unflushed: &mut Option<UnflushedReplies>,
     violation: super::packet::Violation,
     deadline: Duration,
     peer_addr: std::net::SocketAddr,
@@ -525,8 +553,9 @@ async fn close_with_violation<P: PacketIo, T: Timer>(
     tracing::warn!("{} ({peer_addr}) — closing", violation.reason());
     if let Some(pkt) = violation.disconnect(packets.version(), max_packet_size) {
         drop(
-            bounded_send::<_, T>(
+            queue_reply::<_, T>(
                 packets,
+                unflushed,
                 pkt,
                 deadline,
                 peer_addr,
@@ -535,10 +564,11 @@ async fn close_with_violation<P: PacketIo, T: Timer>(
             .await,
         );
     }
+    drop(flush_replies::<_, T>(packets, unflushed, peer_addr).await);
     SessionOutcome::Violation
 }
 
-/// Bounded `send_and_flush` under a deadline (handshake or idle).
+/// Bounded `send` + `flush` under a deadline (handshake or idle).
 async fn bounded_send<P: PacketIo, T: Timer>(
     packets: &mut P,
     pkt: MqttPacket,
@@ -546,12 +576,89 @@ async fn bounded_send<P: PacketIo, T: Timer>(
     peer_addr: std::net::SocketAddr,
     timeout_context: &'static str,
 ) -> Result<(), Error> {
-    let send_fut = packets.send_and_flush(pkt);
+    let send_fut = async move {
+        packets.send(pkt).await?;
+        packets.flush().await
+    };
     match T::timeout(deadline, send_fut).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(Error::Io(e)),
         Err(_) => {
             tracing::debug!("{timeout_context} ({peer_addr})");
+            Err(Error::Timeout)
+        }
+    }
+}
+
+/// Replies encoded into the write buffer and not yet flushed. One flush
+/// writes them all, bounded by the earliest one's deadline and reporting
+/// its timeout context: no reply reaches the wire later than its own bound.
+struct UnflushedReplies {
+    flush_by: std::time::Instant,
+    timeout_context: &'static str,
+}
+
+/// Encode `pkt` into the write buffer under `deadline` and record it in
+/// `unflushed`. A buffer that already holds the codecs' backpressure
+/// boundary is flushed first, so the codec never writes inside `send` and
+/// every write of queued replies goes through `flush_replies`. A failed or
+/// timed-out encode clears `unflushed`, so nothing more is written after it.
+async fn queue_reply<P: PacketIo, T: Timer>(
+    packets: &mut P,
+    unflushed: &mut Option<UnflushedReplies>,
+    pkt: MqttPacket,
+    deadline: Duration,
+    peer_addr: std::net::SocketAddr,
+    timeout_context: &'static str,
+) -> Result<(), Error> {
+    let flush_by = std::time::Instant::now() + deadline;
+    if packets.write_buffer().len() >= WRITE_BACKPRESSURE_BOUNDARY {
+        flush_replies::<_, T>(packets, unflushed, peer_addr).await?;
+    }
+    let left = flush_by.saturating_duration_since(std::time::Instant::now());
+    match T::timeout(left, packets.send(pkt)).await {
+        Ok(Ok(())) => {
+            unflushed.get_or_insert(UnflushedReplies {
+                flush_by,
+                timeout_context,
+            });
+            Ok(())
+        }
+        Ok(Err(e)) => {
+            *unflushed = None;
+            Err(Error::Io(e))
+        }
+        Err(_) => {
+            *unflushed = None;
+            tracing::debug!("{timeout_context} ({peer_addr})");
+            Err(Error::Timeout)
+        }
+    }
+}
+
+/// Flush every queued reply by the earliest one's deadline. Nothing queued
+/// is a no-op; a deadline already past is a timeout with no write, as a
+/// reply whose budget ran out is never written.
+async fn flush_replies<P: PacketIo, T: Timer>(
+    packets: &mut P,
+    unflushed: &mut Option<UnflushedReplies>,
+    peer_addr: std::net::SocketAddr,
+) -> Result<(), Error> {
+    let Some(queued) = unflushed.take() else {
+        return Ok(());
+    };
+    let left = queued
+        .flush_by
+        .saturating_duration_since(std::time::Instant::now());
+    if left.is_zero() {
+        tracing::debug!("{} ({peer_addr})", queued.timeout_context);
+        return Err(Error::Timeout);
+    }
+    match T::timeout(left, packets.flush()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(Error::Io(e)),
+        Err(_) => {
+            tracing::debug!("{} ({peer_addr})", queued.timeout_context);
             Err(Error::Timeout)
         }
     }
@@ -693,6 +800,23 @@ pub(crate) mod tests {
     /// Delays every write after the CONNACK so a test can stall the thread
     /// inside the PUBACK write.
     const WRITE_STALL_DELAY: Duration = Duration::from_millis(400);
+    /// Delays every write after the CONNACK by more than the test's own
+    /// scheduling noise, so one write per reply is told apart from one
+    /// write per read batch.
+    const BATCH_WRITE_DELAY: Duration = Duration::from_millis(300);
+    /// Topic filters in `encode_v3_subscribe_past_the_write_boundary`. Its
+    /// SUBACK carries one return code per filter, so that one reply passes
+    /// `WRITE_BACKPRESSURE_BOUNDARY` on its own.
+    const FILTERS_PAST_THE_WRITE_BOUNDARY: usize = 8 * 1024;
+    /// The SUBACK refusing `FILTERS_PAST_THE_WRITE_BOUNDARY` filters: type
+    /// 0x90, remaining length 8194 (varint `82 40`), packet id 1, then one
+    /// v3 `Failure` (0x80) per filter.
+    const SUBACK_PAST_THE_WRITE_BOUNDARY_HEADER: [u8; 5] = [0x90, 0x82, 0x40, 0x00, 0x01];
+    const V3_SUBACK_FAILURE: u8 = 0x80;
+    /// Delay of every write after the CONNACK in
+    /// `flush_after_a_boundary_write_ends_at_the_budget_of_the_replies_still_queued`:
+    /// one write fits the 1.5 s idle budget of `V3_CONNECT_TEST_KA1`, two do not.
+    const BOUNDARY_BUDGET_WRITE: Duration = Duration::from_millis(900);
     /// Ingest deadline of the room test. With 3.5 s of waitable budget (4.5 s
     /// less the reserve), the two hold-debt rules differ when room frees
     /// between 0.2 s (3.5 s mod 1.1 s) and 1.1 s after the anchor.
@@ -853,6 +977,10 @@ pub(crate) mod tests {
         /// been fully drained yields this io error and clears the field.
         /// Lets tests inject an arbitrary transport failure mid-handshake.
         read_error: Option<std::io::ErrorKind>,
+        /// If `Some(kind)`, the first write after the undelayed ones yields
+        /// this io error instead of waiting `write_delay`, and clears the
+        /// field. Later writes reach the socket, so a retry would show.
+        write_error: Option<std::io::ErrorKind>,
         inner: S,
     }
 
@@ -889,6 +1017,8 @@ pub(crate) mod tests {
         async fn write<T: IoBuf>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
             if self.undelayed_writes > 0 {
                 self.undelayed_writes -= 1;
+            } else if let Some(kind) = self.write_error.take() {
+                return (Err(std::io::Error::from(kind)), buf);
             } else {
                 monoio::time::sleep(self.write_delay).await;
             }
@@ -898,6 +1028,8 @@ pub(crate) mod tests {
         async fn writev<T: IoVecBuf>(&mut self, buf_vec: T) -> monoio::BufResult<usize, T> {
             if self.undelayed_writes > 0 {
                 self.undelayed_writes -= 1;
+            } else if let Some(kind) = self.write_error.take() {
+                return (Err(std::io::Error::from(kind)), buf_vec);
             } else {
                 monoio::time::sleep(self.write_delay).await;
             }
@@ -938,6 +1070,7 @@ pub(crate) mod tests {
                 write_delay,
                 undelayed_writes,
                 read_error,
+                write_error: None,
                 inner: stream,
             };
             handle_client_io(
@@ -970,6 +1103,30 @@ pub(crate) mod tests {
         TcpStream,
         monoio::task::JoinHandle<Result<SessionOutcome, Error>>,
     ) {
+        spawn_handler_scripted_io(
+            tx,
+            idle_timeout_secs,
+            ingest_deadline,
+            first_read,
+            write_delay,
+            None,
+        )
+        .await
+    }
+
+    /// `spawn_handler_scripted` whose first write after the CONNACK fails
+    /// with `write_error` when it is `Some`.
+    async fn spawn_handler_scripted_io(
+        tx: EventSender,
+        idle_timeout_secs: u64,
+        ingest_deadline: Duration,
+        first_read: Vec<u8>,
+        write_delay: Duration,
+        write_error: Option<std::io::ErrorKind>,
+    ) -> (
+        TcpStream,
+        monoio::task::JoinHandle<Result<SessionOutcome, Error>>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("local_addr");
         let handle = monoio::spawn(async move {
@@ -981,6 +1138,7 @@ pub(crate) mod tests {
                 write_delay,
                 undelayed_writes: 1,
                 read_error: None,
+                write_error,
                 inner: stream,
             };
             handle_client_io(
@@ -5429,7 +5587,7 @@ pub(crate) mod tests {
                 spawn_handler_test_io(5, 30, Duration::from_secs(10), 1, Some(prefix), None).await;
             let peer = client.local_addr().expect("local_addr").to_string();
 
-            // Idle deadline (1.5s) elapses mid-flush → bounded send_and_flush
+            // Idle deadline (1.5s) elapses mid-flush → bounded send + flush
             // returns Elapsed → handler returns Err(Error::Timeout).
             let start = std::time::Instant::now();
             let join_res = monoio::time::timeout(Duration::from_secs(4), handle)
@@ -6570,6 +6728,750 @@ pub(crate) mod tests {
                     ],
                 ),
                 "expected one WARN line with the bound-violation reason and peer {peer}; logs:\n{logs}"
+            );
+        });
+    }
+
+    /// AC-1, AC-2 — the PUBACKs owed by three PUBLISHes that arrived in one
+    /// read leave in one write, in arrival order. Every write after the
+    /// CONNACK waits `BATCH_WRITE_DELAY`, so one write per reply would need
+    /// three delays before the last PUBACK arrives.
+    #[test]
+    fn replies_owed_by_one_read_leave_in_one_write() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (tx, _rx) = event_channel(0, std::sync::Arc::default());
+            let mut prefix = V3_CONNECT_TEST.to_vec();
+            for packet_id in 1..=3 {
+                prefix.extend_from_slice(&v3_qos1_publish(b"t", packet_id));
+            }
+            let (mut client, handle) =
+                spawn_handler_scripted(tx, 30, LONG_INGEST_DEADLINE, prefix, BATCH_WRITE_DELAY)
+                    .await;
+
+            let connack = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                .await
+                .expect("read CONNACK");
+            assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+            let start = std::time::Instant::now();
+            let acks = tcp_read_n_bounded(&mut client, 12, Duration::from_secs(3))
+                .await
+                .expect("read PUBACKs");
+            let elapsed = start.elapsed();
+            assert_eq!(
+                acks,
+                vec![0x40, 0x02, 0x00, 0x01, 0x40, 0x02, 0x00, 0x02, 0x40, 0x02, 0x00, 0x03]
+            );
+            assert!(
+                elapsed < BATCH_WRITE_DELAY * 2,
+                "three PUBACKs took {elapsed:?}: more than one delayed write"
+            );
+
+            tcp_write_all(&mut client, &DISCONNECT)
+                .await
+                .expect("disconnect write");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(matches!(join_res, Ok(SessionOutcome::Served)));
+        });
+    }
+
+    /// AC-3 — a PUBACK owed before a partial packet reaches the peer with no
+    /// further client input, whether the read buffer holds one byte of the
+    /// next fixed header or every byte of the next PUBLISH but its last.
+    #[test]
+    fn puback_reaches_the_peer_while_the_next_packet_is_still_partial() {
+        for split in [1, PUBLISH_QOS1_T.len() - 1] {
+            let mut rt = build_runtime();
+            rt.block_on(async {
+                let (tx, _rx) = event_channel(0, std::sync::Arc::default());
+                let mut prefix = V3_CONNECT_TEST.to_vec();
+                prefix.extend_from_slice(&PUBLISH_QOS1_T);
+                prefix.extend_from_slice(&PUBLISH_QOS1_T[..split]);
+                let (mut client, handle) =
+                    spawn_handler_scripted(tx, 30, LONG_INGEST_DEADLINE, prefix, Duration::ZERO)
+                        .await;
+
+                let got = tcp_read_n_bounded(&mut client, 8, Duration::from_secs(1))
+                    .await
+                    .expect("read CONNACK + PUBACK");
+                assert_eq!(
+                    got,
+                    vec![0x20, 0x02, 0x00, 0x00, 0x40, 0x02, 0x00, 0x01],
+                    "split at {split}"
+                );
+                tcp_write_all(&mut client, &PUBLISH_QOS1_T[split..])
+                    .await
+                    .expect("write the rest of the PUBLISH");
+                let got = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(1))
+                    .await
+                    .expect("read second PUBACK");
+                assert_eq!(got, vec![0x40, 0x02, 0x00, 0x01], "split at {split}");
+
+                tcp_write_all(&mut client, &DISCONNECT)
+                    .await
+                    .expect("disconnect write");
+                let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                    .await
+                    .expect("join timeout");
+                assert!(matches!(join_res, Ok(SessionOutcome::Served)));
+            });
+        }
+    }
+
+    /// AC-4 — a PUBACK owed before a PUBLISH that finds the event channel
+    /// full reaches the peer while that PUBLISH is held, and the held
+    /// PUBLISH's own PUBACK follows once the channel has room.
+    #[test]
+    fn puback_reaches_the_peer_while_the_next_publish_waits_for_channel_room() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (tx, mut rx) = event_channel(0, std::sync::Arc::default());
+            for _ in 0..EVENT_CHANNEL_CAPACITY - 1 {
+                tx.send(Publish::fixture("t", &[]));
+            }
+            let mut prefix = V3_CONNECT_TEST.to_vec();
+            prefix.extend_from_slice(&v3_qos1_publish(b"t", 1));
+            prefix.extend_from_slice(&v3_qos1_publish(b"t", 2));
+            let (mut client, handle) =
+                spawn_handler_scripted(tx, 30, LONG_INGEST_DEADLINE, prefix, Duration::ZERO).await;
+
+            let got = tcp_read_n_bounded(&mut client, 8, Duration::from_secs(1))
+                .await
+                .expect("read CONNACK + first PUBACK");
+            assert_eq!(got, vec![0x20, 0x02, 0x00, 0x00, 0x40, 0x02, 0x00, 0x01]);
+            let early = tcp_read_n_bounded(&mut client, 4, NO_ACK_WINDOW)
+                .await
+                .expect("read during the hold");
+            assert!(early.is_empty(), "second PUBACK before room: {early:?}");
+
+            rx.recv().await.expect("free one slot");
+            let got = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(1))
+                .await
+                .expect("read second PUBACK");
+            assert_eq!(got, vec![0x40, 0x02, 0x00, 0x02]);
+
+            tcp_write_all(&mut client, &DISCONNECT)
+                .await
+                .expect("disconnect write");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(matches!(join_res, Ok(SessionOutcome::Served)));
+        });
+    }
+
+    /// AC-5 — a PUBACK owed before a client DISCONNECT read from the same
+    /// buffer reaches the peer before the server closes.
+    #[test]
+    fn puback_reaches_the_peer_before_a_client_disconnect_ends_the_session() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (tx, _rx) = event_channel(0, std::sync::Arc::default());
+            let mut prefix = V3_CONNECT_TEST.to_vec();
+            prefix.extend_from_slice(&PUBLISH_QOS1_T);
+            prefix.extend_from_slice(&DISCONNECT);
+            let (mut client, handle) =
+                spawn_handler_scripted(tx, 30, LONG_INGEST_DEADLINE, prefix, Duration::ZERO).await;
+
+            let got = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(2))
+                .await
+                .expect("read to EOF");
+            assert_eq!(got, vec![0x20, 0x02, 0x00, 0x00, 0x40, 0x02, 0x00, 0x01]);
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Ok(SessionOutcome::Served)),
+                "{join_res:?}"
+            );
+        });
+    }
+
+    /// AC-6 — a PUBACK owed before a v3 protocol violation read from the
+    /// same buffer reaches the peer before the server closes; v3 has no
+    /// server DISCONNECT, so the PUBACK is the last byte written.
+    #[test]
+    fn puback_reaches_the_peer_before_a_v3_violation_ends_the_session() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (tx, _rx) = event_channel(0, std::sync::Arc::default());
+            let mut prefix = V3_CONNECT_TEST.to_vec();
+            prefix.extend_from_slice(&PUBLISH_QOS1_T);
+            prefix.extend_from_slice(&V3_CONNECT_TEST);
+            let (mut client, handle) =
+                spawn_handler_scripted(tx, 30, LONG_INGEST_DEADLINE, prefix, Duration::ZERO).await;
+
+            let got = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(2))
+                .await
+                .expect("read to EOF");
+            assert_eq!(got, vec![0x20, 0x02, 0x00, 0x00, 0x40, 0x02, 0x00, 0x01]);
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Ok(SessionOutcome::Violation)),
+                "{join_res:?}"
+            );
+        });
+    }
+
+    /// AC-7 — on v5 a reply owed before a protocol violation is written
+    /// ahead of the server's DISCONNECT: the client reads the PUBREC, then
+    /// the ProtocolError DISCONNECT, then EOF.
+    #[test]
+    fn v5_pubrec_reaches_the_peer_ahead_of_the_violation_disconnect() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (tx, _rx) = event_channel(0, std::sync::Arc::default());
+            let id1 = NonZeroU16::new(1).expect("non-zero");
+            let mut prefix = encode_v5_connect(30, "test");
+            prefix.extend_from_slice(&encode_v5_qos2_publish("t", id1, &FIXTURE_PAYLOAD));
+            prefix.extend_from_slice(&encode_v5_connect(30, "test"));
+            let (mut client, handle) =
+                spawn_handler_scripted(tx, 30, LONG_INGEST_DEADLINE, prefix, Duration::ZERO).await;
+
+            let mut reader = V5Reader::new();
+            let connack = monoio::time::timeout(Duration::from_secs(2), reader.next(&mut client))
+                .await
+                .expect("v5 CONNACK read timeout")
+                .expect("v5 CONNACK decoded");
+            assert!(
+                matches!(connack, MqttPacket::V5(PacketV5::ConnectAck(_))),
+                "{connack:?}"
+            );
+            let pubrec = monoio::time::timeout(Duration::from_secs(2), reader.next(&mut client))
+                .await
+                .expect("v5 PUBREC read timeout")
+                .expect("v5 PUBREC decoded");
+            assert!(
+                matches!(&pubrec, MqttPacket::V5(PacketV5::PublishReceived(ack)) if ack.packet_id == id1),
+                "{pubrec:?}"
+            );
+            let disconnect =
+                monoio::time::timeout(Duration::from_secs(2), reader.raw(&mut client, 4))
+                    .await
+                    .expect("v5 DISCONNECT read timeout");
+            assert_eq!(disconnect, vec![0xE0, 0x02, 0x82, 0x00]);
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Ok(SessionOutcome::Violation)),
+                "{join_res:?}"
+            );
+        });
+    }
+
+    /// AC-8, AC-9 — a PUBACK and a PINGRESP queued from one read whose
+    /// write blocks close the connection at the ka=1 idle budget (1.5 s from
+    /// the CONNECT), and the one debug line names the earliest queued reply,
+    /// the PUBACK.
+    #[test]
+    fn deferred_reply_flush_times_out_under_the_earliest_reply_budget() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let mut prefix = V3_CONNECT_TEST_KA1.to_vec();
+            prefix.extend_from_slice(&PUBLISH_QOS1_T);
+            prefix.extend_from_slice(&PINGREQ);
+            let (client, _rx, handle) =
+                spawn_handler_test_io(5, 30, Duration::from_secs(10), 1, Some(prefix), None).await;
+            let peer = client.local_addr().expect("local_addr").to_string();
+
+            let start = std::time::Instant::now();
+            let join_res = monoio::time::timeout(Duration::from_secs(4), handle)
+                .await
+                .expect("join timeout");
+            let elapsed = start.elapsed();
+            assert!(matches!(join_res, Err(Error::Timeout)), "{join_res:?}");
+            assert!(
+                (Duration::from_millis(1300)..=Duration::from_millis(2500)).contains(&elapsed),
+                "elapsed {elapsed:?} outside 1.3s..=2.5s (1.5s idle budget)"
+            );
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert_eq!(count_lines_at(&logs, "DEBUG", "timeout"), 1, "{logs}");
+            assert!(
+                has_line_at(&logs, "DEBUG", &[TIMEOUT_CTX_PUBACK_FLUSH, &peer]),
+                "{logs}"
+            );
+            drop(client);
+        });
+    }
+    /// v3 SUBSCRIBE, packet id 1, asking for `FILTERS_PAST_THE_WRITE_BOUNDARY`
+    /// copies of filter "a" at QoS 0.
+    fn encode_v3_subscribe_past_the_write_boundary() -> Vec<u8> {
+        let mut enc = MqttEncoder::v3();
+        let pkt = MqttPacket::V3(PacketV3::Subscribe {
+            packet_id: NonZeroU16::new(1).expect("non-zero"),
+            topic_filters: vec![
+                ("a".into(), CodecQoS::AtMostOnce);
+                FILTERS_PAST_THE_WRITE_BOUNDARY
+            ],
+        });
+        let mut buf = BytesMut::new();
+        enc.encode(pkt, &mut buf).expect("encode v3 SUBSCRIBE");
+        buf.to_vec()
+    }
+
+    /// AC-2, AC-17 — replies keep decode order when one of them passes the
+    /// 8 KiB write boundary, and the queued bytes leave before the next
+    /// encode rather than waiting for the batch's flush: the client
+    /// reads CONNACK and the whole SUBACK, then, one delayed write later,
+    /// the PINGRESP and the PUBACK.
+    #[test]
+    fn replies_past_the_write_boundary_reach_the_peer_in_decode_order() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (tx, _rx) = event_channel(0, std::sync::Arc::default());
+            let mut prefix = V3_CONNECT_TEST.to_vec();
+            prefix.extend_from_slice(&encode_v3_subscribe_past_the_write_boundary());
+            prefix.extend_from_slice(&PINGREQ);
+            prefix.extend_from_slice(&PUBLISH_QOS1_T);
+            let (mut client, handle) =
+                spawn_handler_scripted(tx, 30, LONG_INGEST_DEADLINE, prefix, BATCH_WRITE_DELAY)
+                    .await;
+
+            let mut expected = vec![0x20, 0x02, 0x00, 0x00];
+            expected.extend_from_slice(&SUBACK_PAST_THE_WRITE_BOUNDARY_HEADER);
+            expected.extend(std::iter::repeat_n(
+                V3_SUBACK_FAILURE,
+                FILTERS_PAST_THE_WRITE_BOUNDARY,
+            ));
+            let got = tcp_read_n_bounded(&mut client, expected.len(), Duration::from_secs(2))
+                .await
+                .expect("read CONNACK + SUBACK");
+            assert_eq!(got.len(), expected.len());
+            assert!(
+                got == expected,
+                "CONNACK + SUBACK differ from the expected bytes"
+            );
+            let suback_at = std::time::Instant::now();
+            let got = tcp_read_n_bounded(&mut client, 6, Duration::from_secs(2))
+                .await
+                .expect("read PINGRESP + PUBACK");
+            assert_eq!(got, vec![0xD0, 0x00, 0x40, 0x02, 0x00, 0x01]);
+            let gap = suback_at.elapsed();
+            assert!(
+                gap >= BATCH_WRITE_DELAY / 2,
+                "PINGRESP + PUBACK {gap:?} after the SUBACK: the SUBACK waited for the batch flush"
+            );
+
+            tcp_write_all(&mut client, &DISCONNECT)
+                .await
+                .expect("disconnect write");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(matches!(join_res, Ok(SessionOutcome::Served)));
+        });
+    }
+
+    /// AC-8, AC-9, AC-17 — when the flush before a PINGRESP's encode writes a
+    /// queued SUBACK past the write boundary and that write blocks, the
+    /// session closes at the ka=1 idle budget and the one debug line names
+    /// the SUBACK, the queued reply, not the PINGRESP about to be encoded.
+    #[test]
+    fn write_past_the_boundary_times_out_under_the_earliest_reply_budget() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let mut prefix = V3_CONNECT_TEST_KA1.to_vec();
+            prefix.extend_from_slice(&encode_v3_subscribe_past_the_write_boundary());
+            prefix.extend_from_slice(&PINGREQ);
+            let (client, _rx, handle) =
+                spawn_handler_test_io(5, 30, Duration::from_secs(10), 1, Some(prefix), None).await;
+            let peer = client.local_addr().expect("local_addr").to_string();
+
+            let start = std::time::Instant::now();
+            let join_res = monoio::time::timeout(Duration::from_secs(4), handle)
+                .await
+                .expect("join timeout");
+            let elapsed = start.elapsed();
+            assert!(matches!(join_res, Err(Error::Timeout)), "{join_res:?}");
+            assert!(
+                (Duration::from_millis(1300)..=Duration::from_millis(2500)).contains(&elapsed),
+                "elapsed {elapsed:?} outside 1.3s..=2.5s (1.5s idle budget)"
+            );
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert_eq!(count_lines_at(&logs, "DEBUG", "timeout"), 1, "{logs}");
+            assert!(
+                has_line_at(&logs, "DEBUG", &[TIMEOUT_CTX_SUBACK_FLUSH, &peer]),
+                "{logs}"
+            );
+            drop(client);
+        });
+    }
+
+    /// AC-3 — a PUBACK owed before a transport read error reaches the peer:
+    /// the read that fails is a socket read, so the PUBACK leaves before it.
+    #[test]
+    fn puback_reaches_the_peer_before_a_transport_read_error_ends_the_session() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let mut prefix = V3_CONNECT_TEST.to_vec();
+            prefix.extend_from_slice(&PUBLISH_QOS1_T);
+            let (mut client, _rx, handle) = spawn_handler_test_io(
+                5,
+                30,
+                Duration::ZERO,
+                1,
+                Some(prefix),
+                Some(std::io::ErrorKind::ConnectionReset),
+            )
+            .await;
+
+            let got = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(2))
+                .await
+                .expect("read to EOF");
+            assert_eq!(got, vec![0x20, 0x02, 0x00, 0x00, 0x40, 0x02, 0x00, 0x01]);
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Ok(SessionOutcome::Served)),
+                "{join_res:?}"
+            );
+        });
+    }
+
+    /// AC-13, AC-15 — when the reply flush on a client DISCONNECT fails, the
+    /// session ends with that io error and writes nothing more: the client
+    /// reads only the CONNACK before EOF.
+    #[test]
+    fn failed_reply_flush_on_client_disconnect_ends_the_session_with_the_io_error() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (tx, _rx) = event_channel(0, std::sync::Arc::default());
+            let mut prefix = V3_CONNECT_TEST.to_vec();
+            prefix.extend_from_slice(&PUBLISH_QOS1_T);
+            prefix.extend_from_slice(&DISCONNECT);
+            let (mut client, handle) = spawn_handler_scripted_io(
+                tx,
+                30,
+                LONG_INGEST_DEADLINE,
+                prefix,
+                Duration::ZERO,
+                Some(std::io::ErrorKind::BrokenPipe),
+            )
+            .await;
+
+            let got = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(2))
+                .await
+                .expect("read to EOF");
+            assert_eq!(got, vec![0x20, 0x02, 0x00, 0x00]);
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(&join_res, Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::BrokenPipe),
+                "{join_res:?}"
+            );
+        });
+    }
+
+    /// AC-14, AC-15 — when the write of the queued PUBREC and the v5
+    /// DISCONNECT fails, the session still reports a violation and writes
+    /// nothing more: the client reads only the CONNACK before EOF.
+    #[test]
+    fn failed_violation_close_write_still_reports_the_violation() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (tx, _rx) = event_channel(0, std::sync::Arc::default());
+            let id1 = NonZeroU16::new(1).expect("non-zero");
+            let mut prefix = encode_v5_connect(30, "test");
+            prefix.extend_from_slice(&encode_v5_qos2_publish("t", id1, &FIXTURE_PAYLOAD));
+            prefix.extend_from_slice(&encode_v5_connect(30, "test"));
+            let (mut client, handle) = spawn_handler_scripted_io(
+                tx,
+                30,
+                LONG_INGEST_DEADLINE,
+                prefix,
+                Duration::ZERO,
+                Some(std::io::ErrorKind::BrokenPipe),
+            )
+            .await;
+
+            let mut reader = V5Reader::new();
+            let connack = monoio::time::timeout(Duration::from_secs(2), reader.next(&mut client))
+                .await
+                .expect("v5 CONNACK read timeout")
+                .expect("v5 CONNACK decoded");
+            assert!(
+                matches!(connack, MqttPacket::V5(PacketV5::ConnectAck(_))),
+                "{connack:?}"
+            );
+            let rest = monoio::time::timeout(Duration::from_secs(2), reader.raw(&mut client, 1))
+                .await
+                .expect("EOF read timeout");
+            assert!(rest.is_empty(), "bytes after the failed write: {rest:?}");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Ok(SessionOutcome::Violation)),
+                "{join_res:?}"
+            );
+        });
+    }
+
+    /// v5 SUBSCRIBE, packet id 1, asking for `FILTERS_PAST_THE_WRITE_BOUNDARY`
+    /// copies of filter "a" with default options.
+    fn encode_v5_subscribe_past_the_write_boundary() -> Vec<u8> {
+        let mut enc = MqttEncoder::v5();
+        let pkt = MqttPacket::V5(PacketV5::Subscribe(rmqtt_codec::v5::Subscribe {
+            packet_id: NonZeroU16::new(1).expect("non-zero"),
+            id: None,
+            user_properties: Vec::new(),
+            topic_filters: vec![
+                ("a".into(), rmqtt_codec::v5::SubscriptionOptions::default());
+                FILTERS_PAST_THE_WRITE_BOUNDARY
+            ],
+        }));
+        let mut buf = BytesMut::new();
+        enc.encode(pkt, &mut buf).expect("encode v5 SUBSCRIBE");
+        buf.to_vec()
+    }
+
+    /// AC-14, AC-15 — when the boundary flush before the v5 violation
+    /// DISCONNECT's encode fails, the close writes nothing more and still
+    /// reports the violation: the client
+    /// reads only the CONNACK before EOF, although later writes would reach
+    /// the socket.
+    #[test]
+    fn failed_boundary_flush_before_the_disconnect_writes_nothing_more() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (tx, _rx) = event_channel(0, std::sync::Arc::default());
+            let mut prefix = encode_v5_connect(30, "test");
+            prefix.extend_from_slice(&encode_v5_subscribe_past_the_write_boundary());
+            prefix.extend_from_slice(&encode_v5_connect(30, "test"));
+            let (mut client, handle) = spawn_handler_scripted_io(
+                tx,
+                30,
+                LONG_INGEST_DEADLINE,
+                prefix,
+                Duration::ZERO,
+                Some(std::io::ErrorKind::BrokenPipe),
+            )
+            .await;
+
+            let mut reader = V5Reader::new();
+            let connack = monoio::time::timeout(Duration::from_secs(2), reader.next(&mut client))
+                .await
+                .expect("v5 CONNACK read timeout")
+                .expect("v5 CONNACK decoded");
+            assert!(
+                matches!(connack, MqttPacket::V5(PacketV5::ConnectAck(_))),
+                "{connack:?}"
+            );
+            let rest = monoio::time::timeout(Duration::from_secs(2), reader.raw(&mut client, 1))
+                .await
+                .expect("EOF read timeout");
+            assert!(rest.is_empty(), "bytes after the failed write: {rest:?}");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Ok(SessionOutcome::Violation)),
+                "{join_res:?}"
+            );
+        });
+    }
+
+    /// AC-8, AC-9, AC-17 — after the boundary flush writes the queued SUBACK,
+    /// the queue's budget is that of the replies queued after it. The first
+    /// PINGRESP's budget ends 1.5 s after the CONNECT; the second PINGREQ
+    /// decodes after the SUBACK write refreshed the idle anchor, so its
+    /// PINGRESP's budget ends later. The flush of both PINGRESPs ends at the
+    /// first one's budget and names the PINGRESP, not the SUBACK.
+    #[test]
+    fn flush_after_a_boundary_write_ends_at_the_budget_of_the_replies_still_queued() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (tx, _rx) = event_channel(0, std::sync::Arc::default());
+            let mut prefix = V3_CONNECT_TEST_KA1.to_vec();
+            prefix.extend_from_slice(&encode_v3_subscribe_past_the_write_boundary());
+            prefix.extend_from_slice(&PINGREQ);
+            prefix.extend_from_slice(&PINGREQ);
+            let (client, handle) =
+                spawn_handler_scripted(tx, 30, LONG_INGEST_DEADLINE, prefix, BOUNDARY_BUDGET_WRITE)
+                    .await;
+            let peer = client.local_addr().expect("local_addr").to_string();
+
+            let start = std::time::Instant::now();
+            let join_res = monoio::time::timeout(Duration::from_secs(4), handle)
+                .await
+                .expect("join timeout");
+            let elapsed = start.elapsed();
+            assert!(matches!(join_res, Err(Error::Timeout)), "{join_res:?}");
+            assert!(
+                (Duration::from_millis(1300)..=Duration::from_millis(1700)).contains(&elapsed),
+                "elapsed {elapsed:?} outside 1.3s..=1.7s (1.5s idle budget)"
+            );
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert_eq!(count_lines_at(&logs, "DEBUG", "timeout"), 1, "{logs}");
+            assert!(
+                has_line_at(&logs, "DEBUG", &[TIMEOUT_CTX_PINGRESP_FLUSH, &peer]),
+                "{logs}"
+            );
+            drop(client);
+        });
+    }
+
+    /// AC-1, AC-2 — every reply kind the packet loop owes is queued, not
+    /// flushed one by one: a SUBSCRIBE, a PINGREQ, a QoS 2 PUBLISH, its
+    /// PUBREL and an UNSUBSCRIBE arriving in one read leave as SUBACK,
+    /// PINGRESP, PUBREC, PUBCOMP and UNSUBACK in one write, in decode order.
+    /// One write per reply would need five `BATCH_WRITE_DELAY` waits.
+    #[test]
+    fn every_reply_kind_owed_by_one_read_leaves_in_one_write() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (tx, _rx) = event_channel(0, std::sync::Arc::default());
+            let mut prefix = V3_CONNECT_TEST.to_vec();
+            prefix.extend_from_slice(&V3_SUBSCRIBE_T_ID37);
+            prefix.extend_from_slice(&PINGREQ);
+            prefix.extend_from_slice(&PUBLISH_QOS2_T);
+            prefix.extend_from_slice(&V3_PUBREL_ID1);
+            prefix.extend_from_slice(&V3_UNSUBSCRIBE_T_ID37);
+            let (mut client, handle) =
+                spawn_handler_scripted(tx, 30, LONG_INGEST_DEADLINE, prefix, BATCH_WRITE_DELAY)
+                    .await;
+
+            let connack = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                .await
+                .expect("read CONNACK");
+            assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+            let start = std::time::Instant::now();
+            let replies = tcp_read_n_bounded(&mut client, 19, Duration::from_secs(3))
+                .await
+                .expect("read the batch of replies");
+            let elapsed = start.elapsed();
+            assert_eq!(
+                replies,
+                vec![
+                    0x90, 0x03, 0x00, 0x25, 0x80, // SUBACK, packet id 37, Failure
+                    0xD0, 0x00, // PINGRESP
+                    0x50, 0x02, 0x00, 0x01, // PUBREC, packet id 1
+                    0x70, 0x02, 0x00, 0x01, // PUBCOMP, packet id 1
+                    0xB0, 0x02, 0x00, 0x25, // UNSUBACK, packet id 37
+                ]
+            );
+            assert!(
+                elapsed < BATCH_WRITE_DELAY * 2,
+                "five replies took {elapsed:?}: more than one delayed write"
+            );
+
+            tcp_write_all(&mut client, &DISCONNECT)
+                .await
+                .expect("disconnect write");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(matches!(join_res, Ok(SessionOutcome::Served)));
+        });
+    }
+
+    /// AC-1, AC-2 — the same rule holds on v5: two QoS 2 PUBLISHes and a
+    /// PINGREQ from one read are answered by two PUBRECs and a PINGRESP in
+    /// one write, in decode order.
+    #[test]
+    fn v5_replies_owed_by_one_read_leave_in_one_write() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (tx, _rx) = event_channel(0, std::sync::Arc::default());
+            let id1 = NonZeroU16::new(1).expect("non-zero");
+            let id2 = NonZeroU16::new(2).expect("non-zero");
+            let mut prefix = encode_v5_connect(30, "test");
+            prefix.extend_from_slice(&encode_v5_qos2_publish("t", id1, &FIXTURE_PAYLOAD));
+            prefix.extend_from_slice(&encode_v5_qos2_publish("t", id2, &FIXTURE_PAYLOAD));
+            prefix.extend_from_slice(&PINGREQ);
+            let (mut client, handle) =
+                spawn_handler_scripted(tx, 30, LONG_INGEST_DEADLINE, prefix, BATCH_WRITE_DELAY)
+                    .await;
+
+            let mut reader = V5Reader::new();
+            let connack = monoio::time::timeout(Duration::from_secs(2), reader.next(&mut client))
+                .await
+                .expect("v5 CONNACK read timeout")
+                .expect("v5 CONNACK decoded");
+            assert!(
+                matches!(connack, MqttPacket::V5(PacketV5::ConnectAck(_))),
+                "{connack:?}"
+            );
+            let start = std::time::Instant::now();
+            let mut replies = Vec::new();
+            for _ in 0..3 {
+                let packet = monoio::time::timeout(Duration::from_secs(3), reader.next(&mut client))
+                    .await
+                    .expect("v5 reply read timeout")
+                    .expect("v5 reply decoded");
+                replies.push(packet);
+            }
+            let elapsed = start.elapsed();
+            assert!(
+                matches!(&replies[0], MqttPacket::V5(PacketV5::PublishReceived(ack)) if ack.packet_id == id1),
+                "{:?}",
+                replies[0]
+            );
+            assert!(
+                matches!(&replies[1], MqttPacket::V5(PacketV5::PublishReceived(ack)) if ack.packet_id == id2),
+                "{:?}",
+                replies[1]
+            );
+            assert!(
+                matches!(&replies[2], MqttPacket::V5(PacketV5::PingResponse)),
+                "{:?}",
+                replies[2]
+            );
+            assert!(
+                elapsed < BATCH_WRITE_DELAY * 2,
+                "three v5 replies took {elapsed:?}: more than one delayed write"
+            );
+
+            tcp_write_all(&mut client, &DISCONNECT)
+                .await
+                .expect("disconnect write");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(matches!(join_res, Ok(SessionOutcome::Served)));
+        });
+    }
+
+    /// AC-15 — a flush stalled before its first write sends nothing: the
+    /// queued PUBACK of a PUBLISH read with the CONNECT never reaches the
+    /// peer, which sees the CONNACK and then EOF, and the session ends with
+    /// `Err(Error::Timeout)` at the ka=1 idle budget.
+    #[test]
+    fn timed_out_reply_flush_writes_nothing_to_the_peer() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (tx, _rx) = event_channel(0, std::sync::Arc::default());
+            let mut prefix = V3_CONNECT_TEST_KA1.to_vec();
+            prefix.extend_from_slice(&PUBLISH_QOS1_T);
+            let (mut client, handle) =
+                spawn_handler_scripted(tx, 30, LONG_INGEST_DEADLINE, prefix, RUNTIME_STALL).await;
+
+            let start = std::time::Instant::now();
+            let got = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(4))
+                .await
+                .expect("read to EOF");
+            assert_eq!(got, vec![0x20, 0x02, 0x00, 0x00]);
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            let elapsed = start.elapsed();
+            assert!(matches!(join_res, Err(Error::Timeout)), "{join_res:?}");
+            assert!(
+                (Duration::from_millis(1300)..=Duration::from_millis(2500)).contains(&elapsed),
+                "elapsed {elapsed:?} outside 1.3s..=2.5s (1.5s idle budget)"
             );
         });
     }

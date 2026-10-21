@@ -140,14 +140,20 @@ impl PacketIo for TokioPackets {
         self.framed.next()
     }
 
-    async fn send_and_flush(&mut self, packet: MqttPacket) -> io::Result<()> {
-        // `SinkExt::send` is feed + flush, so this is the one flush per reply
-        // the shipped `send_and_flush` performs (`handler.rs:531`).
-        SinkExt::send(&mut self.framed, packet).await
+    async fn send(&mut self, packet: MqttPacket) -> io::Result<()> {
+        SinkExt::feed(&mut self.framed, packet).await
     }
 
-    fn read_buffer_is_empty(&self) -> bool {
-        self.framed.read_buffer().is_empty()
+    async fn flush(&mut self) -> io::Result<()> {
+        SinkExt::flush(&mut self.framed).await
+    }
+
+    fn read_buffer(&self) -> &[u8] {
+        self.framed.read_buffer()
+    }
+
+    fn write_buffer(&self) -> &[u8] {
+        self.framed.write_buffer()
     }
 
     fn version(&self) -> ProtocolVersion {

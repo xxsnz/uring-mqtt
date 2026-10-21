@@ -188,6 +188,12 @@ impl EventSender {
         Admission::Dropped
     }
 
+    /// `true` when an offer made now would wait for a slot: the receiver
+    /// is still there and no slot is free.
+    pub(crate) fn would_hold(&self) -> bool {
+        !self.tx.is_closed() && self.state.room.available_permits() == 0
+    }
+
     /// Test-only thin wrapper over `admit_with` using the shipped monoio timer.
     #[cfg(test)]
     pub(crate) async fn admit(

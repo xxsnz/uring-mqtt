@@ -84,19 +84,33 @@ impl MaxInboundPacketSize {
     /// bound. `false` while the header is incomplete, and for a varint longer
     /// than 4 bytes (rmqtt-codec rejects that as `InvalidLength`).
     pub(crate) fn rejects_fixed_header(self, src: &[u8]) -> bool {
-        let mut remaining_length: u32 = 0;
-        #[allow(clippy::cast_possible_truncation)] // i < MAX_VARINT_BYTES by the `take`
-        for (i, &byte) in src.iter().skip(1).take(MAX_VARINT_BYTES).enumerate() {
-            remaining_length |=
-                u32::from(byte & VARINT_PAYLOAD_MASK) << (VARINT_PAYLOAD_BITS * i as u32);
-            if byte & VARINT_CONTINUATION_BIT == 0 {
-                #[allow(clippy::cast_possible_truncation)] // i < MAX_VARINT_BYTES by the `take`
-                let header_len = 2 + i as u64;
-                return header_len + u64::from(remaining_length) > u64::from(self.0);
-            }
-        }
-        false
+        packet_len(src).is_some_and(|len| len > u64::from(self.0))
     }
+}
+
+/// Total wire length of the packet `src` starts with, from a complete
+/// fixed header; `None` while the header is incomplete and for a varint
+/// longer than 4 bytes.
+fn packet_len(src: &[u8]) -> Option<u64> {
+    let mut remaining_length: u32 = 0;
+    #[allow(clippy::cast_possible_truncation)] // i < MAX_VARINT_BYTES by the `take`
+    for (i, &byte) in src.iter().skip(1).take(MAX_VARINT_BYTES).enumerate() {
+        remaining_length |=
+            u32::from(byte & VARINT_PAYLOAD_MASK) << (VARINT_PAYLOAD_BITS * i as u32);
+        if byte & VARINT_CONTINUATION_BIT == 0 {
+            #[allow(clippy::cast_possible_truncation)] // i < MAX_VARINT_BYTES by the `take`
+            let header_len = 2 + i as u64;
+            return Some(header_len + u64::from(remaining_length));
+        }
+    }
+    None
+}
+
+/// `true` when `src` starts with one whole packet, so decoding it needs
+/// no socket read. Valid only at a frame start: a decoder holding a
+/// partial body has already consumed that packet's fixed header.
+pub(crate) fn holds_complete_packet(src: &[u8]) -> bool {
+    packet_len(src).is_some_and(|len| src.len() as u64 >= len)
 }
 
 /// Wrapper around rmqtt-codec's MqttCodec for monoio-codec compatibility.

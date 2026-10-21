@@ -5,7 +5,7 @@ use std::future::Future;
 use std::io;
 use std::time::Duration;
 
-use monoio::io::sink::SinkExt;
+use monoio::io::sink::Sink;
 use monoio::io::stream::Stream;
 use monoio::io::{AsyncReadRent, AsyncWriteRent};
 use monoio_codec::Framed;
@@ -42,8 +42,13 @@ pub trait HandshakeIo {
 /// MQTT-codec-agnostic IO for the steady-state packet loop.
 pub trait PacketIo {
     fn next_packet(&mut self) -> impl Future<Output = Option<io::Result<(MqttPacket, u32)>>>;
-    fn send_and_flush(&mut self, packet: MqttPacket) -> impl Future<Output = io::Result<()>>;
-    fn read_buffer_is_empty(&self) -> bool;
+    /// Encode `packet` into the write buffer. Writes to the socket only when
+    /// the buffer already holds the codec's backpressure boundary.
+    fn send(&mut self, packet: MqttPacket) -> impl Future<Output = io::Result<()>>;
+    fn flush(&mut self) -> impl Future<Output = io::Result<()>>;
+    fn read_buffer(&self) -> &[u8];
+    /// Bytes encoded by `send` and not yet written to the socket.
+    fn write_buffer(&self) -> &[u8];
     fn version(&self) -> ProtocolVersion;
 }
 
@@ -97,12 +102,20 @@ impl<IO: AsyncReadRent + AsyncWriteRent> PacketIo for MonoioPackets<IO> {
         self.0.next()
     }
 
-    fn send_and_flush(&mut self, packet: MqttPacket) -> impl Future<Output = io::Result<()>> {
-        SinkExt::send_and_flush(&mut self.0, packet)
+    fn send(&mut self, packet: MqttPacket) -> impl Future<Output = io::Result<()>> {
+        Sink::send(&mut self.0, packet)
     }
 
-    fn read_buffer_is_empty(&self) -> bool {
-        self.0.read_buffer().is_empty()
+    fn flush(&mut self) -> impl Future<Output = io::Result<()>> {
+        Sink::<MqttPacket>::flush(&mut self.0)
+    }
+
+    fn read_buffer(&self) -> &[u8] {
+        self.0.read_buffer()
+    }
+
+    fn write_buffer(&self) -> &[u8] {
+        self.0.write_buffer()
     }
 
     fn version(&self) -> ProtocolVersion {

@@ -12,9 +12,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
-use bench::twin::{self, TokioTimer};
-use uring_mqtt::runtime_seam::{TimedOut, Timer};
-use uring_mqtt::{BrokerConfig, Publish, PublishCallback};
+use std::num::NonZeroU16;
+
+use bench::twin::{self, TokioHandshake, TokioTimer};
+use rmqtt_codec::v3::Packet as PacketV3;
+use uring_mqtt::runtime_seam::{
+    HandshakeIo, MqttPacket, PacketIo, ProtocolVersion, TimedOut, Timer,
+};
+use uring_mqtt::{BrokerConfig, MaxInboundPacketSize, Publish, PublishCallback};
 
 /// Outer watchdog for every harness thread below — a safety net against a
 /// hang, not the acceptance bound itself (each test asserts its own,
@@ -42,6 +47,8 @@ const PINGRESP: [u8; 2] = [0xD0, 0x00];
 const DISCONNECT: [u8; 2] = [0xE0, 0x00];
 /// v3 PUBACK for packet id 7.
 const PUBACK_7: [u8; 4] = [0x40, 0x02, 0x00, 0x07];
+/// v3 PUBACK for packet id 8.
+const PUBACK_8: [u8; 4] = [0x40, 0x02, 0x00, 0x08];
 /// v3 QoS 1 PUBLISH, topic "t", packet id 7, payload `[1, 2, 3, 4]`.
 const V3_PUBLISH_QOS1_ID7: [u8; 11] = [
     0x32, 0x09, 0x00, 0x01, b't', 0x00, 0x07, 1, 2, 3, 4,
@@ -59,6 +66,18 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// AC-9/AC-10 callback-visibility bound.
 const CALLBACK_VISIBLE_BOUND: Duration = Duration::from_secs(2);
 const CALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// AC-10 bound on a PUBACK read that must succeed with no further client
+/// input: far above loopback latency, far below `IO_TIMEOUT`.
+const PARTIAL_ACK_READ_BOUND: Duration = Duration::from_secs(2);
+/// Adapter-test window in which a reply the adapter wrote at once would
+/// reach a loopback peer; a queued one must not arrive inside it.
+const UNFLUSHED_READ_WINDOW: Duration = Duration::from_millis(200);
+/// PUBACKs that fill the codecs' 8 KiB write backpressure boundary.
+const PUBACKS_AT_THE_WRITE_BOUNDARY: usize = 8 * 1024 / PUBACK_7.len();
+/// AC-16/AC-18 bound on a whole adapter scenario (bind, connect, accept,
+/// send, flush, reads): above every bound inside it, so a stalled setup
+/// fails the test instead of hanging it.
+const ADAPTER_SCENARIO_BOUND: Duration = Duration::from_secs(30);
 
 /// AC-11 handshake-timeout bounds.
 const HANDSHAKE_TIMEOUT_SECS: u64 = 1;
@@ -814,4 +833,170 @@ fn tokio_timer_times_out_a_pending_future() {
         TokioTimer::timeout(TIMER_TEST_DEADLINE, async { 5 }).await
     });
     assert_eq!(completed, Ok(5));
+}
+
+/// AC-16 — the tokio adapter's `send` only queues: two PUBACKs sent below
+/// the write boundary do not reach the peer until `flush`, which then
+/// delivers both in send order.
+#[test]
+fn tokio_packets_send_queues_replies_until_flush() {
+    use tokio::io::AsyncReadExt as _;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+    let scenario = async {
+        let listener = tokio::net::TcpListener::bind(loopback_addr(0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let mut client = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect");
+        let (server, _) = listener.accept().await.expect("accept");
+        let mut packets = TokioHandshake::new(server, MaxInboundPacketSize::DEFAULT)
+            .into_packets(ProtocolVersion::MQTT3, MaxInboundPacketSize::DEFAULT);
+
+        for packet_id in [7, 8] {
+            let packet_id = NonZeroU16::new(packet_id).expect("non-zero");
+            PacketIo::send(
+                &mut packets,
+                MqttPacket::V3(PacketV3::PublishAck { packet_id }),
+            )
+            .await
+            .expect("send");
+        }
+        let mut acks = [0u8; 8];
+        let early = tokio::time::timeout(UNFLUSHED_READ_WINDOW, client.read(&mut acks)).await;
+        assert!(early.is_err(), "bytes reached the peer before flush: {early:?}");
+
+        PacketIo::flush(&mut packets).await.expect("flush");
+        tokio::time::timeout(IO_TIMEOUT, client.read_exact(&mut acks))
+            .await
+            .expect("read timeout")
+            .expect("read PUBACKs");
+        assert_eq!(acks[..4], PUBACK_7);
+        assert_eq!(acks[4..], PUBACK_8);
+    };
+    runtime.block_on(async {
+        tokio::time::timeout(ADAPTER_SCENARIO_BOUND, scenario)
+            .await
+            .expect("adapter scenario timeout");
+    });
+}
+
+/// AC-16, AC-18 — `send` holds replies up to the 8 KiB write boundary:
+/// with 2 048 PUBACKs encoded, `write_buffer` holds all 8 192 bytes and the
+/// peer reads nothing; `flush` then delivers them and empties the buffer.
+#[test]
+fn tokio_packets_send_holds_replies_up_to_the_write_boundary() {
+    use tokio::io::AsyncReadExt as _;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+    let scenario = async {
+        let listener = tokio::net::TcpListener::bind(loopback_addr(0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let mut client = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect");
+        let (server, _) = listener.accept().await.expect("accept");
+        let mut packets = TokioHandshake::new(server, MaxInboundPacketSize::DEFAULT)
+            .into_packets(ProtocolVersion::MQTT3, MaxInboundPacketSize::DEFAULT);
+        let packet_id = NonZeroU16::new(7).expect("non-zero");
+
+        for _ in 0..PUBACKS_AT_THE_WRITE_BOUNDARY {
+            PacketIo::send(
+                &mut packets,
+                MqttPacket::V3(PacketV3::PublishAck { packet_id }),
+            )
+            .await
+            .expect("send");
+        }
+        let mut queued = vec![0u8; PUBACKS_AT_THE_WRITE_BOUNDARY * PUBACK_7.len()];
+        assert_eq!(packets.write_buffer().len(), queued.len());
+        let early = tokio::time::timeout(UNFLUSHED_READ_WINDOW, client.read(&mut queued)).await;
+        assert!(early.is_err(), "bytes reached the peer before flush: {early:?}");
+
+        PacketIo::flush(&mut packets).await.expect("flush");
+        assert!(packets.write_buffer().is_empty(), "flush left bytes queued");
+        tokio::time::timeout(IO_TIMEOUT, client.read_exact(&mut queued))
+            .await
+            .expect("read timeout")
+            .expect("read the PUBACKs");
+        assert!(
+            queued.chunks(PUBACK_7.len()).all(|ack| ack == PUBACK_7),
+            "flushed bytes are not PUBACKs"
+        );
+    };
+    runtime.block_on(async {
+        tokio::time::timeout(ADAPTER_SCENARIO_BOUND, scenario)
+            .await
+            .expect("adapter scenario timeout");
+    });
+}
+
+/// AC-10 — a PUBACK owed before a partial packet reaches the client with
+/// no further input: the PUBLISH and all but the last byte of a second
+/// one go out in one write, and the first PUBACK must arrive before the
+/// client sends that last byte.
+#[test]
+fn twin_acks_a_publish_while_the_next_packet_is_still_partial() {
+    let _exclusive = twin_exclusive();
+    let (tx, rx) = mpsc::channel::<Result<(), String>>();
+    std::thread::Builder::new()
+        .name("twin-partial-ack".into())
+        .spawn(move || {
+            let outcome = (|| -> Result<(), String> {
+                let port = bench::free_port();
+                let config = BrokerConfig::new(format!("127.0.0.1:{port}")).num_workers(1);
+                let (callback, _sink) = collecting_callback();
+                let handle = twin::start(config, callback)?;
+
+                let mut client =
+                    connect_v3(loopback_addr(port)).map_err(|e| format!("connect: {e}"))?;
+                client
+                    .set_read_timeout(Some(PARTIAL_ACK_READ_BOUND))
+                    .map_err(|e| format!("set read timeout: {e}"))?;
+                let split = V3_PUBLISH_QOS1_ID7.len() - 1;
+                let mut first = V3_PUBLISH_QOS1_ID7.to_vec();
+                first.extend_from_slice(&V3_PUBLISH_QOS1_ID7[..split]);
+                client
+                    .write_all(&first)
+                    .map_err(|e| format!("write publish + partial: {e}"))?;
+
+                let mut puback = [0u8; 4];
+                client
+                    .read_exact(&mut puback)
+                    .map_err(|e| format!("read first puback: {e}"))?;
+                if puback != PUBACK_7 {
+                    return Err(format!("unexpected first PUBACK {puback:?}"));
+                }
+                client
+                    .write_all(&V3_PUBLISH_QOS1_ID7[split..])
+                    .map_err(|e| format!("write last byte: {e}"))?;
+                client
+                    .read_exact(&mut puback)
+                    .map_err(|e| format!("read second puback: {e}"))?;
+                if puback != PUBACK_7 {
+                    return Err(format!("unexpected second PUBACK {puback:?}"));
+                }
+
+                handle.shutdown_handle().shutdown();
+                handle.join().map_err(|e| format!("join: {e}"))?;
+                Ok(())
+            })();
+            let _ = tx.send(outcome);
+        })
+        .expect("spawn harness");
+
+    let Ok(result) = rx.recv_timeout(HARNESS_TIMEOUT) else {
+        panic!("harness did not report within {HARNESS_TIMEOUT:?}")
+    };
+    result.expect("twin must ack a publish while the next packet is still partial");
 }
