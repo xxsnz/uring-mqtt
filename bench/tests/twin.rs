@@ -697,6 +697,64 @@ fn twin_join_reports_a_non_routine_session_error() {
     result.expect("join must report a non-routine session error");
 }
 
+/// AC-29 — a session cut off mid-packet is the generator's own "stalled"
+/// evidence (`bench/src/gen.rs:921-934`), not a server-side failure
+/// (decision Q8), so `join` stays quiet about it exactly as it does for a
+/// routine disconnect.
+#[test]
+fn twin_join_stays_quiet_after_a_session_cut_off_mid_packet() {
+    let _exclusive = twin_exclusive();
+    let (tx, rx) = mpsc::channel::<Result<(), String>>();
+    std::thread::Builder::new()
+        .name("twin-truncated-packet".into())
+        .spawn(move || {
+            let outcome = (|| -> Result<(), String> {
+                let port = bench::free_port();
+                let config = BrokerConfig::new(format!("127.0.0.1:{port}")).num_workers(1);
+                let (callback, _sink) = collecting_callback();
+                let handle = twin::start(config, callback)?;
+
+                let mut client =
+                    connect_raw(loopback_addr(port)).map_err(|e| format!("connect: {e}"))?;
+                client
+                    .write_all(&V3_CONNECT)
+                    .map_err(|e| format!("write CONNECT: {e}"))?;
+                let mut connack = [0u8; 4];
+                client
+                    .read_exact(&mut connack)
+                    .map_err(|e| format!("read CONNACK: {e}"))?;
+                client
+                    .write_all(&[0x30, 0x0A, 0x00, 0x01, b't'])
+                    .map_err(|e| format!("write a PUBLISH missing 7 body bytes: {e}"))?;
+                client
+                    .shutdown(std::net::Shutdown::Write)
+                    .map_err(|e| format!("shutdown write half: {e}"))?;
+                // Read to EOF so the stalled session has ended before
+                // shutdown; the twin writes nothing back.
+                let mut buf = [0u8; 1];
+                loop {
+                    match client.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(_) => continue,
+                        Err(e) => return Err(format!("read until EOF: {e}")),
+                    }
+                }
+
+                handle.shutdown_handle().shutdown();
+                handle.join().map_err(|e| format!("join: {e}"))?;
+                Ok(())
+            })();
+            let _ = tx.send(outcome);
+        })
+        .expect("spawn harness");
+
+    let bound = SESSION_ERROR_JOIN_BOUND + HARNESS_TIMEOUT;
+    let Ok(result) = rx.recv_timeout(bound) else {
+        panic!("harness did not report within {bound:?}")
+    };
+    result.expect("join must stay quiet after a session cut off mid-packet");
+}
+
 /// Review pass 4 — a refused connect is server-side evidence too: the
 /// shipped worker counts it (`note_refused`, `src/broker/worker.rs:579`) and
 /// decisions Q15 and R2-Q2 make it invalidate the run, so `join` reports it.
@@ -933,6 +991,99 @@ fn tokio_packets_send_holds_replies_up_to_the_write_boundary() {
             queued.chunks(PUBACK_7.len()).all(|ack| ack == PUBACK_7),
             "flushed bytes are not PUBACKs"
         );
+    };
+    runtime.block_on(async {
+        tokio::time::timeout(ADAPTER_SCENARIO_BOUND, scenario)
+            .await
+            .expect("adapter scenario timeout");
+    });
+}
+
+/// AC-25 — `PacketCodec::decode_eof` mirrors `MqttDecoder`'s truncation
+/// report: a header announcing 10 remaining bytes with none supplied before
+/// EOF yields `UnexpectedEof` from `next_packet`, not a silent `None`.
+#[test]
+fn tokio_packets_report_eof_after_a_header_only_packet_as_an_error() {
+    use tokio::io::AsyncWriteExt as _;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+    let scenario = async {
+        let listener = tokio::net::TcpListener::bind(loopback_addr(0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let (server, _) = listener.accept().await.expect("accept");
+        let mut packets = TokioHandshake::new(server, MaxInboundPacketSize::DEFAULT)
+            .into_packets(ProtocolVersion::MQTT3, MaxInboundPacketSize::DEFAULT);
+
+        client
+            .write_all(&[0x30, 0x0A])
+            .await
+            .expect("write header-only packet");
+        client.shutdown().await.expect("shutdown client write");
+
+        let result = tokio::time::timeout(IO_TIMEOUT, PacketIo::next_packet(&mut packets))
+            .await
+            .expect("next_packet timeout");
+        match result {
+            Some(Err(e)) => assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::UnexpectedEof,
+                "expected UnexpectedEof, got {e:?}"
+            ),
+            other => panic!("expected Some(Err(UnexpectedEof)), got {other:?}"),
+        }
+    };
+    runtime.block_on(async {
+        tokio::time::timeout(ADAPTER_SCENARIO_BOUND, scenario)
+            .await
+            .expect("adapter scenario timeout");
+    });
+}
+
+/// AC-25 — the twin's other truncation shape: body bytes of an unfinished
+/// packet buffered at EOF. tokio-util's default `decode_eof` reports that as
+/// an untyped `Other` error, which the `TruncatedPacket` evidence policy in
+/// `join` cannot recognise, so the kind is pinned here as well.
+#[test]
+fn tokio_packets_report_eof_inside_a_packet_body_as_an_error() {
+    use tokio::io::AsyncWriteExt as _;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+    let scenario = async {
+        let listener = tokio::net::TcpListener::bind(loopback_addr(0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let (server, _) = listener.accept().await.expect("accept");
+        let mut packets = TokioHandshake::new(server, MaxInboundPacketSize::DEFAULT)
+            .into_packets(ProtocolVersion::MQTT3, MaxInboundPacketSize::DEFAULT);
+
+        client
+            .write_all(&[0x30, 0x0A, 0x00, 0x01, b't'])
+            .await
+            .expect("write a packet missing its last body bytes");
+        client.shutdown().await.expect("shutdown client write");
+
+        let result = tokio::time::timeout(IO_TIMEOUT, PacketIo::next_packet(&mut packets))
+            .await
+            .expect("next_packet timeout");
+        match result {
+            Some(Err(e)) => assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::UnexpectedEof,
+                "expected UnexpectedEof, got {e:?}"
+            ),
+            other => panic!("expected Some(Err(UnexpectedEof)), got {other:?}"),
+        }
     };
     runtime.block_on(async {
         tokio::time::timeout(ADAPTER_SCENARIO_BOUND, scenario)

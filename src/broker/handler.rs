@@ -123,7 +123,8 @@ pub async fn serve_session<H: HandshakeIo, T: Timer>(
     // Phase 1: Detect protocol version.
     let mut io = io;
 
-    let version = match T::timeout(remaining(), io.next_version()).await {
+    let detected = T::timeout(remaining(), io.next_version()).await;
+    let version = match detected {
         Ok(Some(Ok(v))) => v,
         Ok(Some(Err(e))) => {
             if let Some(DecodeError::MaxSizeExceeded) =
@@ -134,6 +135,26 @@ pub async fn serve_session<H: HandshakeIo, T: Timer>(
                     max_inbound_packet_size.get()
                 );
                 return Err(Error::Io(e));
+            }
+            if let Some(DecodeError::UnsupportedProtocolLevel) =
+                e.get_ref().and_then(|s| s.downcast_ref::<DecodeError>())
+            {
+                tracing::warn!("CONNECT refused: unsupported protocol level from {peer_addr}");
+                // No version was negotiated, so the refusal is the MQTT 3.1.1 CONNACK
+                // (MQTT 3.1.1 §3.1.2.2), never a v5 capability set.
+                let mut packets = io.into_packets(ProtocolVersion::MQTT3, max_inbound_packet_size);
+                bounded_send::<_, T>(
+                    &mut packets,
+                    MqttPacket::V3(PacketV3::ConnectAck(ConnectAck {
+                        return_code: ConnectAckReason::UnacceptableProtocolVersion,
+                        session_present: false,
+                    })),
+                    remaining(),
+                    peer_addr,
+                    TIMEOUT_CTX_CONNACK_FLUSH,
+                )
+                .await?;
+                return Ok(SessionOutcome::Refused);
             }
             if e.get_ref()
                 .and_then(|s| s.downcast_ref::<DecodeError>())
@@ -486,7 +507,12 @@ async fn run_packet_loop<P: PacketIo, T: Timer>(
                     )
                     .await);
                 }
-                tracing::debug!("Packet error: {:?}", e);
+                let err = Error::Io(e);
+                if err.is_truncated_packet() {
+                    tracing::warn!("client closed the connection mid-packet ({peer_addr})");
+                    break Err(err);
+                }
+                tracing::debug!("Packet error: {:?}", err);
                 break Ok(SessionOutcome::Served);
             }
             Ok(None) => {
@@ -534,6 +560,20 @@ async fn deliver_publish<T: Timer>(
     }
 }
 
+/// Log the write failure a best-effort violation close discarded: routine
+/// hangups at debug, other failures at warn. A timeout already logged its
+/// one debug line where it expired, so it is not logged again.
+fn log_violation_close_write_error(peer_addr: std::net::SocketAddr, err: &Error) {
+    if matches!(err, Error::Timeout) {
+        return;
+    }
+    if err.is_routine_disconnect() {
+        tracing::debug!("violation close write failed ({peer_addr}): {err}");
+    } else {
+        tracing::warn!("violation close write failed ({peer_addr}): {err}");
+    }
+}
+
 /// Emit the one warn line, send the v5 DISCONNECT best-effort, and report
 /// `Violation`. The DISCONNECT flush is best-effort by design: a write
 /// failure to a dead peer must not convert a countable violation into an
@@ -541,7 +581,8 @@ async fn deliver_publish<T: Timer>(
 /// a DISCONNECT that does not fit under it is omitted rather than written, so
 /// the close never breaks the limit it may itself be enforcing. Replies queued
 /// before the violation are written ahead of the DISCONNECT in the same
-/// best-effort flush.
+/// best-effort flush. A write failure other than a timeout is logged once with
+/// the peer.
 async fn close_with_violation<P: PacketIo, T: Timer>(
     packets: &mut P,
     unflushed: &mut Option<UnflushedReplies>,
@@ -551,8 +592,8 @@ async fn close_with_violation<P: PacketIo, T: Timer>(
     max_packet_size: Option<NonZeroU32>,
 ) -> SessionOutcome {
     tracing::warn!("{} ({peer_addr}) — closing", violation.reason());
-    if let Some(pkt) = violation.disconnect(packets.version(), max_packet_size) {
-        drop(
+    let queued = match violation.disconnect(packets.version(), max_packet_size) {
+        Some(pkt) => {
             queue_reply::<_, T>(
                 packets,
                 unflushed,
@@ -561,10 +602,14 @@ async fn close_with_violation<P: PacketIo, T: Timer>(
                 peer_addr,
                 TIMEOUT_CTX_DISCONNECT_FLUSH,
             )
-            .await,
-        );
+            .await
+        }
+        None => Ok(()),
+    };
+    let flushed = flush_replies::<_, T>(packets, unflushed, peer_addr).await;
+    if let Err(err) = queued.and(flushed) {
+        log_violation_close_write_error(peer_addr, &err);
     }
-    drop(flush_replies::<_, T>(packets, unflushed, peer_addr).await);
     SessionOutcome::Violation
 }
 
@@ -703,6 +748,43 @@ pub(crate) mod tests {
         0x10, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'X', 0x04, 0x02, 0x00, 0x3C, 0x00, 0x04, b't',
         b'e', b's', b't',
     ];
+    /// v3 CONNECT shape with protocol level 6 (unsupported) → `VersionCodec`
+    /// rejects with `DecodeError::InvalidProtocol`, but the name is known.
+    /// Byte index 8 is the only difference from `V3_CONNECT_TEST`.
+    const V3_CONNECT_LEVEL_6: [u8; 18] = [
+        0x10, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x06, 0x02, 0x00, 0x3C, 0x00, 0x04, b't',
+        b'e', b's', b't',
+    ];
+    /// v3 CONNECT shape with protocol name "MQIsdp" (MQTT 3.1) and level 2
+    /// (unsupported).
+    const V3_CONNECT_MQISDP_LEVEL_2: [u8; 20] = [
+        0x10, 0x12, 0x00, 0x06, b'M', b'Q', b'I', b's', b'd', b'p', 0x02, 0x02, 0x00, 0x3C, 0x00,
+        0x04, b't', b'e', b's', b't',
+    ];
+    /// v3 CONNECT with protocol name "MQIsdp" (MQTT 3.1) and level 3, which
+    /// `VersionCodec` accepts: the refusal probe must leave it alone. Byte
+    /// index 10 is the only difference from `V3_CONNECT_MQISDP_LEVEL_2`.
+    const V3_CONNECT_MQISDP_LEVEL_3: [u8; 20] = [
+        0x10, 0x12, 0x00, 0x06, b'M', b'Q', b'I', b's', b'd', b'p', 0x03, 0x02, 0x00, 0x3C, 0x00,
+        0x04, b't', b'e', b's', b't',
+    ];
+    /// v3 CONNECT shape with protocol name "MQTX" (unknown) and level 6
+    /// (unsupported) — the bad name must still win. Byte index 8 is the only
+    /// difference from `V3_CONNECT_BAD_PROTOCOL_NAME`.
+    const V3_CONNECT_BAD_NAME_LEVEL_6: [u8; 18] = [
+        0x10, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'X', 0x06, 0x02, 0x00, 0x3C, 0x00, 0x04, b't',
+        b'e', b's', b't',
+    ];
+    /// Declares an empty CONNECT body (remaining length 0); the protocol name
+    /// and level that follow lie past the declared frame.
+    const V3_CONNECT_LEVEL_PAST_FRAME: [u8; 9] =
+        [0x10, 0x00, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x06];
+    /// Declares a 6-byte CONNECT body, so the declared frame ends exactly at
+    /// the level byte: the level lies one byte outside the frame, not inside
+    /// it. Pins the probe's `<` boundary, which `V3_CONNECT_LEVEL_PAST_FRAME`
+    /// (frame ending four bytes earlier) cannot tell from `<=`.
+    const V3_CONNECT_LEVEL_AT_FRAME_END: [u8; 9] =
+        [0x10, 0x06, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x06];
     /// v3 CONNECT: empty id, clean_session=false → decoder emits `InvalidClientId`.
     const V3_CONNECT_EMPTY_NO_CLEAN: [u8; 14] = [
         0x10, 0x0C, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x00, 0x00, 0x3C, 0x00, 0x00,
@@ -726,9 +808,18 @@ pub(crate) mod tests {
     const PUBLISH_QOS1_T_BAD_PAYLOAD: [u8; 10] =
         [0x32, 0x08, 0x00, 0x01, b't', 0x00, 0x01, 0xAA, 0xBB, 0xCC];
     const PINGREQ: [u8; 2] = [0xC0, 0x00];
+    /// PINGREQ declaring a one-byte body (MQTT 3.1.1 and 5.0 §3.12 forbid one).
+    const PINGREQ_WITH_BODY: [u8; 3] = [0xC0, 0x01, 0x00];
+    /// PINGREQ with Remaining Length 0 encoded non-minimally, in two bytes.
+    const PINGREQ_NON_MINIMAL: [u8; 3] = [0xC0, 0x80, 0x00];
     const DISCONNECT: [u8; 2] = [0xE0, 0x00];
     /// v3 SUBSCRIBE: packet id 37, single filter "t", QoS 0.
     const V3_SUBSCRIBE_T_ID37: [u8; 8] = [0x82, 0x06, 0x00, 0x25, 0x00, 0x01, b't', 0x00];
+    /// v3 SUBSCRIBE: packet id 37, filter "t" at QoS 0 followed by a
+    /// zero-length filter at QoS 0 (MQTT-4.7.3-1 forbids the second).
+    const V3_SUBSCRIBE_T_AND_EMPTY_ID37: [u8; 11] = [
+        0x82, 0x09, 0x00, 0x25, 0x00, 0x01, b't', 0x00, 0x00, 0x00, 0x00,
+    ];
     /// v3 UNSUBSCRIBE: packet id 37, single filter "t". The id is
     /// deliberately not 1: an arm that hardcoded `NonZeroU16::new(1).unwrap()`
     /// instead of propagating `*packet_id` would still satisfy an id-1 case.
@@ -3088,6 +3179,134 @@ pub(crate) mod tests {
         });
     }
 
+    /// AC-15 — a v5 UNSUBSCRIBE carrying a zero-length filter alongside a
+    /// valid one closes with the `0x82` Protocol Error DISCONNECT and no
+    /// UNSUBACK, the violation counterpart of `acks_v5_unsubscribe_with_unsuback`.
+    #[test]
+    fn v5_unsubscribe_with_a_zero_length_filter_disconnects_with_82_and_gets_no_unsuback() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            let peer = client.local_addr().expect("local_addr").to_string();
+
+            tcp_write_all(&mut client, &encode_v5_connect(30, "test"))
+                .await
+                .expect("v5 CONNECT write");
+
+            let mut reader = V5Reader::new();
+            let connack = monoio::time::timeout(Duration::from_secs(2), reader.next(&mut client))
+                .await
+                .expect("connack timeout");
+            match connack {
+                Some(MqttPacket::V5(PacketV5::ConnectAck(_))) => {}
+                other => panic!("expected v5 CONNACK, got {other:?}"),
+            }
+
+            // v5 UNSUBSCRIBE, packet id 37, a zero-length filter alongside a
+            // valid one.
+            let mut enc = MqttEncoder::v5();
+            let pkt = MqttPacket::V5(PacketV5::Unsubscribe(rmqtt_codec::v5::Unsubscribe {
+                packet_id: NonZeroU16::new(37).expect("non-zero"),
+                user_properties: Vec::new(),
+                topic_filters: vec!["a".into(), "".into()],
+            }));
+            let mut buf = BytesMut::new();
+            enc.encode(pkt, &mut buf).expect("encode v5 UNSUBSCRIBE");
+            tcp_write_all(&mut client, &buf)
+                .await
+                .expect("v5 UNSUBSCRIBE write");
+
+            let disconnect_bytes =
+                monoio::time::timeout(Duration::from_secs(2), reader.raw(&mut client, 4))
+                    .await
+                    .expect("v5 DISCONNECT read timeout");
+            assert_eq!(
+                disconnect_bytes,
+                vec![0xE0, 0x02, 0x82, 0x00],
+                "expected v5 DISCONNECT carrying ProtocolError (0x82), not an UNSUBACK"
+            );
+
+            let rest = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(2))
+                .await
+                .expect("EOF after the v5 DISCONNECT");
+            assert!(
+                rest.is_empty(),
+                "expected EOF after the DISCONNECT, got {rest:02X?}"
+            );
+
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            match join_res {
+                Ok(super::SessionOutcome::Violation) => {}
+                other => panic!("expected SessionOutcome::Violation, got {other:?}"),
+            }
+
+            let logs =
+                String::from_utf8(sink.lock().expect("log lock").clone()).expect("utf8 logs");
+            assert!(
+                has_line_at(
+                    &logs,
+                    "WARN",
+                    &["protocol violation: zero-length topic filter", &peer]
+                ),
+                "expected one WARN line with the zero-length-filter reason and peer {peer}; logs:\n{logs}"
+            );
+        });
+    }
+
+    /// AC-12, AC-14 — the v3 half of the zero-length-filter rule on the wire:
+    /// a SUBSCRIBE naming an empty filter closes with no SUBACK and no
+    /// DISCONNECT (MQTT 3.1.1 has no reason code), which the `dispatch` and
+    /// `Violation::disconnect` unit tests cannot observe.
+    #[test]
+    fn v3_subscribe_with_a_zero_length_filter_closes_without_a_suback() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            let peer = client.local_addr().expect("local_addr").to_string();
+            tcp_write_all(&mut client, &V3_CONNECT_TEST)
+                .await
+                .expect("CONNECT write");
+            let connack = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                .await
+                .expect("read CONNACK");
+            assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+
+            tcp_write_all(&mut client, &V3_SUBSCRIBE_T_AND_EMPTY_ID37)
+                .await
+                .expect("v3 SUBSCRIBE write");
+            let post = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(2))
+                .await
+                .expect("read to eof (bounded)");
+            assert!(
+                post.is_empty(),
+                "a v3 close on a zero-length filter must emit no SUBACK, got {post:02X?}"
+            );
+
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            match join_res {
+                Ok(super::SessionOutcome::Violation) => {}
+                other => panic!("expected SessionOutcome::Violation, got {other:?}"),
+            }
+
+            let logs =
+                String::from_utf8(sink.lock().expect("log lock").clone()).expect("utf8 logs");
+            assert!(
+                has_line_at(
+                    &logs,
+                    "WARN",
+                    &["protocol violation: zero-length topic filter", &peer]
+                ),
+                "expected one WARN line with the zero-length-filter reason and peer {peer}; logs:\n{logs}"
+            );
+        });
+    }
+
     /// AC-26 — a v5 device asking with a wildcard SUBSCRIBE still gets its
     /// SUBACK, and the session keeps reading afterwards. The CONNACK and the
     /// SUBACK are read through `V5Reader` because the SUBACK may coalesce with
@@ -4302,6 +4521,338 @@ pub(crate) mod tests {
         });
     }
 
+    /// AC-1, AC-2, AC-3: a known protocol name ("MQTT") with an unsupported
+    /// level (6) gets the MQTT 3.1.1 CONNACK refusal, not the generic
+    /// handshake-violation warn.
+    #[test]
+    fn unsupported_protocol_level_gets_connack_0x01_and_ends_refused() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            let peer = client.local_addr().expect("local_addr").to_string();
+            tcp_write_all(&mut client, &V3_CONNECT_LEVEL_6)
+                .await
+                .expect("write unsupported level");
+            let got = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(2))
+                .await
+                .expect("read to eof");
+            assert_eq!(got, vec![0x20, 0x02, 0x00, 0x01], "expected CONNACK 0x01, got {got:?}");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Ok(SessionOutcome::Refused)),
+                "expected Ok(SessionOutcome::Refused), got {join_res:?}"
+            );
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert_eq!(
+                count_lines_at(&logs, "WARN", "CONNECT refused: unsupported protocol level"),
+                1,
+                "expected exactly one unsupported-protocol-level warn, got: {logs}"
+            );
+            assert!(
+                has_line_at(
+                    &logs,
+                    "WARN",
+                    &["CONNECT refused: unsupported protocol level from", &peer],
+                ),
+                "missing WARN-level refusal log with complete peer address, got: {logs}"
+            );
+            assert_eq!(
+                count_lines_at(&logs, "WARN", "first packet was not CONNECT"),
+                0,
+                "an unsupported protocol level must not be labelled a handshake violation, got: {logs}"
+            );
+        });
+    }
+
+    /// AC-1, AC-2: the MQTT 3.1 protocol name ("MQIsdp") with an unsupported
+    /// level (2) also gets the MQTT 3.1.1 CONNACK refusal.
+    #[test]
+    fn unsupported_level_under_the_mqtt_3_1_name_gets_connack_0x01() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            tcp_write_all(&mut client, &V3_CONNECT_MQISDP_LEVEL_2)
+                .await
+                .expect("write unsupported level");
+            let got = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(2))
+                .await
+                .expect("read to eof");
+            assert_eq!(
+                got,
+                vec![0x20, 0x02, 0x00, 0x01],
+                "expected CONNACK 0x01, got {got:?}"
+            );
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Ok(SessionOutcome::Refused)),
+                "expected Ok(SessionOutcome::Refused), got {join_res:?}"
+            );
+        });
+    }
+
+    /// AC-1, AC-2 — every level outside {3, 4, 5} under a known name is
+    /// refused the same way, not only the level 6 of the fixture above: a
+    /// zero level, a level below the supported range and the highest byte.
+    #[test]
+    fn every_unsupported_protocol_level_under_a_known_name_gets_connack_0x01() {
+        for level in [0x00_u8, 0x02, 0xFF] {
+            let mut connect = V3_CONNECT_LEVEL_6;
+            connect[8] = level;
+            let mut rt = build_runtime();
+            rt.block_on(async {
+                let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+                tcp_write_all(&mut client, &connect)
+                    .await
+                    .expect("write unsupported level");
+                let got = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(2))
+                    .await
+                    .expect("read to eof");
+                assert_eq!(
+                    got,
+                    vec![0x20, 0x02, 0x00, 0x01],
+                    "expected CONNACK 0x01 for level {level:#04x}, got {got:?}"
+                );
+                let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                    .await
+                    .expect("join timeout");
+                assert!(
+                    matches!(join_res, Ok(SessionOutcome::Refused)),
+                    "expected Ok(SessionOutcome::Refused) for level {level:#04x}, got {join_res:?}"
+                );
+            });
+        }
+    }
+
+    /// AC-1 (failure mode: over-refusal) — the MQTT 3.1 name with the level
+    /// `VersionCodec` accepts (3) still completes its handshake, so the
+    /// refusal probe cannot be reading the name alone.
+    #[test]
+    fn mqisdp_connect_at_a_supported_level_still_completes_the_handshake() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            tcp_write_all(&mut client, &V3_CONNECT_MQISDP_LEVEL_3)
+                .await
+                .expect("MQIsdp CONNECT write");
+            let connack = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                .await
+                .expect("read CONNACK");
+            assert_eq!(
+                connack,
+                vec![0x20, 0x02, 0x00, 0x00],
+                "expected an accepting CONNACK for MQTT 3.1 level 3, got {connack:?}"
+            );
+            tcp_write_all(&mut client, &DISCONNECT)
+                .await
+                .expect("disconnect write");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Ok(SessionOutcome::Served)),
+                "expected Ok(SessionOutcome::Served), got {join_res:?}"
+            );
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert_eq!(
+                count_lines_at(&logs, "WARN", "CONNECT refused"),
+                0,
+                "a supported MQTT 3.1 level must not be refused, got: {logs}"
+            );
+        });
+    }
+
+    /// AC-27 (failure mode: off-by-one in the probe's frame guard) — a level
+    /// byte sitting exactly at the end of the declared Remaining Length is
+    /// outside the frame, so it gets no CONNACK.
+    #[test]
+    fn level_at_the_end_of_the_declared_connect_frame_gets_no_connack() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            tcp_write_all(&mut client, &V3_CONNECT_LEVEL_AT_FRAME_END)
+                .await
+                .expect("write level at frame end");
+            let got = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(2))
+                .await
+                .expect("read to eof");
+            assert!(got.is_empty(), "expected zero response bytes, got {got:?}");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Err(Error::Io(ref e)) if e.kind() == std::io::ErrorKind::InvalidData),
+                "expected Err(Error::Io(InvalidData)), got {join_res:?}"
+            );
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert_eq!(
+                count_lines_at(&logs, "WARN", "CONNECT refused"),
+                0,
+                "a level byte at the frame end must not be labelled a CONNECT refusal, got: {logs}"
+            );
+        });
+    }
+
+    /// AC-4, AC-5 (failure mode: a bad protocol name wins over an unsupported
+    /// level): "MQTX" with level 6 still gets the silent close, never a
+    /// CONNACK.
+    #[test]
+    fn bad_protocol_name_with_an_unsupported_level_still_gets_no_connack() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            let peer = client.local_addr().expect("local_addr").to_string();
+            tcp_write_all(&mut client, &V3_CONNECT_BAD_NAME_LEVEL_6)
+                .await
+                .expect("write bad name with unsupported level");
+            let got = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(2))
+                .await
+                .expect("read to eof");
+            assert!(got.is_empty(), "expected zero response bytes, got {got:?}");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Err(Error::Io(ref e)) if e.kind() == std::io::ErrorKind::InvalidData),
+                "expected Err(Error::Io(InvalidData)), got {join_res:?}"
+            );
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert!(
+                has_line_at(
+                    &logs,
+                    "WARN",
+                    &["handshake violation: first packet was not CONNECT", &peer],
+                ),
+                "missing WARN-level violation log with complete peer address, got: {logs}"
+            );
+            assert_eq!(
+                count_lines_at(&logs, "WARN", "CONNECT refused"),
+                0,
+                "a bad protocol name must not be labelled a CONNECT refusal, got: {logs}"
+            );
+        });
+    }
+
+    /// AC-28 (precedence, pass 2 finding 2): a non-minimal Remaining Length
+    /// combined with an unsupported protocol level never reaches the CONNACK
+    /// refusal path — the malformed-header check fires first.
+    #[test]
+    fn non_minimal_connect_with_an_unsupported_level_gets_no_connack() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            let mut buf = vec![0x10, 0x90, 0x00];
+            buf.extend_from_slice(&V3_CONNECT_LEVEL_6[2..]);
+            tcp_write_all(&mut client, &buf)
+                .await
+                .expect("write non-minimal CONNECT with unsupported level");
+            let got = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(2))
+                .await
+                .expect("read to eof");
+            assert!(got.is_empty(), "expected zero response bytes, got {got:?}");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Err(Error::Io(ref e)) if e.kind() == std::io::ErrorKind::InvalidData),
+                "expected Err(Error::Io(InvalidData)), got {join_res:?}"
+            );
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert_eq!(
+                count_lines_at(&logs, "WARN", "CONNECT refused"),
+                0,
+                "a non-minimal header must not be labelled a CONNECT refusal, got: {logs}"
+            );
+        });
+    }
+
+    /// AC-11 — a CONNECT whose Remaining Length is encoded non-minimally is
+    /// rejected as a malformed CONNECT, on both versions.
+    #[test]
+    fn connect_with_a_non_minimal_remaining_length_gets_no_connack_on_both_versions() {
+        for c in [V3_CONNECT_TEST.to_vec(), encode_v5_connect(30, "test")] {
+            assert!(c[1] < 0x80, "fixture Remaining Length must fit one byte");
+            let sink = capture_logs();
+            let mut rt = build_runtime();
+            rt.block_on(async {
+                let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+                let peer = client.local_addr().expect("local_addr").to_string();
+                let mut buf = vec![c[0], c[1] | 0x80, 0x00];
+                buf.extend_from_slice(&c[2..]);
+                tcp_write_all(&mut client, &buf)
+                    .await
+                    .expect("write non-minimal CONNECT");
+                let got = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(2))
+                    .await
+                    .expect("read to eof");
+                assert!(got.is_empty(), "expected zero response bytes, got {got:?}");
+                let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                    .await
+                    .expect("join timeout");
+                assert!(
+                    matches!(join_res, Err(Error::Io(_))),
+                    "expected Err(Error::Io(_)), got {join_res:?}"
+                );
+                let logs =
+                    String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+                assert!(
+                    has_line_at(
+                        &logs,
+                        "WARN",
+                        &["handshake violation: malformed CONNECT", &peer],
+                    ),
+                    "missing WARN-level violation log with complete peer address, got: {logs}"
+                );
+            });
+        }
+    }
+
+    /// AC-27 (failure mode: probe over-read, review pass 1 finding 1): a
+    /// protocol name and level that lie past the declared Remaining Length
+    /// must not be read by the unsupported-level probe.
+    #[test]
+    fn level_past_the_declared_connect_frame_gets_no_connack() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            tcp_write_all(&mut client, &V3_CONNECT_LEVEL_PAST_FRAME)
+                .await
+                .expect("write level past frame");
+            let got = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(2))
+                .await
+                .expect("read to eof");
+            assert!(got.is_empty(), "expected zero response bytes, got {got:?}");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Err(Error::Io(ref e)) if e.kind() == std::io::ErrorKind::InvalidData),
+                "expected Err(Error::Io(InvalidData)), got {join_res:?}"
+            );
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert_eq!(
+                count_lines_at(&logs, "WARN", "CONNECT refused"),
+                0,
+                "a probe over-read past the declared frame must not be labelled a CONNECT refusal, got: {logs}"
+            );
+        });
+    }
+
     #[test]
     fn closes_connection_on_duplicate_connect() {
         let mut rt = build_runtime();
@@ -4534,6 +5085,53 @@ pub(crate) mod tests {
             // The DISCONNECT is the last thing written: the socket reaches EOF
             // with no trailing bytes. A zero bound here would time out before
             // the close and assert nothing.
+            let rest = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(2))
+                .await
+                .expect("EOF after the v5 DISCONNECT");
+            assert!(
+                rest.is_empty(),
+                "expected EOF after the DISCONNECT, got {rest:02X?}"
+            );
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            match join_res {
+                Ok(super::SessionOutcome::Violation) => {}
+                other => panic!("expected SessionOutcome::Violation, got {other:?}"),
+            }
+        });
+    }
+
+    /// AC-9 — a non-minimal fixed header mid-session is rejected the same way
+    /// as any other malformed packet: a `MalformedPacket` (0x81) DISCONNECT.
+    #[test]
+    fn v5_non_minimal_packet_mid_session_disconnects_with_81() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            tcp_write_all(&mut client, &encode_v5_connect(30, "test"))
+                .await
+                .expect("v5 CONNECT write");
+            let mut reader = V5Reader::new();
+            let connack = monoio::time::timeout(Duration::from_secs(2), reader.next(&mut client))
+                .await
+                .expect("v5 CONNACK read timeout")
+                .expect("v5 CONNACK decoded");
+            let MqttPacket::V5(PacketV5::ConnectAck(_)) = connack else {
+                panic!("expected v5 CONNACK, got {connack:?}")
+            };
+            tcp_write_all(&mut client, &PINGREQ_NON_MINIMAL)
+                .await
+                .expect("non-minimal PINGREQ write");
+            let disconnect_bytes =
+                monoio::time::timeout(Duration::from_secs(2), reader.raw(&mut client, 4))
+                    .await
+                    .expect("v5 DISCONNECT read timeout");
+            assert_eq!(
+                disconnect_bytes,
+                vec![0xE0, 0x02, 0x81, 0x00],
+                "expected v5 DISCONNECT carrying MalformedPacket (0x81)"
+            );
             let rest = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(2))
                 .await
                 .expect("EOF after the v5 DISCONNECT");
@@ -5541,6 +6139,106 @@ pub(crate) mod tests {
             assert!(
                 matches!(join_res, Err(Error::ClientClosed)),
                 "expected Err(Error::ClientClosed), got {join_res:?}"
+            );
+        });
+    }
+
+    /// AC-22, AC-23 — a stream that ends mid-packet after CONNECT warns with
+    /// the peer address and ends the session as `Err(Error::Io(UnexpectedEof))`,
+    /// not the quiet `Served` path.
+    #[test]
+    fn truncated_packet_after_connect_warns_with_the_peer_and_is_not_served() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            let peer = client.local_addr().expect("local_addr").to_string();
+            tcp_write_all(&mut client, &V3_CONNECT_TEST)
+                .await
+                .expect("CONNECT write");
+            let connack = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                .await
+                .expect("read CONNACK");
+            assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+            tcp_write_all(&mut client, &[0x30, 0x0A, 0x00, 0x01, b't'])
+                .await
+                .expect("write truncated PUBLISH");
+            drop(client);
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            match join_res {
+                Err(Error::Io(e)) => {
+                    assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof);
+                }
+                other => panic!("expected Err(Error::Io(UnexpectedEof)), got {other:?}"),
+            }
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert_eq!(
+                count_lines_at(&logs, "WARN", "client closed the connection mid-packet"),
+                1,
+                "expected exactly one WARN mid-packet line, got: {logs}"
+            );
+            assert!(
+                has_line_at(
+                    &logs,
+                    "WARN",
+                    &["client closed the connection mid-packet", &peer]
+                ),
+                "missing WARN-level mid-packet log with complete peer address, got: {logs}"
+            );
+        });
+    }
+
+    /// AC-22, AC-23 — the same mid-packet end on an MQTT 5 session: the
+    /// `CodecPair` delegation must reach `MqttDecoder::decode_eof` for the v5
+    /// inner codec too, not only for v3.
+    #[test]
+    fn v5_truncated_packet_after_connect_warns_with_the_peer_and_is_not_served() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            let peer = client.local_addr().expect("local_addr").to_string();
+            tcp_write_all(&mut client, &encode_v5_connect(30, "test"))
+                .await
+                .expect("v5 CONNECT write");
+            let mut reader = V5Reader::new();
+            let connack = monoio::time::timeout(Duration::from_secs(2), reader.next(&mut client))
+                .await
+                .expect("connack timeout");
+            match connack {
+                Some(MqttPacket::V5(PacketV5::ConnectAck(_))) => {}
+                other => panic!("expected v5 CONNACK, got {other:?}"),
+            }
+            tcp_write_all(&mut client, &[0x30, 0x0A, 0x00, 0x01, b't'])
+                .await
+                .expect("write truncated PUBLISH");
+            drop(client);
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            match join_res {
+                Err(Error::Io(e)) => {
+                    assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof);
+                }
+                other => panic!("expected Err(Error::Io(UnexpectedEof)), got {other:?}"),
+            }
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert_eq!(
+                count_lines_at(&logs, "WARN", "client closed the connection mid-packet"),
+                1,
+                "expected exactly one WARN mid-packet line, got: {logs}"
+            );
+            assert!(
+                has_line_at(
+                    &logs,
+                    "WARN",
+                    &["client closed the connection mid-packet", &peer]
+                ),
+                "missing WARN-level mid-packet log with complete peer address, got: {logs}"
             );
         });
     }
@@ -6629,6 +7327,42 @@ pub(crate) mod tests {
         });
     }
 
+    /// AC-10 — a mid-session PINGREQ declaring a body closes under the
+    /// violation policy with no PINGRESP.
+    #[test]
+    fn v3_pingreq_with_a_body_closes_as_violation_without_a_pingresp() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            tcp_write_all(&mut client, &V3_CONNECT_TEST)
+                .await
+                .expect("CONNECT write");
+            let connack = tcp_read_n_bounded(&mut client, 4, Duration::from_secs(2))
+                .await
+                .expect("read CONNACK");
+            assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+
+            tcp_write_all(&mut client, &PINGREQ_WITH_BODY)
+                .await
+                .expect("PINGREQ with body write");
+            let post = tcp_read_to_eof_bounded(&mut client, Duration::from_secs(2))
+                .await
+                .expect("read to eof (bounded)");
+            assert!(
+                post.is_empty(),
+                "a v3 close on a PINGREQ with a body must emit no PINGRESP, got {post:?}"
+            );
+
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            match join_res {
+                Ok(super::SessionOutcome::Violation) => {}
+                other => panic!("expected SessionOutcome::Violation, got {other:?}"),
+            }
+        });
+    }
+
     /// AC-12 — the over-bound mid-session close logs a WARN line naming the
     /// bound-violation reason and the complete peer address.
     #[test]
@@ -7214,6 +7948,197 @@ pub(crate) mod tests {
             assert!(
                 matches!(join_res, Ok(SessionOutcome::Violation)),
                 "{join_res:?}"
+            );
+        });
+    }
+
+    /// AC-16, AC-19 — a routine write failure (`BrokenPipe`) discarded by a
+    /// violation close logs exactly one debug line naming the peer and the
+    /// error, and no warn line.
+    #[test]
+    fn failed_violation_close_write_logs_a_routine_error_at_debug_with_the_peer() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (tx, _rx) = event_channel(0, std::sync::Arc::default());
+            let id1 = NonZeroU16::new(1).expect("non-zero");
+            let mut prefix = encode_v5_connect(30, "test");
+            prefix.extend_from_slice(&encode_v5_qos2_publish("t", id1, &FIXTURE_PAYLOAD));
+            prefix.extend_from_slice(&encode_v5_connect(30, "test"));
+            let (client, handle) = spawn_handler_scripted_io(
+                tx,
+                30,
+                LONG_INGEST_DEADLINE,
+                prefix,
+                Duration::ZERO,
+                Some(std::io::ErrorKind::BrokenPipe),
+            )
+            .await;
+            let peer = client.local_addr().expect("local_addr").to_string();
+
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Ok(SessionOutcome::Violation)),
+                "{join_res:?}"
+            );
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert_eq!(
+                count_lines_at(&logs, "DEBUG", "violation close write failed"),
+                1,
+                "expected exactly one DEBUG violation-close-write-failed line, got: {logs}"
+            );
+            assert!(
+                has_line_at(
+                    &logs,
+                    "DEBUG",
+                    &["violation close write failed", &peer, "broken pipe"]
+                ),
+                "missing DEBUG-level violation-close-write-failed log with peer and error, got: {logs}"
+            );
+            assert_eq!(
+                count_lines_at(&logs, "WARN", "violation close write failed"),
+                0,
+                "expected no WARN violation-close-write-failed line, got: {logs}"
+            );
+        });
+    }
+
+    /// AC-17, AC-19 — a non-routine write failure (`PermissionDenied`)
+    /// discarded by a violation close logs exactly one warn line naming the
+    /// peer and the error, and no debug line.
+    #[test]
+    fn failed_violation_close_write_logs_a_non_routine_error_at_warn_with_the_peer() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (tx, _rx) = event_channel(0, std::sync::Arc::default());
+            let id1 = NonZeroU16::new(1).expect("non-zero");
+            let mut prefix = encode_v5_connect(30, "test");
+            prefix.extend_from_slice(&encode_v5_qos2_publish("t", id1, &FIXTURE_PAYLOAD));
+            prefix.extend_from_slice(&encode_v5_connect(30, "test"));
+            let (client, handle) = spawn_handler_scripted_io(
+                tx,
+                30,
+                LONG_INGEST_DEADLINE,
+                prefix,
+                Duration::ZERO,
+                Some(std::io::ErrorKind::PermissionDenied),
+            )
+            .await;
+            let peer = client.local_addr().expect("local_addr").to_string();
+
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Ok(SessionOutcome::Violation)),
+                "{join_res:?}"
+            );
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert_eq!(
+                count_lines_at(&logs, "WARN", "violation close write failed"),
+                1,
+                "expected exactly one WARN violation-close-write-failed line, got: {logs}"
+            );
+            assert!(
+                has_line_at(
+                    &logs,
+                    "WARN",
+                    &["violation close write failed", &peer, "permission denied"]
+                ),
+                "missing WARN-level violation-close-write-failed log with peer and error, got: {logs}"
+            );
+            assert_eq!(
+                count_lines_at(&logs, "DEBUG", "violation close write failed"),
+                0,
+                "expected no DEBUG violation-close-write-failed line, got: {logs}"
+            );
+        });
+    }
+
+    /// AC-18 (regression guard) — a violation close whose DISCONNECT write
+    /// times out logs only the existing idle-timeout line: the discarded
+    /// write error is `Error::Timeout`, already logged once where it
+    /// expired, so it must not be logged again as a write failure.
+    #[test]
+    fn timed_out_violation_close_logs_only_its_timeout_line() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let mut prefix = encode_v5_connect(1, "dev5");
+            prefix.extend_from_slice(&[0xD0, 0x00]);
+            let (_client, _rx, handle) =
+                spawn_handler_test_io(5, 30, Duration::from_secs(10), 1, Some(prefix), None).await;
+
+            let join_res = monoio::time::timeout(Duration::from_secs(4), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Ok(SessionOutcome::Violation)),
+                "{join_res:?}"
+            );
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert_eq!(
+                count_lines_at(&logs, "DEBUG", "idle timeout during DISCONNECT flush"),
+                1,
+                "expected exactly one DEBUG DISCONNECT-flush timeout line, got: {logs}"
+            );
+            assert!(
+                !logs.contains("violation close write failed"),
+                "a timed-out write must not also log violation close write failed, got: {logs}"
+            );
+        });
+    }
+
+    /// AC-18 (regression guard) — a violation close whose DISCONNECT write
+    /// succeeds logs no violation-close-write-failure line.
+    #[test]
+    fn delivered_violation_close_logs_no_write_failure() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            tcp_write_all(&mut client, &encode_v5_connect(30, "test"))
+                .await
+                .expect("v5 CONNECT write");
+            let mut reader = V5Reader::new();
+            let connack = monoio::time::timeout(Duration::from_secs(2), reader.next(&mut client))
+                .await
+                .expect("v5 CONNACK read timeout")
+                .expect("v5 CONNACK decoded");
+            assert!(
+                matches!(connack, MqttPacket::V5(PacketV5::ConnectAck(_))),
+                "{connack:?}"
+            );
+            tcp_write_all(&mut client, &[0xD0, 0x00])
+                .await
+                .expect("PINGRESP write");
+            let disconnect_bytes =
+                monoio::time::timeout(Duration::from_secs(2), reader.raw(&mut client, 4))
+                    .await
+                    .expect("v5 DISCONNECT read timeout");
+            assert_eq!(
+                disconnect_bytes,
+                vec![0xE0, 0x02, 0x82, 0x00],
+                "expected v5 DISCONNECT carrying ProtocolError (0x82)"
+            );
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(
+                matches!(join_res, Ok(SessionOutcome::Violation)),
+                "{join_res:?}"
+            );
+            let logs =
+                String::from_utf8(sink.lock().expect("log buffer").clone()).expect("utf8 logs");
+            assert!(
+                !logs.contains("violation close write failed"),
+                "a delivered violation close must not log violation close write failed, got: {logs}"
             );
         });
     }

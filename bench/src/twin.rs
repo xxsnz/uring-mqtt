@@ -18,9 +18,9 @@ use tokio_util::codec::Framed;
 
 use monoio_codec::{Decoder as MonoioDecoder, Decoded as MonoioDecoded};
 use uring_mqtt::runtime_seam::{
-    event_channel, EventReceiver, HandshakeIo, is_routine_disconnect, MqttDecoder, MqttEncoder,
-    MqttPacket, PacketIo, ProtocolVersion, serve_session, SessionOutcome, TimedOut, Timer,
-    VersionDecoder, MAX_TIMEOUT_SECS,
+    event_channel, EventReceiver, HandshakeIo, is_routine_disconnect, is_truncated_packet,
+    MqttDecoder, MqttEncoder, MqttPacket, PacketIo, ProtocolVersion, serve_session, SessionOutcome,
+    TimedOut, Timer, VersionDecoder, MAX_TIMEOUT_SECS,
 };
 use uring_mqtt::{BrokerConfig, MaxInboundPacketSize, PublishCallback};
 
@@ -84,6 +84,14 @@ impl tokio_util::codec::Decoder for PacketCodec {
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         match <MqttDecoder as MonoioDecoder>::decode(&mut self.decoder, src) {
+            Ok(MonoioDecoded::Some(item)) => Ok(Some(item)),
+            Ok(MonoioDecoded::Insufficient | MonoioDecoded::InsufficientAtLeast(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn decode_eof(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        match <MqttDecoder as MonoioDecoder>::decode_eof(&mut self.decoder, src) {
             Ok(MonoioDecoded::Some(item)) => Ok(Some(item)),
             Ok(MonoioDecoded::Insufficient | MonoioDecoded::InsufficientAtLeast(_)) => Ok(None),
             Err(e) => Err(e),
@@ -460,6 +468,10 @@ async fn worker_main(
                             // protocol error invalidate the run. The twin has
                             // no logger, so `join` is where an operator can
                             // still tell rejected traffic from a quiet server.
+                            //
+                            // The generator ends a stalled connection mid-packet and counts it
+                            // `stalled` (`bench/src/gen.rs:921-934`); that is its own evidence,
+                            // not a server-side failure (decision Q8).
                             match outcome {
                                 Ok(SessionOutcome::Served) => None,
                                 Ok(SessionOutcome::Refused) => {
@@ -468,6 +480,7 @@ async fn worker_main(
                                 Ok(SessionOutcome::Violation) => {
                                     Some(format!("session {peer}: protocol violation"))
                                 }
+                                Err(e) if is_truncated_packet(&e) => None,
                                 Err(e) if is_routine_disconnect(&e) => None,
                                 Err(e) => Some(format!("session {peer}: {e}")),
                             }

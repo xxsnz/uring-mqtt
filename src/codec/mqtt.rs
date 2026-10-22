@@ -15,6 +15,12 @@ pub use rmqtt_codec::v3::{ConnectAck, ConnectAckReason, Packet as PacketV3};
 pub use rmqtt_codec::v5::Packet as PacketV5;
 pub use rmqtt_codec::MqttPacket;
 
+/// The stream ended inside a packet: a fixed header was consumed and its
+/// body never completed, or bytes of an unfinished packet were still buffered.
+#[derive(Debug, thiserror::Error)]
+#[error("connection closed mid-packet")]
+pub(crate) struct TruncatedPacket;
+
 /// The inbound packet-size bound: the largest MQTT packet, in total wire bytes
 /// (fixed header + variable header + payload), the server reads from a client.
 /// Enforced from the fixed header before any body-sized allocation, and
@@ -36,6 +42,8 @@ const VARINT_PAYLOAD_MASK: u8 = 0x7F;
 const VARINT_CONTINUATION_BIT: u8 = 0x80;
 /// Most bytes a Remaining Length varint may use.
 const MAX_VARINT_BYTES: usize = 4;
+/// First byte of a PINGREQ, which has no variable header and no payload in either version.
+const PINGREQ_FIRST_BYTE: u8 = 0xC0;
 
 /// Length in bytes of the varint that encodes `r` (1 to 4).
 fn varint_len(r: u32) -> u32 {
@@ -92,15 +100,22 @@ impl MaxInboundPacketSize {
 /// fixed header; `None` while the header is incomplete and for a varint
 /// longer than 4 bytes.
 fn packet_len(src: &[u8]) -> Option<u64> {
+    #[allow(clippy::cast_possible_truncation)] // header_len <= 1 + MAX_VARINT_BYTES
+    fixed_header(src)
+        .map(|(header_len, remaining_length)| header_len as u64 + u64::from(remaining_length))
+}
+
+/// Width in bytes of the fixed header `src` starts with (type byte plus
+/// Remaining Length varint) and the Remaining Length it declares; `None`
+/// while the header is incomplete and for a varint longer than 4 bytes.
+pub(crate) fn fixed_header(src: &[u8]) -> Option<(usize, u32)> {
     let mut remaining_length: u32 = 0;
     #[allow(clippy::cast_possible_truncation)] // i < MAX_VARINT_BYTES by the `take`
     for (i, &byte) in src.iter().skip(1).take(MAX_VARINT_BYTES).enumerate() {
         remaining_length |=
             u32::from(byte & VARINT_PAYLOAD_MASK) << (VARINT_PAYLOAD_BITS * i as u32);
         if byte & VARINT_CONTINUATION_BIT == 0 {
-            #[allow(clippy::cast_possible_truncation)] // i < MAX_VARINT_BYTES by the `take`
-            let header_len = 2 + i as u64;
-            return Some(header_len + u64::from(remaining_length));
+            return Some((2 + i, remaining_length));
         }
     }
     None
@@ -111,6 +126,21 @@ fn packet_len(src: &[u8]) -> Option<u64> {
 /// partial body has already consumed that packet's fixed header.
 pub(crate) fn holds_complete_packet(src: &[u8]) -> bool {
     packet_len(src).is_some_and(|len| src.len() as u64 >= len)
+}
+
+/// `true` when `src` starts with a complete fixed header no client may
+/// send: a PINGREQ declaring a body (MQTT 3.1.1 and 5.0 §3.12), or a
+/// Remaining Length not in its minimal encoding (MQTT 3.1.1 §2.2.3,
+/// MQTT 5.0 §1.5.5). Checked after the size bound, which measures a
+/// header at its real width.
+pub(crate) fn rejects_malformed_fixed_header(src: &[u8]) -> bool {
+    let Some((header_len, remaining_length)) = fixed_header(src) else {
+        return false;
+    };
+    let pingreq_with_body = src[0] == PINGREQ_FIRST_BYTE && remaining_length != 0;
+    let non_minimal =
+        u32::try_from(header_len - 1).is_ok_and(|width| width > varint_len(remaining_length));
+    pingreq_with_body || non_minimal
 }
 
 /// Wrapper around rmqtt-codec's MqttCodec for monoio-codec compatibility.
@@ -173,6 +203,12 @@ impl Decoder for MqttDecoder {
                 DecodeError::MaxSizeExceeded,
             ));
         }
+        if self.at_frame_start && rejects_malformed_fixed_header(src) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                DecodeError::MalformedPacket,
+            ));
+        }
         let before = src.len();
         match TokioDecoder::decode(&mut self.inner, src) {
             Ok(Some(packet)) => {
@@ -186,6 +222,20 @@ impl Decoder for MqttDecoder {
                 Ok(Decoded::Insufficient)
             }
             Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
+        }
+    }
+
+    /// A stream that ends inside a packet is reported as `TruncatedPacket`,
+    /// including a fixed header consumed with no body byte after it, which
+    /// leaves the buffer empty and which the default would treat as a clean end.
+    fn decode_eof(&mut self, src: &mut BytesMut) -> Result<Decoded<Self::Item>, Self::Error> {
+        match self.decode(src)? {
+            Decoded::Some(item) => Ok(Decoded::Some(item)),
+            _ if src.is_empty() && self.at_frame_start => Ok(Decoded::Insufficient),
+            _ => Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                TruncatedPacket,
+            )),
         }
     }
 }
@@ -333,6 +383,94 @@ mod tests {
             }
             _ => panic!("Expected CONNACK, got {decoded:?}"),
         }
+    }
+
+    #[test]
+    fn decoder_reports_eof_after_a_header_only_packet_as_truncated() {
+        for mut decoder in [MqttDecoder::v3(), MqttDecoder::v5()] {
+            let mut buf = BytesMut::from(&[0x30, 0x0A][..]);
+            let decoded = MonoioDecoder::decode(&mut decoder, &mut buf).unwrap();
+            assert!(
+                matches!(decoded, Decoded::Insufficient),
+                "expected Insufficient after a header-only packet, got {decoded:?}"
+            );
+            let err = MonoioDecoder::decode_eof(&mut decoder, &mut buf)
+                .expect_err("decode_eof must err at EOF after a header-only packet");
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+            assert_eq!(err.to_string(), "connection closed mid-packet");
+        }
+    }
+
+    #[test]
+    fn decoder_reports_eof_inside_a_partial_fixed_header_as_truncated() {
+        for mut decoder in [MqttDecoder::v3(), MqttDecoder::v5()] {
+            let mut buf = BytesMut::from(&[0x30][..]);
+            let err = MonoioDecoder::decode_eof(&mut decoder, &mut buf)
+                .expect_err("decode_eof must err at EOF inside a partial fixed header");
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        }
+    }
+
+    #[test]
+    fn decoder_ends_cleanly_at_eof_on_a_packet_boundary() {
+        let mut decoder = MqttDecoder::v3();
+
+        let mut buf = BytesMut::new();
+        let decoded = MonoioDecoder::decode_eof(&mut decoder, &mut buf)
+            .expect("decode_eof on an empty buffer must not err");
+        assert!(matches!(decoded, Decoded::Insufficient));
+
+        let mut buf = BytesMut::from(&[0xC0, 0x00][..]);
+        let decoded = MonoioDecoder::decode_eof(&mut decoder, &mut buf)
+            .expect("decode_eof on a complete PINGREQ must not err");
+        match decoded {
+            Decoded::Some((MqttPacket::V3(PacketV3::PingRequest), _)) => {}
+            _ => panic!("Expected PINGREQ, got {decoded:?}"),
+        }
+
+        let decoded = MonoioDecoder::decode_eof(&mut decoder, &mut buf)
+            .expect("decode_eof after a packet boundary must not err");
+        assert!(matches!(decoded, Decoded::Insufficient));
+    }
+
+    /// AC-20 — the stream ends with body bytes of an unfinished packet still
+    /// buffered: the third truncation state, next to the header-only case and
+    /// the partial fixed header above.
+    #[test]
+    fn decoder_reports_eof_with_a_partial_body_buffered_as_truncated() {
+        for mut decoder in [MqttDecoder::v3(), MqttDecoder::v5()] {
+            let mut buf = BytesMut::from(&[0x30, 0x0A, 0x00, 0x01, b't'][..]);
+            let decoded = MonoioDecoder::decode(&mut decoder, &mut buf).unwrap();
+            assert!(
+                matches!(decoded, Decoded::Insufficient),
+                "expected Insufficient while the body is incomplete, got {decoded:?}"
+            );
+            let err = MonoioDecoder::decode_eof(&mut decoder, &mut buf)
+                .expect_err("decode_eof must err at EOF inside a packet body");
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+            assert_eq!(err.to_string(), "connection closed mid-packet");
+        }
+    }
+
+    /// AC-21 — at EOF on a packet boundary every whole buffered packet is
+    /// returned before the clean end, not just the first one.
+    #[test]
+    fn decoder_drains_every_whole_buffered_packet_before_ending_cleanly() {
+        let mut decoder = MqttDecoder::v3();
+        let mut buf = BytesMut::from(&[0xC0, 0x00, 0xC0, 0x00][..]);
+
+        for nth in 1..=2 {
+            let decoded = MonoioDecoder::decode_eof(&mut decoder, &mut buf)
+                .expect("decode_eof on a whole buffered PINGREQ must not err");
+            match decoded {
+                Decoded::Some((MqttPacket::V3(PacketV3::PingRequest), _)) => {}
+                other => panic!("expected PINGREQ {nth} of 2, got {other:?}"),
+            }
+        }
+
+        let decoded = MonoioDecoder::decode_eof(&mut decoder, &mut buf)
+            .expect("decode_eof after the last packet must not err");
+        assert!(matches!(decoded, Decoded::Insufficient));
     }
 
     #[test]
@@ -614,12 +752,12 @@ mod tests {
         }
     }
 
-    /// AC-6 — a non-minimal Remaining Length encoding whose total wire size is
-    /// exactly the bound is accepted. The exact header check and the derived
-    /// rmqtt-codec limit must agree at the boundary, so no honest client is
-    /// closed for its encoding width alone.
+    /// AC-6 (this feature), superseding F2.4 AC-6's acceptance — a non-minimal
+    /// Remaining Length whose packet is exactly the bound passes the size
+    /// check at its real width and is then rejected as malformed (MQTT 3.1.1
+    /// §2.2.3, MQTT 5.0 [MQTT-1.5.5-1]; decision Q3).
     #[test]
-    fn decoder_accepts_a_non_minimal_remaining_length_exactly_at_the_bound() {
+    fn decoder_rejects_a_non_minimal_remaining_length_at_the_bound_as_malformed() {
         /// Bound the non-minimal rejection case above also uses.
         const NON_MINIMAL_BOUND: u32 = 64;
         /// Remaining Length 61 in two bytes: 1 + 2 + 61 = 64 total wire bytes.
@@ -634,23 +772,109 @@ mod tests {
         buf.extend_from_slice(&NON_MINIMAL_HEADER);
         buf.extend_from_slice(&[0x00, 0x01, b't']);
         buf.resize(buf.len() + (NON_MINIMAL_REMAINING_LENGTH - 3), 0);
-        match MonoioDecoder::decode(&mut decoder, &mut buf).expect("decode") {
-            Decoded::Some((MqttPacket::V3(PacketV3::Publish(p)), _)) => {
-                assert_eq!(p.payload.len(), NON_MINIMAL_REMAINING_LENGTH - 3);
-            }
-            other => panic!("expected v3 PUBLISH at the bound, got {other:?}"),
-        }
+        let err = MonoioDecoder::decode(&mut decoder, &mut buf)
+            .expect_err("non-minimal header at the bound must be rejected as malformed");
+        assert!(matches!(
+            err.get_ref().and_then(|s| s.downcast_ref::<DecodeError>()),
+            Some(DecodeError::MalformedPacket)
+        ));
 
         let mut decoder = MqttDecoder::new(ProtocolVersion::MQTT5, max);
         let mut buf = BytesMut::new();
         buf.extend_from_slice(&NON_MINIMAL_HEADER);
         buf.extend_from_slice(&[0x00, 0x01, b't', 0x00]);
         buf.resize(buf.len() + (NON_MINIMAL_REMAINING_LENGTH - 4), 0);
-        match MonoioDecoder::decode(&mut decoder, &mut buf).expect("decode") {
-            Decoded::Some((MqttPacket::V5(PacketV5::Publish(p)), _)) => {
-                assert_eq!(p.payload.len(), NON_MINIMAL_REMAINING_LENGTH - 4);
+        let err = MonoioDecoder::decode(&mut decoder, &mut buf)
+            .expect_err("non-minimal header at the bound must be rejected as malformed");
+        assert!(matches!(
+            err.get_ref().and_then(|s| s.downcast_ref::<DecodeError>()),
+            Some(DecodeError::MalformedPacket)
+        ));
+    }
+
+    /// AC-6 — a non-minimal fixed header is rejected before its body arrives,
+    /// whether it declares a PINGREQ body or an ordinary packet body.
+    #[test]
+    fn decoder_rejects_a_non_minimal_header_only_packet_before_its_body() {
+        for version in [ProtocolVersion::MQTT3, ProtocolVersion::MQTT5] {
+            for header in [[0xC0, 0x80, 0x00], [0x30, 0x83, 0x00]] {
+                let mut decoder = MqttDecoder::new(version, MaxInboundPacketSize::DEFAULT);
+                let mut buf = BytesMut::new();
+                buf.extend_from_slice(&header);
+                let err = MonoioDecoder::decode(&mut decoder, &mut buf)
+                    .expect_err("non-minimal header-only packet must be rejected as malformed");
+                assert!(matches!(
+                    err.get_ref().and_then(|s| s.downcast_ref::<DecodeError>()),
+                    Some(DecodeError::MalformedPacket)
+                ));
             }
-            other => panic!("expected v5 PUBLISH at the bound, got {other:?}"),
+        }
+    }
+
+    /// AC-6 — the minimality rule compares the header's real width against
+    /// the width the Remaining Length needs, at every width a non-minimal
+    /// encoding can use: two bytes is the only one the tests above reach, so
+    /// a rule that only looked at `0x80 0x00` would pass them and still admit
+    /// these three headers.
+    #[test]
+    fn decoder_rejects_a_non_minimal_remaining_length_at_every_varint_width() {
+        /// Remaining Length 200 in three bytes (minimal width 2).
+        const WIDTH_3_FOR_2: [u8; 4] = [0x30, 0xC8, 0x81, 0x00];
+        /// Remaining Length 0 in four bytes (minimal width 1).
+        const WIDTH_4_FOR_1: [u8; 5] = [0x30, 0x80, 0x80, 0x80, 0x00];
+        /// Remaining Length 16 383 in four bytes (minimal width 2).
+        const WIDTH_4_FOR_2: [u8; 5] = [0x30, 0xFF, 0xFF, 0x80, 0x00];
+
+        for version in [ProtocolVersion::MQTT3, ProtocolVersion::MQTT5] {
+            for header in [&WIDTH_3_FOR_2[..], &WIDTH_4_FOR_1[..], &WIDTH_4_FOR_2[..]] {
+                let mut decoder = MqttDecoder::new(version, MaxInboundPacketSize::DEFAULT);
+                let mut buf = BytesMut::new();
+                buf.extend_from_slice(header);
+                let err = MonoioDecoder::decode(&mut decoder, &mut buf)
+                    .expect_err("a non-minimal Remaining Length must be rejected as malformed");
+                assert!(
+                    matches!(
+                        err.get_ref().and_then(|s| s.downcast_ref::<DecodeError>()),
+                        Some(DecodeError::MalformedPacket)
+                    ),
+                    "expected MalformedPacket for {header:02x?} on {version:?}, got {err:?}"
+                );
+            }
+        }
+    }
+
+    /// AC-8 — a PINGREQ declaring a body is rejected as malformed, for both
+    /// versions; a PINGREQ with no body still decodes.
+    #[test]
+    fn decoder_rejects_a_pingreq_carrying_a_body_on_both_versions() {
+        for version in [ProtocolVersion::MQTT3, ProtocolVersion::MQTT5] {
+            let mut decoder = MqttDecoder::new(version, MaxInboundPacketSize::DEFAULT);
+            let mut buf = BytesMut::new();
+            buf.extend_from_slice(&[0xC0, 0x05]);
+            let err = MonoioDecoder::decode(&mut decoder, &mut buf)
+                .expect_err("a PINGREQ declaring a body must be rejected as malformed");
+            assert!(matches!(
+                err.get_ref().and_then(|s| s.downcast_ref::<DecodeError>()),
+                Some(DecodeError::MalformedPacket)
+            ));
+
+            let mut decoder = MqttDecoder::new(version, MaxInboundPacketSize::DEFAULT);
+            let mut buf = BytesMut::new();
+            buf.extend_from_slice(&[0xC0, 0x00]);
+            match (
+                version,
+                MonoioDecoder::decode(&mut decoder, &mut buf).expect("decode"),
+            ) {
+                (
+                    ProtocolVersion::MQTT3,
+                    Decoded::Some((MqttPacket::V3(PacketV3::PingRequest), _)),
+                )
+                | (
+                    ProtocolVersion::MQTT5,
+                    Decoded::Some((MqttPacket::V5(PacketV5::PingRequest), _)),
+                ) => {}
+                (v, other) => panic!("expected PINGREQ with no body for {v:?}, got {other:?}"),
+            }
         }
     }
 

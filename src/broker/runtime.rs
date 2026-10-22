@@ -154,6 +154,13 @@ impl monoio_codec::Decoder for CodecPair {
     ) -> Result<monoio_codec::Decoded<Self::Item>, Self::Error> {
         self.decoder.decode(src)
     }
+
+    fn decode_eof(
+        &mut self,
+        src: &mut bytes::BytesMut,
+    ) -> Result<monoio_codec::Decoded<Self::Item>, Self::Error> {
+        monoio_codec::Decoder::decode_eof(&mut self.decoder, src)
+    }
 }
 
 impl monoio_codec::Encoder<MqttPacket> for CodecPair {

@@ -28,6 +28,38 @@ impl VersionDecoder {
     }
 }
 
+/// Protocol names `VersionCodec` accepts (rmqtt-codec 0.2.2 `src/version.rs:54-72`):
+/// MQTT 3.1.1 / 5.0 and MQTT 3.1.
+const PROTOCOL_NAME_MQTT: &[u8] = b"MQTT";
+const PROTOCOL_NAME_MQISDP: &[u8] = b"MQIsdp";
+/// Width of the protocol-name length prefix.
+const PROTOCOL_NAME_LEN_BYTES: usize = 2;
+
+/// `true` when the CONNECT `src` starts with names a protocol `VersionCodec`
+/// accepts. `VersionCodec` answers `InvalidProtocol` for an unknown name and
+/// for an unsupported level alike, so a known name means the level was refused.
+/// A malformed fixed header is never a level refusal: it closes silently like
+/// any malformed CONNECT.
+fn names_a_known_protocol(src: &[u8]) -> bool {
+    let Some((header_len, remaining_length)) = crate::codec::mqtt::fixed_header(src) else {
+        return false;
+    };
+    if crate::codec::mqtt::rejects_malformed_fixed_header(src) {
+        return false;
+    }
+    let name_start = header_len + PROTOCOL_NAME_LEN_BYTES;
+    let Some(&[hi, lo]) = src.get(header_len..name_start) else {
+        return false;
+    };
+    let name_end = name_start + usize::from(u16::from_be_bytes([hi, lo]));
+    // `VersionCodec` reads past the declared frame; the level byte at
+    // `name_end` must lie inside it for the refusal to be about this CONNECT.
+    let frame_end = header_len + usize::try_from(remaining_length).unwrap_or(usize::MAX);
+    name_end < frame_end
+        && matches!(src.get(name_start..name_end),
+            Some(name) if name == PROTOCOL_NAME_MQTT || name == PROTOCOL_NAME_MQISDP)
+}
+
 impl Decoder for VersionDecoder {
     type Item = ProtocolVersion;
     type Error = io::Error;
@@ -42,6 +74,12 @@ impl Decoder for VersionDecoder {
         match TokioDecoder::decode(&mut self.inner, src) {
             Ok(Some(version)) => Ok(Decoded::Some(version)),
             Ok(None) => Ok(Decoded::Insufficient),
+            Err(DecodeError::InvalidProtocol) if names_a_known_protocol(src) => {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    DecodeError::UnsupportedProtocolLevel,
+                ))
+            }
             Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
         }
     }

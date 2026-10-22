@@ -151,6 +151,8 @@ pub(crate) enum Violation {
     PublishMissingPacketId,
     /// SUBSCRIBE / UNSUBSCRIBE whose topic-filter list is empty.
     EmptyTopicFilterList,
+    /// SUBSCRIBE / UNSUBSCRIBE naming a zero-length topic filter (MQTT-4.7.3-1).
+    EmptyTopicFilter,
     /// The reply the request obliges the server to send is larger than the
     /// Maximum Packet Size the client declared it can receive.
     ReplyOverMaxPacketSize,
@@ -185,6 +187,7 @@ impl Violation {
                 "protocol violation: PUBLISH at QoS 1 or above without a packet id"
             }
             Violation::EmptyTopicFilterList => "protocol violation: empty topic filter list",
+            Violation::EmptyTopicFilter => "protocol violation: zero-length topic filter",
             Violation::ReplyOverMaxPacketSize => {
                 "protocol violation: reply exceeds the client's maximum packet size"
             }
@@ -227,6 +230,7 @@ impl Violation {
                 Violation::DuplicateConnect
                 | Violation::PublishMissingPacketId
                 | Violation::EmptyTopicFilterList
+                | Violation::EmptyTopicFilter
                 | Violation::ReplyOverMaxPacketSize
                 | Violation::ServerOnlyPacket
                 | Violation::PublishAckFromClient
@@ -243,6 +247,7 @@ impl Violation {
                 Violation::DuplicateConnect
                 | Violation::PublishMissingPacketId
                 | Violation::EmptyTopicFilterList
+                | Violation::EmptyTopicFilter
                 | Violation::ServerOnlyPacket
                 | Violation::PublishAckFromClient
                 | Violation::AuthNotNegotiated
@@ -493,24 +498,36 @@ pub(crate) fn dispatch<'a>(
             packet_id,
             topic_filters,
         }) => match NonZeroUsize::new(topic_filters.len()) {
-            Some(n) => Disposition::Reply(Reply::SubscribeRefusal(*packet_id, n)),
             None => Disposition::Violation(Violation::EmptyTopicFilterList),
+            Some(_) if topic_filters.iter().any(|(f, _)| f.is_empty()) => {
+                Disposition::Violation(Violation::EmptyTopicFilter)
+            }
+            Some(n) => Disposition::Reply(Reply::SubscribeRefusal(*packet_id, n)),
         },
         MqttPacket::V5(PacketV5::Subscribe(s)) => match NonZeroUsize::new(s.topic_filters.len()) {
-            Some(n) => Disposition::Reply(Reply::SubscribeRefusal(s.packet_id, n)),
             None => Disposition::Violation(Violation::EmptyTopicFilterList),
+            Some(_) if s.topic_filters.iter().any(|(f, _)| f.is_empty()) => {
+                Disposition::Violation(Violation::EmptyTopicFilter)
+            }
+            Some(n) => Disposition::Reply(Reply::SubscribeRefusal(s.packet_id, n)),
         },
         MqttPacket::V3(PacketV3::Unsubscribe {
             packet_id,
             topic_filters,
         }) => match NonZeroUsize::new(topic_filters.len()) {
-            Some(n) => Disposition::Reply(Reply::UnsubscribeAck(*packet_id, n)),
             None => Disposition::Violation(Violation::EmptyTopicFilterList),
+            Some(_) if topic_filters.iter().any(|f| f.is_empty()) => {
+                Disposition::Violation(Violation::EmptyTopicFilter)
+            }
+            Some(n) => Disposition::Reply(Reply::UnsubscribeAck(*packet_id, n)),
         },
         MqttPacket::V5(PacketV5::Unsubscribe(s)) => {
             match NonZeroUsize::new(s.topic_filters.len()) {
-                Some(n) => Disposition::Reply(Reply::UnsubscribeAck(s.packet_id, n)),
                 None => Disposition::Violation(Violation::EmptyTopicFilterList),
+                Some(_) if s.topic_filters.iter().any(|f| f.is_empty()) => {
+                    Disposition::Violation(Violation::EmptyTopicFilter)
+                }
+                Some(n) => Disposition::Reply(Reply::UnsubscribeAck(s.packet_id, n)),
             }
         }
         MqttPacket::V3(
@@ -1284,6 +1301,77 @@ mod tests {
         ));
     }
 
+    /// AC-12 — a filter list mixing a zero-length filter with a non-empty
+    /// one closes as `Violation::EmptyTopicFilter`, distinct from the
+    /// empty-list `EmptyTopicFilterList` case still covered by the last row.
+    #[test]
+    fn dispatch_refuses_a_zero_length_filter_in_every_subscribe_and_unsubscribe() {
+        let id = NonZeroU16::new(1).expect("non-zero");
+
+        let binding = v3_subscribe(id, vec![("a", QoS::AtMostOnce), ("", QoS::AtMostOnce)]);
+        assert!(matches!(
+            dispatch(&binding, &mut AwaitingRelease::default()),
+            Disposition::Violation(Violation::EmptyTopicFilter)
+        ));
+
+        let binding = v5_subscribe(
+            id,
+            None,
+            vec![
+                ("a", SubscriptionOptions::default()),
+                ("", SubscriptionOptions::default()),
+            ],
+        );
+        assert!(matches!(
+            dispatch(&binding, &mut AwaitingRelease::default()),
+            Disposition::Violation(Violation::EmptyTopicFilter)
+        ));
+
+        let binding = v3_unsubscribe(id, vec!["a", ""]);
+        assert!(matches!(
+            dispatch(&binding, &mut AwaitingRelease::default()),
+            Disposition::Violation(Violation::EmptyTopicFilter)
+        ));
+
+        let binding = v5_unsubscribe(id, vec!["", "a"]);
+        assert!(matches!(
+            dispatch(&binding, &mut AwaitingRelease::default()),
+            Disposition::Violation(Violation::EmptyTopicFilter)
+        ));
+
+        let binding = v3_subscribe(id, vec![]);
+        assert!(matches!(
+            dispatch(&binding, &mut AwaitingRelease::default()),
+            Disposition::Violation(Violation::EmptyTopicFilterList)
+        ));
+    }
+
+    /// AC-12 (precedence, failure mode: a lone empty filter read as an empty
+    /// list) — a one-element list holding only the zero-length filter is
+    /// `EmptyTopicFilter`, never `EmptyTopicFilterList`. This is the shape a
+    /// device subscribing to a blank topic actually sends.
+    #[test]
+    fn dispatch_refuses_a_lone_zero_length_filter_in_every_subscribe_and_unsubscribe() {
+        let id = NonZeroU16::new(37).expect("non-zero");
+
+        let bindings = [
+            v3_subscribe(id, vec![("", QoS::AtMostOnce)]),
+            v5_subscribe(id, None, vec![("", SubscriptionOptions::default())]),
+            v3_unsubscribe(id, vec![""]),
+            v5_unsubscribe(id, vec![""]),
+        ];
+        for binding in &bindings {
+            let disposition = dispatch(binding, &mut AwaitingRelease::default());
+            assert!(
+                matches!(
+                    disposition,
+                    Disposition::Violation(Violation::EmptyTopicFilter)
+                ),
+                "expected EmptyTopicFilter for {binding:?}, got {disposition:?}"
+            );
+        }
+    }
+
     /// AC-4, AC-25 — one failure code per filter on each version, the version
     /// variant matches the codec, and a non-1 packet id is propagated (a
     /// hardcoded `NonZeroU16::new(1).unwrap()` in `render` would satisfy every
@@ -1646,6 +1734,23 @@ mod tests {
             );
             assert!(violation.disconnect(ProtocolVersion::MQTT3, None).is_none());
         }
+    }
+
+    /// AC-13, AC-14 — a zero-length topic filter closes v5 with the same
+    /// Protocol Error (`0x82`) as `EmptyTopicFilterList`, and leaves v3
+    /// silent (no server-sent DISCONNECT on that version).
+    #[test]
+    fn zero_length_filter_disconnects_v5_with_protocol_error_and_v3_with_nothing() {
+        let pkt = Violation::EmptyTopicFilter
+            .disconnect(ProtocolVersion::MQTT5, None)
+            .expect("v5 disconnect");
+        assert_eq!(
+            encode(pkt, ProtocolVersion::MQTT5),
+            vec![0xE0, 0x02, 0x82, 0x00]
+        );
+        assert!(Violation::EmptyTopicFilter
+            .disconnect(ProtocolVersion::MQTT3, None)
+            .is_none());
     }
 
     /// AC-5, AC-25 — UNSUBACK renders to `[0xB0, 0x02, 0x00, 0x01]` on v3 and

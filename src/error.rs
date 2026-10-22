@@ -40,6 +40,19 @@ impl Error {
             Self::Decode(_) | Self::Encode(_) | Self::Protocol(_) | Self::Worker(_) => false,
         }
     }
+
+    /// `true` for an I/O error whose source is `TruncatedPacket`: the client
+    /// closed its connection inside a packet. Typed: a downcast on the
+    /// source, never message text.
+    pub(crate) fn is_truncated_packet(&self) -> bool {
+        matches!(
+            self,
+            Self::Io(e) if e
+                .get_ref()
+                .and_then(|s| s.downcast_ref::<crate::codec::mqtt::TruncatedPacket>())
+                .is_some()
+        )
+    }
 }
 
 /// [`Error::is_routine_disconnect`] for the benchmark's tokio twin, which
@@ -48,6 +61,14 @@ impl Error {
 #[cfg(feature = "runtime-seam")]
 pub fn is_routine_disconnect(err: &Error) -> bool {
     err.is_routine_disconnect()
+}
+
+/// [`Error::is_truncated_packet`] for the benchmark's tokio twin, whose
+/// own load generator ends stalled connections mid-packet. Reachable
+/// only through `runtime_seam`, so the shipped API does not grow.
+#[cfg(feature = "runtime-seam")]
+pub fn is_truncated_packet(err: &Error) -> bool {
+    err.is_truncated_packet()
 }
 
 #[cfg(test)]
@@ -125,6 +146,21 @@ mod tests {
             Error::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "any",))
                 .is_routine_disconnect()
         );
+    }
+
+    #[test]
+    fn truncated_packet_error_is_recognised_and_stays_non_routine() {
+        let truncated = Error::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            crate::codec::mqtt::TruncatedPacket,
+        ));
+        assert!(truncated.is_truncated_packet());
+        assert!(!truncated.is_routine_disconnect());
+
+        let plain_eof = Error::Io(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+        assert!(!plain_eof.is_truncated_packet());
+
+        assert!(!Error::ClientClosed.is_truncated_packet());
     }
 
     #[test]
@@ -214,6 +250,53 @@ mod tests {
             assert_eq!(
                 is_routine_disconnect(err),
                 err.is_routine_disconnect(),
+                "seam disagrees with the method for {err:?}"
+            );
+        }
+    }
+
+    /// AC-29 — the twin's `join` decides on the seam function, so it must
+    /// publish the same verdict as the method for every error shape, and it
+    /// must not widen to a plain `UnexpectedEof` or to the routine class.
+    #[cfg(feature = "runtime-seam")]
+    #[test]
+    fn the_truncation_seam_publishes_the_method_verdict() {
+        let cases = [
+            (
+                Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    crate::codec::mqtt::TruncatedPacket,
+                )),
+                true,
+            ),
+            (
+                Error::Io(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "x")),
+                false,
+            ),
+            (
+                Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    DecodeError::MalformedPacket,
+                )),
+                false,
+            ),
+            (Error::ClientClosed, false),
+            (Error::Timeout, false),
+            (Error::Decode(DecodeError::MalformedPacket), false),
+            (
+                Error::Protocol("connection closed mid-packet".into()),
+                false,
+            ),
+        ];
+        for (err, expected) in &cases {
+            assert_eq!(
+                is_truncated_packet(err),
+                *expected,
+                "seam classified {err:?} wrongly"
+            );
+            assert_eq!(
+                is_truncated_packet(err),
+                err.is_truncated_packet(),
                 "seam disagrees with the method for {err:?}"
             );
         }
