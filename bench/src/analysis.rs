@@ -6,18 +6,18 @@
 //! [`count_driver_fds`] is the one function here that performs I/O; it reads
 //! an fd directory and returns the `io::Error` of a failed inspection.
 //!
-//! The 30 rows of `reconcile` are the spec §9.1 contract; `recompute`
+//! The 31 rows of `reconcile` are the spec §9.1 contract; `recompute`
 //! re-runs `derive` and `reconcile` against a record's stored summary and
 //! returns one mismatch per disagreeing field, so `bench doc` can refuse a
 //! record whose summary has drifted from its raw observations.
 
 // Rates, p99s and clock ticks are 64-bit and have to land in `f64` for
 // ratios; the matching `f64 → u64` conversions are bounded by the spec
-// (window_secs, rate fractions, p99 ns). Accept the loss of precision.
+// (window_secs, offered rates, p99 ns). Accept the loss of precision.
 #![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -32,8 +32,9 @@ use crate::run_record::{
 // (`PLAN.md ## Interface Contracts`, `Protocol constants`). They are used
 // here rather than restated so a change to the runner's declared value
 // cannot leave the published metric and the refusal rows on the old one.
-use crate::runner::{CLEANUP_SURVIVOR_PREFIX, COUNTER_BOUNDARY_TOLERANCE_NS, SUSTAINED_TAIL_SECS};
-pub use crate::runner::SYSCALL_FRACTION_PCT;
+use crate::runner::{
+    CLEANUP_SURVIVOR_PREFIX, COUNTER_BOUNDARY_TOLERANCE_NS, ProtocolConstants, SUSTAINED_TAIL_SECS,
+};
 
 /// Maximum tolerated relative spread of any configuration's metric over its
 /// repetitions (spec §9.1: ≤ 10 %).
@@ -59,6 +60,20 @@ const NS_PER_US: u64 = 1_000;
 /// Tenths per unit: the host-condition clause prints its percentage
 /// rounded to one decimal place.
 const PCT_TENTHS: f64 = 10.0;
+
+/// Largest backlog growth through the window an open-loop run may show,
+/// read as time at its offered rate (spec §9.1 Steady state). Healthy
+/// calibration runs grew at most 9.1 ms and every growing one at least
+/// 114 ms (`bench/CALIBRATION.md`).
+pub const STEADY_STATE_GROWTH_LIMIT_NS: u64 = 50_000_000;
+
+/// Nanoseconds per millisecond: the steady-state reason prints its limit
+/// in milliseconds.
+const NS_PER_MS: u64 = 1_000_000;
+
+/// Milliseconds per second: the steady-state reason prints the backlog as
+/// milliseconds at the offered rate.
+const MS_PER_SECOND: f64 = 1_000.0;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Derived {
@@ -162,7 +177,7 @@ pub fn derive(record: &RunRecord) -> Derived {
 /// One element of the reconciliation decision table. The list order is the
 /// order rows appear in PLAN.md, so a record that violates several rows is
 /// reported in a stable, reviewable order.
-#[allow(clippy::too_many_lines)] // 30 rows of the spec §9.1 contract; splitting them buys nothing
+#[allow(clippy::too_many_lines)] // 31 rows of the spec §9.1 contract; splitting them buys nothing
 #[allow(unused_parens)] // Row 13 chains `&& (Throughput || open_loop) && ...`; the same shape is kept on rows 2, 3 and 6 so the open-loop/throughput boundary is uniform
 pub fn reconcile(record: &RunRecord) -> Vec<String> {
     let mut reasons: Vec<String> = Vec::new();
@@ -374,38 +389,19 @@ pub fn reconcile(record: &RunRecord) -> Vec<String> {
     }
 
     // Row 22 — counted run: boundary times within tolerance.
-    if is_counted_syscall_run(record) {
-        let start = record.window.start_ns;
-        let end = record.window.end_ns;
-        let enabled_off = record
-            .syscalls
-            .enabled_ns
-            .is_none_or(|e| e.abs_diff(start) > COUNTER_BOUNDARY_TOLERANCE_NS);
-        let disabled_off = record
-            .syscalls
-            .disabled_ns
-            .is_none_or(|d| d.abs_diff(end) > COUNTER_BOUNDARY_TOLERANCE_NS);
-        if enabled_off || disabled_off {
-            reasons.push(format!(
-                "counter boundaries outside tolerance: enabled {:?} disabled {:?}",
-                record.syscalls.enabled_ns, record.syscalls.disabled_ns
-            ));
-        }
+    if is_counted_syscall_run(record) && counter_boundaries_off(record) {
+        reasons.push(format!(
+            "counter boundaries outside tolerance: enabled {:?} disabled {:?}",
+            record.syscalls.enabled_ns, record.syscalls.disabled_ns
+        ));
     }
 
     // Row 23 — counted run: exit must be Code(0) or Signal(SIGINT).
-    if is_counted_syscall_run(record) {
-        let ok = match record.syscalls.exit {
-            Some(CounterExit::Code(0)) => true,
-            Some(CounterExit::Signal(s)) => s == SIGINT,
-            _ => false,
-        };
-        if !ok {
-            reasons.push(format!(
-                "syscall counter ended with {:?}",
-                record.syscalls.exit
-            ));
-        }
+    if is_counted_syscall_run(record) && !counter_exit_ok(record) {
+        reasons.push(format!(
+            "syscall counter ended with {:?}",
+            record.syscalls.exit
+        ));
     }
 
     // Row 24 — latency: last_write_start_ns must be Some(t < window.end_ns).
@@ -538,7 +534,41 @@ pub fn reconcile(record: &RunRecord) -> Vec<String> {
         reasons.push("no deliveries in the window to divide the syscall count by".to_string());
     }
 
+    // Row 31 — open-loop (latency and counted): steady state. A backlog
+    // that grows through the window and drains in the grace passes every
+    // row above; this row reads the growth as time at the offered rate.
+    if let Some(reason) = steady_state_reason(record) {
+        reasons.push(reason);
+    }
+
     reasons
+}
+
+/// Row 31's reason for `record`, or `None` when its backlog did not grow
+/// past [`STEADY_STATE_GROWTH_LIMIT_NS`]. Growth is the window's scheduled
+/// slots minus the deliveries the timeline holds inside the window, read
+/// as time at the offered rate. A record with no rate or no window slot
+/// count has no growth to measure; rows 27 and 15 report those.
+fn steady_state_reason(record: &RunRecord) -> Option<String> {
+    if !record.kind.is_open_loop() {
+        return None;
+    }
+    let rate = record.offered_rate?;
+    let window_scheduled = record.counts.window_scheduled?;
+    let deliveries = record
+        .timeline
+        .sum_secs(record.window.start_sec(), record.window.end_sec());
+    let growth = window_scheduled.saturating_sub(deliveries);
+    if u128::from(growth) * u128::from(ONE_SECOND_NS)
+        <= u128::from(STEADY_STATE_GROWTH_LIMIT_NS) * u128::from(rate)
+    {
+        return None;
+    }
+    let growth_ms = growth as f64 * MS_PER_SECOND / rate as f64;
+    Some(format!(
+        "backlog grew by {growth} slots through the window ({growth_ms:.1} ms at the offered rate), above the {} ms steady-state limit",
+        STEADY_STATE_GROWTH_LIMIT_NS / NS_PER_MS
+    ))
 }
 
 /// Walk `record`'s stored summary and return one mismatch string per field
@@ -805,20 +835,132 @@ pub fn config_passes(runs: &[RunRecord], repetitions: u32, enforce_spread: bool)
     config_failure(runs, repetitions, enforce_spread).is_none()
 }
 
-/// Matched latency rates from the slowest throughput competitor:
-/// `(floor(0.5 × min), floor(0.8 × min))`. `None` when no competitor
-/// reported a rate.
-pub fn matched_rates(throughput_medians: &[f64]) -> Option<(u64, u64)> {
-    if throughput_medians.is_empty() {
-        return None;
+/// A reconciliation row that measures the server's capacity at the
+/// offered rate (spec §9.1 Latency outcomes): a configuration whose
+/// every invalid repetition fails at least one of these rows is
+/// published "not sustained at R".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CapacityRow {
+    Unresolved,
+    MissedSlots,
+    SteadyState,
+}
+
+impl CapacityRow {
+    /// The row's name in a not-sustained cell or line.
+    pub fn label(self) -> &'static str {
+        match self {
+            CapacityRow::Unresolved => "unresolved",
+            CapacityRow::MissedSlots => "missed slots",
+            CapacityRow::SteadyState => "steady state",
+        }
     }
-    let min = throughput_medians
+}
+
+/// The capacity rows `record` fails, in [`CapacityRow`] order: row 3
+/// (`unresolved`), row 11 (missed slots) and row 31 (steady state), read
+/// from the same raw fields `reconcile` reads. Empty for a record that is
+/// not open-loop.
+pub fn capacity_rows(record: &RunRecord) -> Vec<CapacityRow> {
+    let mut rows = Vec::new();
+    if !record.kind.is_open_loop() {
+        return rows;
+    }
+    if record.counts.unresolved != 0 {
+        rows.push(CapacityRow::Unresolved);
+    }
+    if record.generator_errors.missed_slots != 0 {
+        rows.push(CapacityRow::MissedSlots);
+    }
+    if steady_state_reason(record).is_some() {
+        rows.push(CapacityRow::SteadyState);
+    }
+    rows
+}
+
+/// How a recorded open-loop configuration ended (spec §9.1 Latency
+/// outcomes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenLoopOutcome {
+    /// The highest attempt passes [`config_passes`].
+    Passed,
+    /// The highest attempt fails and attempts remain in the budget.
+    Pending,
+    /// The budget is spent, every completed attempt holds an invalid
+    /// repetition, and every invalid repetition fails a capacity row.
+    NotSustained(Vec<CapacityRow>),
+    /// The budget is spent on any other failure; names the first
+    /// offending attempt and its cause.
+    Exhausted(String),
+}
+
+/// Classify one configuration's records — every attempt — into a
+/// [`OpenLoopOutcome`]. Recorded profile only: every smoke configuration
+/// must pass, so the smoke gate reads [`config_passes`] alone.
+pub fn open_loop_outcome(runs: &[RunRecord], constants: &ProtocolConstants) -> OpenLoopOutcome {
+    let mut by_attempt: BTreeMap<u32, Vec<RunRecord>> = BTreeMap::new();
+    for run in runs {
+        by_attempt.entry(run.attempt).or_default().push(run.clone());
+    }
+    let Some((_, highest)) = by_attempt.last_key_value() else {
+        return OpenLoopOutcome::Pending;
+    };
+    if config_passes(highest, constants.repetitions, constants.enforce_spread) {
+        return OpenLoopOutcome::Passed;
+    }
+    let completed: Vec<(u32, &Vec<RunRecord>)> = by_attempt
         .iter()
-        .copied()
-        .fold(f64::INFINITY, f64::min);
-    let half = (0.5 * min).floor() as u64;
-    let eighty = (0.8 * min).floor() as u64;
-    Some((half, eighty))
+        .filter(|(_, group)| attempt_complete(group, constants.repetitions))
+        .map(|(attempt, group)| (*attempt, group))
+        .collect();
+    let spent = u32::try_from(completed.len()).unwrap_or(u32::MAX)
+        >= constants.max_config_attempts;
+    if !spent {
+        return OpenLoopOutcome::Pending;
+    }
+    // A strace counted run cannot be repeated with the same method: the
+    // spec recovers through a fresh perf-counted dataset.
+    if runs
+        .iter()
+        .any(|run| run.kind == RunKind::Counted && run.syscalls.method == SyscallMethod::Strace)
+    {
+        return OpenLoopOutcome::Exhausted(format!(
+            "strace counted run spent its {} attempts; record a fresh dataset counted with perf",
+            constants.max_config_attempts
+        ));
+    }
+    let mut rows: BTreeSet<CapacityRow> = BTreeSet::new();
+    for (attempt, group) in completed {
+        let mut invalid: Vec<&RunRecord> = group.iter().filter(|run| !run.valid).collect();
+        invalid.sort_by_key(|run| run.repetition);
+        if invalid.is_empty() {
+            // The attempt holds no invalid repetition: a
+            // configuration-level gate — a missing metric or the spread —
+            // can have refused it.
+            let reason = config_failure(group, constants.repetitions, constants.enforce_spread)
+                .unwrap_or_default();
+            return OpenLoopOutcome::Exhausted(format!("attempt {attempt}: {reason}"));
+        }
+        for run in invalid {
+            if counter_failed(run) {
+                return OpenLoopOutcome::Exhausted(format!(
+                    "attempt {attempt}: repetition {} failed the syscall counter: {}",
+                    run.repetition,
+                    run.invalid_reasons.join("; ")
+                ));
+            }
+            let run_rows = capacity_rows(run);
+            if run_rows.is_empty() {
+                return OpenLoopOutcome::Exhausted(format!(
+                    "attempt {attempt}: repetition {} is invalid on no capacity row: {}",
+                    run.repetition,
+                    run.invalid_reasons.join("; ")
+                ));
+            }
+            rows.extend(run_rows);
+        }
+    }
+    OpenLoopOutcome::NotSustained(rows.into_iter().collect())
 }
 
 /// `total=` value of the `some` line of `/proc/pressure/cpu`: the
@@ -1067,4 +1209,40 @@ fn kind_label(kind: RunKind) -> &'static str {
 /// The counted run (`RunKind::Counted`) is the only run that carries a syscall counter.
 fn is_counted_syscall_run(record: &RunRecord) -> bool {
     record.kind == RunKind::Counted
+}
+
+/// `true` when the counted run's counter boundaries fall outside the
+/// tolerance of the window's start and end (spec §9.1 row 22).
+fn counter_boundaries_off(record: &RunRecord) -> bool {
+    let start = record.window.start_ns;
+    let end = record.window.end_ns;
+    let enabled_off = record
+        .syscalls
+        .enabled_ns
+        .is_none_or(|e| e.abs_diff(start) > COUNTER_BOUNDARY_TOLERANCE_NS);
+    let disabled_off = record
+        .syscalls
+        .disabled_ns
+        .is_none_or(|d| d.abs_diff(end) > COUNTER_BOUNDARY_TOLERANCE_NS);
+    enabled_off || disabled_off
+}
+
+/// `true` when the counted run's counter ended with the code 0 or with
+/// SIGINT (spec §9.1 row 23).
+fn counter_exit_ok(record: &RunRecord) -> bool {
+    match record.syscalls.exit {
+        Some(CounterExit::Code(0)) => true,
+        Some(CounterExit::Signal(s)) => s == SIGINT,
+        _ => false,
+    }
+}
+
+/// `true` when a counted run fails a syscall-counter row (19, 22 or
+/// 23). Spec §9.1 keeps the counter policy for those failures, so they
+/// stop the session even beside a capacity row.
+fn counter_failed(record: &RunRecord) -> bool {
+    is_counted_syscall_run(record)
+        && (record.syscalls.count.is_none()
+            || counter_boundaries_off(record)
+            || !counter_exit_ok(record))
 }

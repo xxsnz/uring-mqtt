@@ -6,26 +6,28 @@
 //! failed attempts stay on disk (AC-46), `read_records`/`check_resume`/
 //! `resume_plan` plan a `--resume` restart that skips passed configs
 //! and continues the others from the next attempt (AC-62, AC-63), and
-//! `run_matrix` drives the §9.1 matrix — throughput first, then
-//! matched-rate latency, then connections — with SIGINT/SIGTERM
+//! `run_matrix` drives the §9.1 matrix — throughput first, then latency
+//! and counted runs at the row group's declared rates, then connections
+//! — with SIGINT/SIGTERM
 //! cancellation (AC-52). Signatures and constants match
 //! `features/benchmark-harness/PLAN.md` `## Interface Contracts`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::analysis::{
-    attempt_complete, config_failure, config_passes, interleave, median, matched_rates, recompute,
+    attempt_complete, config_failure, config_passes, interleave, open_loop_outcome, recompute,
+    CapacityRow, OpenLoopOutcome,
 };
 use crate::run_record::{
     ConfigKey, CpuSets, Env, Profile, RunKind, RunRecord, ServerKind, SyscallMethod, SCHEMA_VERSION,
 };
 use crate::runner::{
-    survivor_resume_refusal, CLEANUP_SURVIVOR_PREFIX, HostSetup, stem_for, LATENCY_FRACTIONS_PCT,
-    ProtocolConstants, RunSpec, SCRATCH_REUSED_PREFIX, SYSCALL_FRACTION_PCT,
+    declared_rates, survivor_resume_refusal, CLEANUP_SURVIVOR_PREFIX, HostSetup, stem_for,
+    ProtocolConstants, RunSpec, SCRATCH_REUSED_PREFIX,
 };
 
 /// The full server set §9.1 records. A `bench run --profile recorded`
@@ -71,11 +73,60 @@ pub enum ResumeState {
 /// What [`run_matrix`] (and [`run_configs`]) produced. `passed` are the
 /// configurations whose every attempt passed `config_passes`; `failed`
 /// are the ones that ran through every `max_config_attempts` and still
-/// did not.
+/// did not; `not_sustained` are the recorded open-loop configurations
+/// published "not sustained at R"; `stopped` names the configuration
+/// whose exhaustion stopped the session.
 #[derive(Debug, Clone, Default)]
 pub struct MatrixOutcome {
     pub passed: Vec<ConfigKey>,
     pub failed: Vec<ConfigKey>,
+    /// Recorded open-loop configurations published "not sustained at R", each with the capacity rows its failed repetitions hit.
+    pub not_sustained: Vec<(ConfigKey, Vec<CapacityRow>)>,
+    /// `<key:?>: <cause>` of the configuration whose exhaustion stopped the session; nothing was scheduled after it.
+    pub stopped: Option<String>,
+}
+
+impl MatrixOutcome {
+    /// What `bench run` prints on stderr: one line per not-sustained
+    /// configuration, then one per failed configuration (a smoke failure
+    /// is a harness-health failure), then the session stop.
+    pub fn stderr_lines(&self, profile: Profile) -> Vec<String> {
+        let mut lines = Vec::new();
+        for (key, rows) in &self.not_sustained {
+            let labels: Vec<&str> = rows.iter().map(|r| r.label()).collect();
+            lines.push(format!(
+                "not sustained at {} msgs/s: {key:?}: {}",
+                display_or_none(key.offered_rate),
+                labels.join(", ")
+            ));
+        }
+        for key in &self.failed {
+            lines.push(match profile {
+                Profile::Smoke => format!("smoke harness-health failure: {key:?}"),
+                Profile::Recorded => format!("failed: {key:?}"),
+            });
+        }
+        if let Some(stopped) = &self.stopped {
+            lines.push(format!("session stopped: {stopped}"));
+        }
+        lines
+    }
+
+    /// `bench run`'s exit status: 2 when the session stopped or a
+    /// configuration failed, 0 otherwise — a not-sustained configuration
+    /// is a published result.
+    pub fn exit_code(&self) -> i32 {
+        if self.stopped.is_some() || !self.failed.is_empty() {
+            2
+        } else {
+            0
+        }
+    }
+}
+
+/// `value` for an operator message, or `none` when it is absent.
+fn display_or_none<T: std::fmt::Display>(value: Option<T>) -> String {
+    value.map_or_else(|| "none".to_string(), |v| v.to_string())
 }
 
 /// Mosquitto is single-process, single-port, so it cannot run on more
@@ -250,6 +301,7 @@ fn check_counter_bin(
 /// A file whose name is not the record's own `file_name()` is fatal
 /// too: a copied or renamed record would otherwise count as a
 /// repetition that never ran.
+/// A record of another schema is refused by its schema first.
 pub fn read_records(dir: &Path) -> Result<Vec<RunRecord>, String> {
     let mut out = Vec::new();
     let entries =
@@ -262,6 +314,16 @@ pub fn read_records(dir: &Path) -> Result<Vec<RunRecord>, String> {
                 .map_err(|e| format!("open {}: {e}", path.display()))?;
             let rec: RunRecord = serde_json::from_reader(file)
                 .map_err(|e| format!("parse {}: {e}", path.display()))?;
+            // A record of another schema follows another naming convention,
+            // so its schema is named before its file name is compared.
+            if rec.schema != SCHEMA_VERSION {
+                return Err(format!(
+                    "{}: record schema {} != {}",
+                    path.display(),
+                    rec.schema,
+                    SCHEMA_VERSION
+                ));
+            }
             let expected = rec.file_name();
             if path.file_name().and_then(|n| n.to_str()) != Some(expected.as_str()) {
                 return Err(format!(
@@ -295,13 +357,14 @@ pub fn read_records(dir: &Path) -> Result<Vec<RunRecord>, String> {
 /// `--syscalls strace` resume of it share one environment, and
 /// `doc::render` then refuses the published mix
 /// (`mixed syscall counter methods`). Only records that carry counter
-/// evidence are compared — every kind but the 80 % latency run records
+/// evidence are compared — every kind but the counted run records
 /// method `None` (`bench/src/runner.rs`). Each record is then
 /// recomputed, because every later reader trusts its stored summary: a
 /// record whose `valid` or `throughput_msgs_per_sec` no longer follows
-/// from its own raw observations decides `resume_plan` and, through
-/// `passing_records_for_key`, the matched rate the new latency runs are
-/// paced at. `finalize_record` derives every one of those fields from
+/// from its own raw observations decides `resume_plan`.
+/// An open-loop record whose offered rate is not a declared rate of its
+/// row group is refused: a changed declared rate needs a fresh dataset.
+/// `finalize_record` derives every one of those fields from
 /// the raw data it just collected, so a mismatch is an edit made outside
 /// the harness, not a run this directory ever produced. The first record
 /// that disagrees ends the check, and every rejection names its file so
@@ -338,6 +401,23 @@ pub fn check_resume(
                 "{file}: record profile {:?} != {:?}",
                 rec.profile, profile
             ));
+        }
+        // A changed declared rate needs a fresh dataset (spec §9.1): an
+        // open-loop record at any other rate measured another experiment.
+        if rec.kind.is_open_loop() {
+            let declared = rec.qos.and_then(|q| declared_rates(profile, rec.workers, q));
+            let on_declared = matches!(
+                (declared, rec.offered_rate),
+                (Some(rates), Some(rate)) if rates.both().contains(&rate)
+            );
+            if !on_declared {
+                return Err(format!(
+                    "{file}: offered_rate {} is not a declared rate of workers {} QoS {}; a changed declared rate needs a fresh dataset",
+                    display_or_none(rec.offered_rate),
+                    rec.workers,
+                    display_or_none(rec.qos)
+                ));
+            }
         }
         if rec.env.git_sha != env.git_sha {
             return Err(format!(
@@ -496,7 +576,7 @@ pub fn resume_plan(
 }
 
 /// `specs` are the RunSpec's the matrix dispatched (one per
-/// `(server, workers, qos, kind, rate_fraction_pct)`); `run` is the
+/// `(server, workers, qos, kind, offered_rate)`); `run` is the
 /// one-run executor (the matrix passes `runner::run_one` in
 /// production; the test injects a stub). The function deduplicates
 /// the specs by `ConfigKey`, then runs rounds of
@@ -523,7 +603,15 @@ pub fn resume_plan(
 /// ([`created_own_scratch`]), so a run never removes another run's
 /// evidence. A run that left a child running after cleanup stops scheduling the same
 /// way, with that child's report as the error.
-pub fn run_configs<F: FnMut(&RunSpec) -> RunRecord, S: ::std::hash::BuildHasher>(
+/// Before each round, every pending configuration whose budget is spent is passed to
+/// `stop` once; `Ok(Some(cause))` returns at once with `MatrixOutcome::stopped` set and nothing more dispatched.
+/// A budget spent before this call (a `--resume`) is checked before the first round.
+#[allow(clippy::too_many_arguments)]
+pub fn run_configs_with_stop<
+    F: FnMut(&RunSpec) -> RunRecord,
+    S: ::std::hash::BuildHasher,
+    T: FnMut(ConfigKey) -> Result<Option<String>, String>,
+>(
     specs: &[RunSpec],
     remaining: &HashMap<ConfigKey, u32, S>,
     constants: &ProtocolConstants,
@@ -531,6 +619,7 @@ pub fn run_configs<F: FnMut(&RunSpec) -> RunRecord, S: ::std::hash::BuildHasher>
     scratch_dir: &Path,
     cancel: &AtomicBool,
     mut run: F,
+    mut stop: T,
 ) -> Result<MatrixOutcome, String> {
     fs::create_dir_all(out_dir).map_err(|e| format!("create out dir: {e}"))?;
     // Deduplicate specs by key, preserving the first occurrence of each.
@@ -558,8 +647,30 @@ pub fn run_configs<F: FnMut(&RunSpec) -> RunRecord, S: ::std::hash::BuildHasher>
         .collect();
 
     let mut passed: Vec<ConfigKey> = Vec::new();
+    let mut checked: HashSet<ConfigKey> = HashSet::new();
 
     loop {
+        // A spent budget may stop the session (spec §9.1 Latency
+        // outcomes). Checking at the top of every round covers a budget
+        // spent before this call and one spent in the round just
+        // finished, so no run is dispatched after it.
+        let mut stop_cause = None;
+        for key in &pending_keys {
+            if *left.get(key).unwrap_or(&0) == 0 && checked.insert(*key) {
+                stop_cause = stop(*key)?;
+                if stop_cause.is_some() {
+                    break;
+                }
+            }
+        }
+        if let Some(cause) = stop_cause {
+            return Ok(MatrixOutcome {
+                passed,
+                failed: pending_keys,
+                stopped: Some(cause),
+                ..MatrixOutcome::default()
+            });
+        }
         let mut active_specs: Vec<RunSpec> = Vec::new();
         for key in &pending_keys {
             if *left.get(key).unwrap_or(&0) == 0 {
@@ -711,7 +822,23 @@ pub fn run_configs<F: FnMut(&RunSpec) -> RunRecord, S: ::std::hash::BuildHasher>
     Ok(MatrixOutcome {
         passed,
         failed: pending_keys,
+        ..MatrixOutcome::default()
     })
+}
+
+/// Run `specs` with no stop check: [`run_configs_with_stop`] whose
+/// check never stops. Throughput, connections and every smoke stage
+/// use it.
+pub fn run_configs<F: FnMut(&RunSpec) -> RunRecord, S: ::std::hash::BuildHasher>(
+    specs: &[RunSpec],
+    remaining: &HashMap<ConfigKey, u32, S>,
+    constants: &ProtocolConstants,
+    out_dir: &Path,
+    scratch_dir: &Path,
+    cancel: &AtomicBool,
+    run: F,
+) -> Result<MatrixOutcome, String> {
+    run_configs_with_stop(specs, remaining, constants, out_dir, scratch_dir, cancel, run, |_| Ok(None))
 }
 
 /// Persist one record as `out_dir/<file_name>`. The JSON is serialized
@@ -853,17 +980,18 @@ fn attempt_in_use(
 
 /// Drive the §9.1 matrix end to end. Each `(workers, qos)` pair runs
 /// its throughput configurations first, then latency configurations at
-/// 50 % and 80 % of the slowest passing throughput rate, then (after
-/// every QoS of one `w`) connections configurations. When a syscall
-/// counter is selected, the open-loop stage also dispatches the counted
-/// configuration at the matched 80 % rate, interleaved with the latency
-/// runs. A failed throughput row marks all of them failed without
-/// running. SIGINT/SIGTERM cancellation is observed before every `run`
+/// the row group's two declared rates (`runner::declared_rates`), then
+/// (after every QoS of one `w`) connections configurations. When a
+/// syscall counter is selected, the open-loop stage also dispatches the
+/// counted configuration at the higher declared rate, interleaved with
+/// the latency runs. A failed throughput configuration does not hold
+/// back its row group's open-loop stage. SIGINT/SIGTERM cancellation is observed before every `run`
 /// call: once set, `run_matrix_with` returns `Err("cancelled")` after
 /// the current run finishes. `run` is the one-run executor; the
 /// production caller passes `|s| crate::runner::run_one(s, host)` and
 /// the tests pass a stub that observes the dispatched specs without
 /// spawning a runner.
+/// In a recorded session the open-loop stage runs through [`run_configs_with_stop`]: an exhausted configuration that [`open_loop_outcome`] classifies `Exhausted` sets `MatrixOutcome::stopped` and returns at once; one classified `NotSustained` goes to `MatrixOutcome::not_sustained` and the session continues.
 pub fn run_matrix_with<F: FnMut(&RunSpec) -> RunRecord>(
     spec: &MatrixSpec,
     host: &HostSetup,
@@ -875,9 +1003,8 @@ pub fn run_matrix_with<F: FnMut(&RunSpec) -> RunRecord>(
     fs::create_dir_all(&host.scratch_dir)
         .map_err(|e| format!("create scratch: {e}"))?;
 
-    // Resume: refuse mismatched env, build the plan, capture records so
-    // the matched-rate calculation can read them.
-    let (plan, mut existing_records) = if spec.resume {
+    // Resume: refuse mismatched env, build the plan.
+    let plan = if spec.resume {
         let existing = read_records(&spec.out_dir)?;
         check_resume(
             &existing,
@@ -886,10 +1013,9 @@ pub fn run_matrix_with<F: FnMut(&RunSpec) -> RunRecord>(
             &host.env,
             &host.cpu_sets,
         )?;
-        let plan = resume_plan(&existing, &constants);
-        (plan, existing)
+        resume_plan(&existing, &constants)
     } else {
-        (HashMap::new(), Vec::new())
+        HashMap::new()
     };
     let remaining: HashMap<ConfigKey, u32> = plan
         .iter()
@@ -918,7 +1044,6 @@ pub fn run_matrix_with<F: FnMut(&RunSpec) -> RunRecord>(
                     workers: w,
                     qos: Some(q),
                     kind: RunKind::Throughput,
-                    rate_fraction_pct: None,
                     offered_rate: None,
                     repetition: 0,
                     attempt: 1,
@@ -938,76 +1063,24 @@ pub fn run_matrix_with<F: FnMut(&RunSpec) -> RunRecord>(
                 &host.cancel,
                 &mut run,
             )?;
-            let thr_failed_keys = thr_outcome.failed;
-            // A config the resume plan skipped already passed, so its
-            // existing records feed the matched-rate median.
-            let mut thr_passed_keys = thr_outcome.passed;
-            thr_passed_keys.extend(thr_skipped);
-            outcome.passed.extend(thr_passed_keys.iter().copied());
-            outcome.failed.extend(thr_failed_keys.iter().copied());
+            // A config the resume plan skipped already passed.
+            outcome.passed.extend(thr_outcome.passed);
+            outcome.passed.extend(thr_skipped);
+            outcome.failed.extend(thr_outcome.failed);
 
-            // Reload the records we just wrote so we can read the
-            // per-server throughput metric for matched_rates.
-            if spec.resume {
-                // On resume we add the new records to the existing list
-                // for the matched-rate calculation; the highest-attempt
-                // passing records are already in `existing_records`.
-                let new_records = read_records(&spec.out_dir)?;
-                existing_records = merge_records(existing_records, new_records);
-            } else {
-                existing_records = read_records(&spec.out_dir)?;
-            }
-
-            if !thr_failed_keys.is_empty() {
-                // Mark latency configs as failed (unrun).
-                for &server in &servers {
-                    for &pct in &LATENCY_FRACTIONS_PCT {
-                        outcome.failed.push(ConfigKey {
-                            server,
-                            workers: w,
-                            qos: Some(q),
-                            kind: RunKind::Latency,
-                            rate_fraction_pct: Some(pct),
-                        });
-                    }
-                    if host.syscalls != SyscallMethod::None {
-                        outcome.failed.push(ConfigKey {
-                            server,
-                            workers: w,
-                            qos: Some(q),
-                            kind: RunKind::Counted,
-                            rate_fraction_pct: Some(SYSCALL_FRACTION_PCT),
-                        });
-                    }
-                }
-                continue;
-            }
-
-            // Compute matched rates from the passing throughput records.
-            let throughput_medians: Vec<f64> = thr_passed_keys
-                .iter()
-                .filter_map(|key| {
-                    median(&passing_records_for_key(&existing_records, *key)
-                        .iter()
-                        .filter_map(crate::analysis::metric)
-                        .collect::<Vec<f64>>())
-                })
-                .collect();
-            let rates = matched_rates(&throughput_medians).unwrap_or((0, 0));
-            let (rate_50, rate_80) = rates;
+            let rates = declared_rates(spec.profile, w, q)
+                .ok_or_else(|| format!("no declared rates for workers {w} QoS {q}"))?;
 
             // Latency configurations.
             let mut lat_specs: Vec<RunSpec> = Vec::new();
             for &server in &servers {
-                for &pct in &LATENCY_FRACTIONS_PCT {
-                    let rate = if pct == 50 { rate_50 } else { rate_80 };
+                for rate in rates.both() {
                     let mut s = RunSpec {
                         profile: spec.profile,
                         server,
                         workers: w,
                         qos: Some(q),
                         kind: RunKind::Latency,
-                        rate_fraction_pct: Some(pct),
                         offered_rate: Some(rate),
                         repetition: 0,
                         attempt: 1,
@@ -1025,8 +1098,7 @@ pub fn run_matrix_with<F: FnMut(&RunSpec) -> RunRecord>(
                         workers: w,
                         qos: Some(q),
                         kind: RunKind::Counted,
-                        rate_fraction_pct: Some(SYSCALL_FRACTION_PCT),
-                        offered_rate: Some(rate_80),
+                        offered_rate: Some(rates.higher),
                         repetition: 0,
                         attempt: 1,
                     };
@@ -1037,17 +1109,74 @@ pub fn run_matrix_with<F: FnMut(&RunSpec) -> RunRecord>(
                     }
                 }
             }
-            let lat_outcome = run_configs(
-                &lat_specs,
-                &remaining,
-                &constants,
-                &spec.out_dir,
-                &host.scratch_dir,
-                &host.cancel,
-                &mut run,
-            )?;
+            // Spec §9.1 Latency outcomes, recorded profile: an exhausted
+            // configuration stops the session unless every failed repetition
+            // hit a capacity row, which publishes it "not sustained at R".
+            let stop_on_exhaustion = |key: ConfigKey| -> Result<Option<String>, String> {
+                let runs: Vec<RunRecord> = read_records(&spec.out_dir)?
+                    .into_iter()
+                    .filter(|r| r.key() == key)
+                    .collect();
+                Ok(match open_loop_outcome(&runs, &constants) {
+                    OpenLoopOutcome::Exhausted(cause) => Some(format!("{key:?}: {cause}")),
+                    OpenLoopOutcome::Passed
+                    | OpenLoopOutcome::Pending
+                    | OpenLoopOutcome::NotSustained(_) => None,
+                })
+            };
+            let lat_outcome = if spec.profile == Profile::Recorded {
+                run_configs_with_stop(
+                    &lat_specs,
+                    &remaining,
+                    &constants,
+                    &spec.out_dir,
+                    &host.scratch_dir,
+                    &host.cancel,
+                    &mut run,
+                    stop_on_exhaustion,
+                )?
+            } else {
+                run_configs(
+                    &lat_specs,
+                    &remaining,
+                    &constants,
+                    &spec.out_dir,
+                    &host.scratch_dir,
+                    &host.cancel,
+                    &mut run,
+                )?
+            };
             outcome.passed.extend(lat_outcome.passed);
-            outcome.failed.extend(lat_outcome.failed);
+            if spec.profile == Profile::Recorded {
+                // A configuration not sustained in this stage is a published
+                // result even when another one stopped the session; a pending
+                // or exhausted one is reported only when nothing stopped.
+                let records = if lat_outcome.failed.is_empty() {
+                    Vec::new()
+                } else {
+                    read_records(&spec.out_dir)?
+                };
+                for key in lat_outcome.failed {
+                    let runs: Vec<RunRecord> =
+                        records.iter().filter(|r| r.key() == key).cloned().collect();
+                    match open_loop_outcome(&runs, &constants) {
+                        OpenLoopOutcome::NotSustained(rows) => outcome.not_sustained.push((key, rows)),
+                        OpenLoopOutcome::Passed
+                        | OpenLoopOutcome::Pending
+                        | OpenLoopOutcome::Exhausted(_) => {
+                            if lat_outcome.stopped.is_none() {
+                                outcome.failed.push(key);
+                            }
+                        }
+                    }
+                }
+                if let Some(stopped) = lat_outcome.stopped {
+                    outcome.stopped = Some(stopped);
+                    return Ok(outcome);
+                }
+            } else {
+                outcome.failed.extend(lat_outcome.failed);
+            }
         }
 
         if host.cancel.load(Ordering::SeqCst) {
@@ -1062,7 +1191,6 @@ pub fn run_matrix_with<F: FnMut(&RunSpec) -> RunRecord>(
                 workers: w,
                 qos: None,
                 kind: RunKind::Connections,
-                rate_fraction_pct: None,
                 offered_rate: None,
                 repetition: 0,
                 attempt: 1,
@@ -1100,7 +1228,7 @@ fn key_of(spec: &RunSpec) -> ConfigKey {
         workers: spec.workers,
         qos: spec.qos,
         kind: spec.kind,
-        rate_fraction_pct: spec.rate_fraction_pct,
+        offered_rate: spec.offered_rate,
     }
 }
 
@@ -1121,17 +1249,6 @@ fn plan_spec(plan: &HashMap<ConfigKey, ResumeState>, spec: &mut RunSpec) -> bool
     }
 }
 
-/// The records of a passing config's highest attempt. A config passes on
-/// its last attempt, so every earlier attempt was rejected for spread or
-/// validity and must not enter the matched-rate median.
-fn passing_records_for_key(records: &[RunRecord], key: ConfigKey) -> Vec<RunRecord> {
-    let mut runs: Vec<RunRecord> =
-        records.iter().filter(|r| r.key() == key).cloned().collect();
-    let highest = runs.iter().map(|r| r.attempt).max().unwrap_or(0);
-    runs.retain(|r| r.attempt == highest);
-    runs
-}
-
 fn out_dir_has_json(dir: &Path) -> Result<bool, String> {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
@@ -1146,18 +1263,4 @@ fn out_dir_has_json(dir: &Path) -> Result<bool, String> {
         }
     }
     Ok(has_json)
-}
-
-fn merge_records(a: Vec<RunRecord>, b: Vec<RunRecord>) -> Vec<RunRecord> {
-    let mut out = a;
-    for rec in b {
-        let key = (rec.key(), rec.attempt, rec.repetition);
-        if !out
-            .iter()
-            .any(|r| (r.key(), r.attempt, r.repetition) == key)
-        {
-            out.push(rec);
-        }
-    }
-    out
 }

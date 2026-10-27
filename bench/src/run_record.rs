@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::record::{Timeline, Window};
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -31,7 +31,7 @@ pub enum RunKind {
     Throughput,
     Latency,
     Connections,
-    /// The counted run (spec §9.1): open-loop at the matched 80 % rate
+    /// The counted run (spec §9.1): open-loop at the higher declared rate
     /// with the syscall counter attached; it supplies only `syscalls/msg`.
     Counted,
 }
@@ -162,7 +162,7 @@ pub struct ConfigKey {
     pub workers: u32,
     pub qos: Option<u8>,
     pub kind: RunKind,
-    pub rate_fraction_pct: Option<u32>,
+    pub offered_rate: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -173,7 +173,6 @@ pub struct RunRecord {
     pub workers: u32,
     pub qos: Option<u8>,
     pub kind: RunKind,
-    pub rate_fraction_pct: Option<u32>,
     pub offered_rate: Option<u64>,
     pub repetition: u32,
     pub attempt: u32,
@@ -245,27 +244,27 @@ impl RunRecord {
             workers: self.workers,
             qos: self.qos,
             kind: self.kind,
-            rate_fraction_pct: self.rate_fraction_pct,
+            offered_rate: self.offered_rate,
         }
     }
 
     /// File naming convention used by `bench run` and `bench doc`:
-    /// `<server>-w<W>[-q<Q>]-<kind>[-p<pct>]-a<attempt>-r<rep>.json`,
+    /// `<server>-w<W>[-q<Q>]-<kind>[-at<offered_rate>]-a<attempt>-r<rep>.json`,
     /// all names lowercased.
     pub fn file_name(&self) -> String {
         let q = self
             .qos
             .map_or_else(String::new, |n| format!("-q{n}"));
-        let p = self
-            .rate_fraction_pct
-            .map_or_else(String::new, |pct| format!("-p{pct}"));
+        let rate = self
+            .offered_rate
+            .map_or_else(String::new, |r| format!("-at{r}"));
         format!(
             "{}-w{}{}-{}{}-a{}-r{}.json",
             server_lower(self.server),
             self.workers,
             q,
             kind_lower(self.kind),
-            p,
+            rate,
             self.attempt,
             self.repetition,
         )

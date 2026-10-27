@@ -76,7 +76,6 @@ fn smoke_throughput_record(repetition: u32) -> RunRecord {
         workers: 1,
         qos: Some(1),
         kind: RunKind::Throughput,
-        rate_fraction_pct: None,
         offered_rate: None,
         repetition,
         attempt: 1,

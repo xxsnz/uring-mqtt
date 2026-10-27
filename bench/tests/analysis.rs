@@ -1,6 +1,6 @@
 //! Public-seam tests for `bench::analysis` (task 8 of the
-//! benchmark-harness feature): derived metrics, the 30-row reconciliation
-//! table, recomputation, percentile/spread/matched_rates, perf/strace
+//! benchmark-harness feature): derived metrics, the 31-row reconciliation
+//! table, recomputation, percentile/spread, perf/strace
 //! parsing, driver-fd counting, interleave ordering, and CPU percent
 //! arithmetic (AC-27..AC-34, AC-48, AC-55, AC-56, AC-61).
 
@@ -9,13 +9,14 @@ use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 
 use bench::analysis::{
-    config_failure, config_passes, count_driver_fds, cpu_count, cpu_percent, derive, interleave,
-    matched_rates, median, metric, parse_cpu_pressure_some_total, parse_perf_count,
-    parse_strace_total, percentile, reconcile, recompute,
-    spread, GENERATOR_LATENESS_FRACTION, SYSCALL_FRACTION_PCT,
+    capacity_rows, config_failure, config_passes, count_driver_fds, cpu_count, cpu_percent, derive,
+    interleave, median, metric, open_loop_outcome, parse_cpu_pressure_some_total, parse_perf_count,
+    parse_strace_total, percentile, reconcile, recompute, spread, CapacityRow, OpenLoopOutcome,
+    GENERATOR_LATENESS_FRACTION,
 };
 use bench::gen::slot_counts;
 use bench::record::{Timeline, Window, LATENCY_BUCKET_MAX_NS};
+use bench::runner::ProtocolConstants;
 use bench::run_record::{
     Build, ConfigKey, CounterExit, Counts, CpuSets, CpuUsage, DriverFds, Env, GeneratorErrors,
     HostCpuPressure, LatencySummary, Profile, RunKind, RunRecord, ServerKind, SyscallMethod,
@@ -123,10 +124,10 @@ fn baseline_record(kind: RunKind, server: ServerKind) -> RunRecord {
     } else {
         (None, None)
     };
-    let (qos, rate_fraction_pct, offered_rate) = match kind {
-        RunKind::Connections => (None, None, None),
-        RunKind::Throughput => (Some(1u8), None, None),
-        RunKind::Latency | RunKind::Counted => (Some(1u8), Some(SYSCALL_FRACTION_PCT), Some(200)),
+    let (qos, offered_rate) = match kind {
+        RunKind::Connections => (None, None),
+        RunKind::Throughput => (Some(1u8), None),
+        RunKind::Latency | RunKind::Counted => (Some(1u8), Some(200)),
     };
     let (syscalls_method, syscalls_count, syscalls_raw, syscalls_per_msg) = if kind == RunKind::Counted
     {
@@ -158,7 +159,6 @@ fn baseline_record(kind: RunKind, server: ServerKind) -> RunRecord {
         workers: 1,
         qos,
         kind,
-        rate_fraction_pct,
         offered_rate,
         repetition: 1,
         attempt: 1,
@@ -264,7 +264,7 @@ fn counted_run_record() -> RunRecord {
 #[test]
 fn a_counted_run_record_is_named_by_its_kind() {
     let record = counted_run_record();
-    assert_eq!(record.file_name(), "uring-w1-q1-counted-p80-a1-r1.json");
+    assert_eq!(record.file_name(), "uring-w1-q1-counted-at200-a1-r1.json");
 }
 
 #[test]
@@ -311,7 +311,7 @@ fn metric_reads_syscalls_per_message_for_a_counted_run() {
 }
 
 #[test]
-#[allow(clippy::too_many_lines)] // exercises every row of the 30-row reconciliation table in one place
+#[allow(clippy::too_many_lines)] // exercises the reconciliation table in one place
 fn reconcile_reports_one_reason_per_violated_rule() {
     // Each case: (label, kind, mutator, expected reason)
     type Mutator = Box<dyn Fn(&mut RunRecord)>;
@@ -569,18 +569,21 @@ fn reconcile_reports_one_reason_per_violated_rule() {
             Box::new(|r| r.timeline.counts[0] += 1),
             "timeline deliveries 701 != delivered 700".to_string(),
         ),
-        // Row 30 — counted syscall run: the window must hold deliveries. Both
-        // warm-up bins carry the whole run's 1398 deliveries, so row 29 still
-        // sees the stored `delivered` and only row 30 fires.
+        // Row 31 — open-loop: steady state. Moving 13 deliveries from the last
+        // window bin to the first warm-up bin keeps row 29's total and leaves
+        // 987 deliveries against 998 window slots: 11 slots, 55 ms at 200/s.
         (
-            "row 30",
-            RunKind::Counted,
-            Box::new(|r| r.timeline.counts = vec![700, 698, 0, 0, 0, 0, 0]),
-            "no deliveries in the window to divide the syscall count by".to_string(),
+            "row 31",
+            RunKind::Latency,
+            Box::new(|r| {
+                r.timeline.counts[6] -= 13;
+                r.timeline.counts[0] += 13;
+            }),
+            "backlog grew by 11 slots through the window (55.0 ms at the offered rate), above the 50 ms steady-state limit".to_string(),
         ),
     ];
 
-    assert_eq!(cases.len(), 30, "the table must hold exactly 30 rows");
+    assert_eq!(cases.len(), 30, "the table holds one case per row; row 30 has its own test");
 
     for (label, kind, mutate, expected) in cases {
         let mut rec = valid_record(kind);
@@ -597,6 +600,47 @@ fn reconcile_reports_one_reason_per_violated_rule() {
 #[test]
 fn reconcile_accepts_a_valid_counted_run() {
     assert_eq!(reconcile(&valid_record(RunKind::Counted)), Vec::<String>::new());
+}
+
+#[test]
+fn reconcile_reports_an_empty_counted_window_on_its_count_and_steady_state_rows() {
+    // Both warm-up bins carry the run's 1398 deliveries: row 30 has no
+    // denominator and row 31 sees all 998 window slots undelivered in the
+    // window — 4990 ms at 200/s.
+    let mut rec = valid_record(RunKind::Counted);
+    rec.timeline.counts = vec![700, 698, 0, 0, 0, 0, 0];
+    assert_eq!(
+        reconcile(&rec),
+        vec![
+            "no deliveries in the window to divide the syscall count by".to_string(),
+            "backlog grew by 998 slots through the window (4990.0 ms at the offered rate), above the 50 ms steady-state limit".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn reconcile_accepts_a_backlog_at_the_steady_state_limit() {
+    // 12 deliveries moved out of the window: 10 slots of growth, exactly
+    // 50 ms at 200/s, which is not above the limit.
+    let mut rec = valid_record(RunKind::Latency);
+    rec.timeline.counts[6] -= 12;
+    rec.timeline.counts[0] += 12;
+    assert_eq!(reconcile(&rec), Vec::<String>::new());
+}
+
+#[test]
+fn reconcile_measures_no_backlog_growth_without_an_offered_rate() {
+    // 13 deliveries moved out of the window: 11 slots of growth, which
+    // row 31 reports at 200/s. Without a rate there is no time to read
+    // the growth as, so row 27 reports the record on its own.
+    let mut rec = valid_record(RunKind::Latency);
+    rec.offered_rate = None;
+    rec.timeline.counts[6] -= 13;
+    rec.timeline.counts[0] += 13;
+    assert_eq!(
+        reconcile(&rec),
+        vec!["no offered rate for a latency run".to_string()]
+    );
 }
 
 #[test]
@@ -704,6 +748,17 @@ fn reconcile_applies_every_open_loop_row_to_a_counted_run() {
             "row 27",
             Box::new(|r| r.offered_rate = Some(201)),
             "scheduled counts inconsistent with rate Some(201)".to_string(),
+        ),
+        // Row 31 — steady state. Moving 13 deliveries from the last window
+        // bin to the first warm-up bin keeps row 29's total and leaves 987
+        // deliveries against 998 window slots: 11 slots, 55 ms at 200/s.
+        (
+            "row 31",
+            Box::new(|r| {
+                r.timeline.counts[6] -= 13;
+                r.timeline.counts[0] += 13;
+            }),
+            "backlog grew by 11 slots through the window (55.0 ms at the offered rate), above the 50 ms steady-state limit".to_string(),
         ),
     ];
 
@@ -867,15 +922,6 @@ fn spread_is_range_over_median() {
     assert_eq!(spread(&loose_values), Some(0.15));
     let tight_values = vec![100.0, 101.0, 99.0, 102.0, 100.0];
     assert_eq!(spread(&tight_values), Some(0.03));
-}
-
-#[test]
-fn matched_rates_follow_the_slowest_competitor() {
-    let competitors = vec![400_000.0, 250_000.0, 300_000.0];
-    assert_eq!(matched_rates(&competitors), Some((125_000, 200_000)));
-    // No competitor median: a latency row has no rate to pace at, and
-    // `(0, 0)` would pace it at no rate at all.
-    assert_eq!(matched_rates(&[]), None);
 }
 
 #[test]
@@ -1708,7 +1754,7 @@ fn derive_matches_stored_fields_for_a_valid_latency_record() {
             workers: rec.workers,
             qos: rec.qos,
             kind: rec.kind,
-            rate_fraction_pct: rec.rate_fraction_pct,
+            offered_rate: rec.offered_rate,
         }
     );
 }
@@ -1973,4 +2019,274 @@ fn host_cpu_pressure_does_not_change_the_reconciliation_verdict() {
     let after = reconcile(&invalid);
     assert_eq!(before, after);
     assert!(!before.is_empty(), "duplicates=2 must surface as a reconciliation reason");
+}
+
+/// The five repetitions of one attempt of the uring 1-worker QoS 1 `kind`
+/// configuration. `fail` mutates the listed repetitions; every record's
+/// stored verdict is then the one `reconcile` reports for it.
+#[allow(clippy::type_complexity)] // the fail list mixes a repetition number and a mutator on purpose
+fn open_loop_attempt(kind: RunKind, attempt: u32, fail: &[(u32, fn(&mut RunRecord))]) -> Vec<RunRecord> {
+    (1..=5u32)
+        .map(|rep| {
+            let mut r = valid_record(kind);
+            r.attempt = attempt;
+            r.repetition = rep;
+            for (target, mutate) in fail {
+                if *target == rep {
+                    mutate(&mut r);
+                }
+            }
+            r.invalid_reasons = reconcile(&r);
+            r.valid = r.invalid_reasons.is_empty();
+            r
+        })
+        .collect()
+}
+
+fn miss_slots(r: &mut RunRecord) {
+    r.generator_errors.missed_slots = 5;
+}
+
+fn leave_unresolved(r: &mut RunRecord) {
+    r.counts.unresolved = 3;
+}
+
+fn grow_backlog(r: &mut RunRecord) {
+    r.timeline.counts[6] -= 13;
+    r.timeline.counts[0] += 13;
+}
+
+fn stall(r: &mut RunRecord) {
+    r.generator_errors.stalled = 3;
+}
+
+fn cancel(r: &mut RunRecord) {
+    r.cancelled = true;
+}
+
+/// A counted repetition that misses slots under strace.
+fn miss_slots_under_strace(r: &mut RunRecord) {
+    r.generator_errors.missed_slots = 5;
+    r.syscalls.method = SyscallMethod::Strace;
+}
+
+/// A counted repetition that misses slots and whose counter exited 1.
+fn miss_slots_and_fail_counter(r: &mut RunRecord) {
+    r.generator_errors.missed_slots = 5;
+    r.syscalls.exit = Some(CounterExit::Code(1));
+}
+
+/// A counted repetition that misses slots and carries no counter count.
+fn miss_slots_and_lose_counter_count(r: &mut RunRecord) {
+    r.generator_errors.missed_slots = 5;
+    r.syscalls.count = None;
+    r.syscalls.per_msg = None;
+}
+
+/// A counted repetition that misses slots and whose counter enabled one
+/// nanosecond past the tolerance.
+fn miss_slots_and_shift_counter_boundary(r: &mut RunRecord) {
+    r.generator_errors.missed_slots = 5;
+    r.syscalls.enabled_ns = Some(WINDOW_START_NS + COUNTER_BOUNDARY_TOLERANCE_NS + 1);
+}
+
+/// A valid repetition whose p99 is twice the others': spread 1.0.
+fn slow_tail(r: &mut RunRecord) {
+    r.latency_ns = Some(LatencySummary {
+        p50: 40_000,
+        p99: 160_000,
+        max: 160_000,
+        histogram: vec![(40_000, 987), (160_000, 11)],
+    });
+}
+
+#[test]
+fn capacity_rows_name_every_capacity_row_a_record_fails() {
+    let record = valid_record(RunKind::Latency);
+    assert_eq!(capacity_rows(&record), vec![]);
+
+    let mut missed = record.clone();
+    miss_slots(&mut missed);
+    assert_eq!(capacity_rows(&missed), vec![CapacityRow::MissedSlots]);
+
+    let mut unresolved = record.clone();
+    leave_unresolved(&mut unresolved);
+    assert_eq!(capacity_rows(&unresolved), vec![CapacityRow::Unresolved]);
+
+    let mut backlog = record.clone();
+    grow_backlog(&mut backlog);
+    assert_eq!(capacity_rows(&backlog), vec![CapacityRow::SteadyState]);
+
+    let mut all = record.clone();
+    miss_slots(&mut all);
+    leave_unresolved(&mut all);
+    grow_backlog(&mut all);
+    assert_eq!(
+        capacity_rows(&all),
+        vec![
+            CapacityRow::Unresolved,
+            CapacityRow::MissedSlots,
+            CapacityRow::SteadyState,
+        ]
+    );
+
+    let mut stalled = record.clone();
+    stall(&mut stalled);
+    assert_eq!(capacity_rows(&stalled), vec![]);
+
+    let mut throughput = valid_record(RunKind::Throughput);
+    throughput.counts.unresolved = 3;
+    assert_eq!(capacity_rows(&throughput), vec![]);
+
+    assert_eq!(
+        [CapacityRow::Unresolved, CapacityRow::MissedSlots, CapacityRow::SteadyState]
+            .map(CapacityRow::label),
+        ["unresolved", "missed slots", "steady state"]
+    );
+}
+
+#[test]
+fn open_loop_outcome_passes_a_configuration_whose_highest_attempt_passes() {
+    let constants = ProtocolConstants::for_profile(Profile::Recorded);
+    let mut runs = open_loop_attempt(RunKind::Latency, 1, &[(2, miss_slots)]);
+    runs.extend(open_loop_attempt(RunKind::Latency, 2, &[]));
+    assert_eq!(open_loop_outcome(&runs, &constants), OpenLoopOutcome::Passed);
+}
+
+#[test]
+fn open_loop_outcome_is_pending_while_attempts_remain() {
+    let constants = ProtocolConstants::for_profile(Profile::Recorded);
+    let mut runs = open_loop_attempt(RunKind::Latency, 1, &[(1, miss_slots)]);
+    runs.extend(open_loop_attempt(RunKind::Latency, 2, &[(1, miss_slots)]));
+    assert_eq!(open_loop_outcome(&runs, &constants), OpenLoopOutcome::Pending);
+}
+
+#[test]
+fn open_loop_outcome_does_not_count_an_interrupted_attempt() {
+    let constants = ProtocolConstants::for_profile(Profile::Recorded);
+    let mut runs = open_loop_attempt(RunKind::Latency, 1, &[(1, miss_slots)]);
+    runs.extend(open_loop_attempt(RunKind::Latency, 2, &[(1, miss_slots)]));
+    runs.extend(open_loop_attempt(
+        RunKind::Latency,
+        3,
+        &[(1, miss_slots), (2, cancel)],
+    ));
+    assert_eq!(open_loop_outcome(&runs, &constants), OpenLoopOutcome::Pending);
+}
+
+#[test]
+fn open_loop_outcome_publishes_a_configuration_failing_only_capacity_rows_as_not_sustained() {
+    let constants = ProtocolConstants::for_profile(Profile::Recorded);
+    let mut runs = open_loop_attempt(RunKind::Latency, 1, &[(1, miss_slots)]);
+    runs.extend(open_loop_attempt(RunKind::Latency, 2, &[(3, leave_unresolved)]));
+    runs.extend(open_loop_attempt(
+        RunKind::Latency,
+        3,
+        &[(2, grow_backlog), (5, miss_slots)],
+    ));
+    assert_eq!(
+        open_loop_outcome(&runs, &constants),
+        OpenLoopOutcome::NotSustained(vec![
+            CapacityRow::Unresolved,
+            CapacityRow::MissedSlots,
+            CapacityRow::SteadyState,
+        ])
+    );
+}
+
+#[test]
+fn open_loop_outcome_stops_on_a_repetition_that_fails_no_capacity_row() {
+    let constants = ProtocolConstants::for_profile(Profile::Recorded);
+    let mut runs = open_loop_attempt(RunKind::Latency, 1, &[(1, miss_slots)]);
+    runs.extend(open_loop_attempt(RunKind::Latency, 2, &[(4, stall)]));
+    runs.extend(open_loop_attempt(RunKind::Latency, 3, &[(1, miss_slots)]));
+    assert_eq!(
+        open_loop_outcome(&runs, &constants),
+        OpenLoopOutcome::Exhausted(
+            "attempt 2: repetition 4 is invalid on no capacity row: stalled 3 (publishes whose write did not complete or whose PUBACK never arrived, plus connection tasks still running at the hard deadline)"
+                .to_string()
+        )
+    );
+}
+
+#[test]
+fn open_loop_outcome_stops_on_an_attempt_that_failed_only_its_spread() {
+    let constants = ProtocolConstants::for_profile(Profile::Recorded);
+    let mut runs = open_loop_attempt(RunKind::Latency, 1, &[(1, miss_slots)]);
+    runs.extend(open_loop_attempt(RunKind::Latency, 2, &[(1, miss_slots)]));
+    runs.extend(open_loop_attempt(RunKind::Latency, 3, &[(5, slow_tail)]));
+    assert_eq!(
+        open_loop_outcome(&runs, &constants),
+        OpenLoopOutcome::Exhausted("attempt 3: spread 1.0000 is above the 0.1 limit".to_string())
+    );
+}
+
+#[test]
+fn open_loop_outcome_stops_a_strace_counted_configuration_on_any_exhaustion() {
+    let constants = ProtocolConstants::for_profile(Profile::Recorded);
+    let mut runs = open_loop_attempt(RunKind::Counted, 1, &[(1, miss_slots_under_strace)]);
+    runs.extend(open_loop_attempt(RunKind::Counted, 2, &[(1, miss_slots_under_strace)]));
+    runs.extend(open_loop_attempt(RunKind::Counted, 3, &[(1, miss_slots_under_strace)]));
+    assert_eq!(
+        open_loop_outcome(&runs, &constants),
+        OpenLoopOutcome::Exhausted(
+            "strace counted run spent its 3 attempts; record a fresh dataset counted with perf"
+                .to_string()
+        )
+    );
+}
+
+#[test]
+fn open_loop_outcome_stops_on_a_counter_failure_beside_a_capacity_row() {
+    let constants = ProtocolConstants::for_profile(Profile::Recorded);
+    let mut runs = open_loop_attempt(RunKind::Counted, 1, &[(1, miss_slots_and_fail_counter)]);
+    runs.extend(open_loop_attempt(RunKind::Counted, 2, &[(1, miss_slots_and_fail_counter)]));
+    runs.extend(open_loop_attempt(RunKind::Counted, 3, &[(1, miss_slots_and_fail_counter)]));
+    assert_eq!(
+        open_loop_outcome(&runs, &constants),
+        OpenLoopOutcome::Exhausted(
+            "attempt 1: repetition 1 failed the syscall counter: missed slots 5; syscall counter ended with Some(Code(1))"
+                .to_string()
+        )
+    );
+}
+
+#[test]
+fn open_loop_outcome_stops_on_a_missing_counter_count_beside_a_capacity_row() {
+    let constants = ProtocolConstants::for_profile(Profile::Recorded);
+    let mut runs = open_loop_attempt(RunKind::Counted, 1, &[(1, miss_slots_and_lose_counter_count)]);
+    runs.extend(open_loop_attempt(RunKind::Counted, 2, &[(1, miss_slots_and_lose_counter_count)]));
+    runs.extend(open_loop_attempt(RunKind::Counted, 3, &[(1, miss_slots_and_lose_counter_count)]));
+    assert_eq!(
+        open_loop_outcome(&runs, &constants),
+        OpenLoopOutcome::Exhausted(
+            "attempt 1: repetition 1 failed the syscall counter: missed slots 5; syscall count missing"
+                .to_string()
+        )
+    );
+}
+
+#[test]
+fn open_loop_outcome_stops_on_an_out_of_tolerance_counter_boundary_beside_a_capacity_row() {
+    let constants = ProtocolConstants::for_profile(Profile::Recorded);
+    let mut runs =
+        open_loop_attempt(RunKind::Counted, 1, &[(1, miss_slots_and_shift_counter_boundary)]);
+    runs.extend(open_loop_attempt(
+        RunKind::Counted,
+        2,
+        &[(1, miss_slots_and_shift_counter_boundary)],
+    ));
+    runs.extend(open_loop_attempt(
+        RunKind::Counted,
+        3,
+        &[(1, miss_slots_and_shift_counter_boundary)],
+    ));
+    assert_eq!(
+        open_loop_outcome(&runs, &constants),
+        OpenLoopOutcome::Exhausted(format!(
+            "attempt 1: repetition 1 failed the syscall counter: missed slots 5; counter boundaries outside tolerance: enabled Some({}) disabled Some({})",
+            WINDOW_START_NS + COUNTER_BOUNDARY_TOLERANCE_NS + 1,
+            WINDOW_END_NS
+        ))
+    );
 }

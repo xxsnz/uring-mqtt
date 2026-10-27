@@ -6,7 +6,7 @@
 //! `## Data Model` and `## Interface Contracts`.
 //!
 //! Syscall counting (task 10) is wired here for the counted run
-//! (`RunKind::Counted`, §9.1), open-loop at the matched 80 % rate.
+//! (`RunKind::Counted`, §9.1), open-loop at the row group's higher declared rate.
 //! `run_one` preps perf right after `READY`, spawns strace at
 //! `window.start_ns`, and stops, reaps and finalizes either kind at
 //! `window.end_ns`. The selected [`SyscallMethod`] and the tool paths
@@ -169,13 +169,58 @@ pub const DEFAULT_GENERATOR_CPUS: &str = "8-17";
 /// `HostSetup.cpu_pressure_path` at; a kernel without PSI has no such file.
 pub const HOST_CPU_PRESSURE_PATH: &str = "/proc/pressure/cpu";
 
-/// Latency rates the runner derives from the slowest throughput competitor:
-/// 50 % and 80 % (§9.1).
-pub const LATENCY_FRACTIONS_PCT: [u32; 2] = [50, 80];
+/// The two absolute offered rates of one row group (spec §9.1 "Declared
+/// rates"): every server in the row group runs latency at both and the
+/// counted run at `higher`. `bench/CALIBRATION.md` records how the values
+/// were chosen; changing one needs a fresh calibration and a fresh
+/// recorded dataset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeclaredRates {
+    pub lower: u64,
+    pub higher: u64,
+}
 
-/// Rate fraction the counted run is paced at (§9.1: the matched 80 %
-/// rate).
-pub const SYSCALL_FRACTION_PCT: u32 = 80;
+impl DeclaredRates {
+    /// `[lower, higher]`, the order the open-loop stage dispatches them in.
+    pub fn both(self) -> [u64; 2] {
+        [self.lower, self.higher]
+    }
+}
+
+/// Recorded declared rates, 1 worker, QoS 1 (msgs/s).
+pub const DECLARED_RATES_W1_Q1: DeclaredRates = DeclaredRates { lower: 75_000, higher: 300_000 };
+
+/// Recorded declared rates, 1 worker, QoS 0 (msgs/s).
+pub const DECLARED_RATES_W1_Q0: DeclaredRates = DeclaredRates { lower: 150_000, higher: 400_000 };
+
+/// Recorded declared rates, 4 workers, QoS 1 (msgs/s).
+pub const DECLARED_RATES_W4_Q1: DeclaredRates = DeclaredRates { lower: 900_000, higher: 1_200_000 };
+
+/// Recorded declared rates, 4 workers, QoS 0 (msgs/s).
+pub const DECLARED_RATES_W4_Q0: DeclaredRates = DeclaredRates { lower: 1_300_000, higher: 1_500_000 };
+
+/// Smoke declared rates for every row group (msgs/s): the smoke gate is a
+/// harness-health check on the debug build, not a rehearsal of the
+/// recorded rates (spec §9.1 Smoke gate). Calibrated on the 1-worker
+/// QoS 1 row the smoke gate runs; the other row groups reuse the pair
+/// without their own calibration.
+pub const SMOKE_DECLARED_RATES: DeclaredRates = DeclaredRates { lower: 40_000, higher: 60_000 };
+
+/// The declared rates of one row group. Smoke uses
+/// [`SMOKE_DECLARED_RATES`] for every row group; recorded covers the four
+/// row groups of the §9.1 matrix and returns `None` for any other.
+pub fn declared_rates(profile: Profile, workers: u32, qos: u8) -> Option<DeclaredRates> {
+    match profile {
+        Profile::Smoke => Some(SMOKE_DECLARED_RATES),
+        Profile::Recorded => match (workers, qos) {
+            (1, 1) => Some(DECLARED_RATES_W1_Q1),
+            (1, 0) => Some(DECLARED_RATES_W1_Q0),
+            (4, 1) => Some(DECLARED_RATES_W4_Q1),
+            (4, 0) => Some(DECLARED_RATES_W4_Q0),
+            _ => None,
+        },
+    }
+}
 
 /// One second in nanoseconds, used to round origin / window boundaries.
 const ONE_SECOND_NS: u64 = 1_000_000_000;
@@ -294,7 +339,6 @@ pub struct RunSpec {
     pub workers: u32,
     pub qos: Option<u8>,
     pub kind: RunKind,
-    pub rate_fraction_pct: Option<u32>,
     pub offered_rate: Option<u64>,
     pub repetition: u32,
     pub attempt: u32,
@@ -1282,7 +1326,6 @@ fn build_minimal_record(spec: &RunSpec) -> RunRecord {
         workers: spec.workers,
         qos: spec.qos,
         kind: spec.kind,
-        rate_fraction_pct: spec.rate_fraction_pct,
         offered_rate: spec.offered_rate,
         repetition: spec.repetition,
         attempt: spec.attempt,
@@ -1842,7 +1885,7 @@ enum CounterKind {
     Strace,
 }
 
-/// Live state of the perf/strace counter for one 80 % latency run. The
+/// Live state of the perf/strace counter for one counted run. The
 /// counter measures the server's syscalls over the measurement window —
 /// perf is the primary tool and drives the `--control=fifo:` protocol,
 /// strace is the fallback whose stderr line "attached" is the only
@@ -3373,7 +3416,6 @@ fn finalize_record(
         workers: spec.workers,
         qos: spec.qos,
         kind: spec.kind,
-        rate_fraction_pct: spec.rate_fraction_pct,
         offered_rate: spec.offered_rate,
         repetition: spec.repetition,
         attempt: spec.attempt,
@@ -3840,7 +3882,6 @@ mod tests {
             workers: 1,
             qos: Some(1),
             kind: RunKind::Throughput,
-            rate_fraction_pct: None,
             offered_rate: None,
             repetition: 1,
             attempt: 1,

@@ -16,9 +16,10 @@ use bench::gen::slot_counts;
 use bench::matrix::{servers_for, RECORDED_QOS, RECORDED_SERVERS, RECORDED_WORKERS};
 use bench::record::{Timeline, Window};
 use bench::run_record::{
-    Build, ConfigKey, CounterExit, Counts, CpuSets, CpuUsage, Env, GeneratorErrors,
+    Build, CounterExit, Counts, CpuSets, CpuUsage, Env, GeneratorErrors,
     LatencySummary, Profile, RunKind, RunRecord, ServerKind, Syscalls, SyscallMethod, SCHEMA_VERSION,
 };
+use bench::runner::{declared_rates, DECLARED_RATES_W1_Q1, SMOKE_DECLARED_RATES};
 
 const WARMUP_SECS: u64 = 10;
 const WINDOW_SECS: u64 = 60;
@@ -32,14 +33,47 @@ const ORIGIN_NS: u64 = 1_700_000_000_000_000_000;
 const WINDOW_START_NS: u64 = ORIGIN_NS + WARMUP_SECS * ONE_SECOND_NS;
 const WINDOW_END_NS: u64 = WINDOW_START_NS + WINDOW_SECS * ONE_SECOND_NS;
 
-const PERF_RAW: &str = "6000,,raw_syscalls:sys_enter,60000000000,100.00,,\n";
-/// `strace -c` summary whose `total` row names the same call count as
-/// [`PERF_RAW`], so swapping a record's method leaves `recompute` happy.
-const STRACE_RAW: &str = "100.00    0.001000           0      6000           total\n";
-const PERF_COUNT: u64 = 6000;
 const THROUGHPUT_RATES: [u64; 5] = [100, 101, 99, 102, 100];
-const LAT_50_HIST: &[(u64, u64)] = &[(40_000, 3000)];
-const LAT_80_HIST: &[(u64, u64)] = &[(80_000, 4800)];
+/// p99 of every latency record at a row group's lower declared rate.
+const LOWER_P99_NS: u64 = 40_000;
+/// p99 of every latency and counted record at the higher declared rate.
+const HIGHER_P99_NS: u64 = 80_000;
+/// A counted record's syscalls per 4 window deliveries: 5, so the table
+/// prints `syscalls/msg` 1.25.
+const SYSCALLS_PER_FOUR_DELIVERIES: u64 = 5;
+const DELIVERIES_PER_SYSCALL_GROUP: u64 = 4;
+
+/// `perf stat` CSV naming `count` raw_syscalls:sys_enter events.
+fn perf_raw(count: u64) -> String {
+    format!("{count},,raw_syscalls:sys_enter,60000000000,100.00,,\n")
+}
+
+/// `strace -c` summary whose `total` row names `count` calls.
+fn strace_raw(count: u64) -> String {
+    format!("100.00    0.001000           0      {count}           total\n")
+}
+
+/// The syscall count that gives a counted record at `rate` 1.25 per
+/// window delivery.
+fn counted_syscalls(rate: u64) -> u64 {
+    rate * WINDOW_SECS * SYSCALLS_PER_FOUR_DELIVERIES / DELIVERIES_PER_SYSCALL_GROUP
+}
+
+/// `true` when `r` is paced at its row group's higher declared rate.
+fn at_higher_rate(r: &RunRecord) -> bool {
+    r.offered_rate
+        == r.qos
+            .and_then(|q| declared_rates(Profile::Recorded, r.workers, q))
+            .map(|d| d.higher)
+}
+
+/// `true` when `r` is paced at its row group's lower declared rate.
+fn at_lower_rate(r: &RunRecord) -> bool {
+    r.offered_rate
+        == r.qos
+            .and_then(|q| declared_rates(Profile::Recorded, r.workers, q))
+            .map(|d| d.lower)
+}
 /// `reconcile` row 12 for `generator_errors.stalled = 3`. `render` calls
 /// `recompute`, which re-derives `invalid_reasons` and compares string for
 /// string, so a fixture that has a stalled count of three must store this text.
@@ -158,7 +192,6 @@ fn throughput_record(server: ServerKind, workers: u32, qos: u8, rep: u32) -> Run
         workers,
         qos: Some(qos),
         kind: RunKind::Throughput,
-        rate_fraction_pct: None,
         offered_rate: None,
         repetition: rep,
         attempt: 1,
@@ -201,26 +234,24 @@ fn throughput_record(server: ServerKind, workers: u32, qos: u8, rep: u32) -> Run
     }
 }
 
-/// Latency record at `pct` (50 or 80) for QoS 1, `connections` evenly split.
+/// Latency record at `rate` msgs/s whose every window slot lands at `p99_ns`.
 #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 fn latency_record(
     server: ServerKind,
     workers: u32,
     qos: u8,
-    pct: u32,
+    rate: u64,
+    p99_ns: u64,
     rep: u32,
 ) -> RunRecord {
-    let (hist, total_window) = if pct == 50 {
-        (LAT_50_HIST.to_vec(), 3000u64)
-    } else {
-        (LAT_80_HIST.to_vec(), 4800u64)
-    };
-    let rate = if pct == 50 { 50u64 } else { 80u64 };
     let (scheduled, window_scheduled) = slot_counts(rate, ORIGIN_NS, window_obj());
-    let total_scheduled = scheduled;
-    // Timeline = uniform `rate` per second across warmup + window seconds.
-    let timeline_counts = vec![rate; usize::try_from(WARMUP_SECS + WINDOW_SECS).expect("fits")];
-    let delivered = total_scheduled;
+    // Timeline = uniform `rate` per second across warmup + window seconds;
+    // the slot grid ends shortly before the window's end, so the shortfall
+    // sits in the warm-up bin and the window itself holds exactly
+    // `rate * WINDOW_SECS` deliveries.
+    let mut timeline_counts = vec![rate; usize::try_from(WARMUP_SECS + WINDOW_SECS).expect("fits")];
+    timeline_counts[0] -= rate * (WARMUP_SECS + WINDOW_SECS) - scheduled;
+    let delivered = scheduled;
     let syscalls = base_syscalls();
     let driver = match server {
         ServerKind::Uring => Some(bench::run_record::DriverFds {
@@ -240,7 +271,6 @@ fn latency_record(
         workers,
         qos: Some(qos),
         kind: RunKind::Latency,
-        rate_fraction_pct: Some(pct),
         offered_rate: Some(rate),
         repetition: rep,
         attempt: 1,
@@ -269,12 +299,12 @@ fn latency_record(
         throughput_msgs_per_sec: None,
         last10s_msgs_per_sec: None,
         latency_ns: Some(LatencySummary {
-            p50: hist[0].0,
-            p99: hist[0].0,
-            max: hist[0].0,
-            histogram: hist,
+            p50: p99_ns,
+            p99: p99_ns,
+            max: p99_ns,
+            histogram: vec![(p99_ns, window_scheduled)],
         }),
-        lateness: vec![(1000, total_window)],
+        lateness: vec![(1000, window_scheduled)],
         lateness_p99_ns: Some(1000),
         last_write_start_ns: Some(WINDOW_END_NS - 1),
         connections_per_sec: None,
@@ -293,17 +323,17 @@ fn latency_record(
     }
 }
 
-/// Counted run (§9.1): paced like the 80 % latency record, but under its
-/// own `RunKind::Counted` with the syscall-counter evidence the 80 %
-/// latency record used to carry.
-fn counted_record(server: ServerKind, workers: u32, qos: u8, rep: u32) -> RunRecord {
-    let mut rec = latency_record(server, workers, qos, 80, rep);
+/// Counted run (§9.1): paced at the row group's higher declared rate,
+/// under its own `RunKind::Counted` with the syscall-counter evidence.
+fn counted_record(server: ServerKind, workers: u32, qos: u8, rate: u64, rep: u32) -> RunRecord {
+    let mut rec = latency_record(server, workers, qos, rate, HIGHER_P99_NS, rep);
     rec.kind = RunKind::Counted;
+    let count = counted_syscalls(rate);
     rec.syscalls = Syscalls {
         method: SyscallMethod::Perf,
-        count: Some(PERF_COUNT),
-        per_msg: Some(PERF_COUNT as f64 / 4800.0),
-        raw: Some(PERF_RAW.to_string()),
+        count: Some(count),
+        per_msg: Some(count as f64 / (rate * WINDOW_SECS) as f64),
+        raw: Some(perf_raw(count)),
         enabled_ns: Some(WINDOW_START_NS),
         disabled_ns: Some(WINDOW_END_NS),
         exit: Some(CounterExit::Signal(2)),
@@ -334,7 +364,6 @@ fn connections_record(server: ServerKind, workers: u32, rep: u32) -> RunRecord {
         workers,
         qos: None,
         kind: RunKind::Connections,
-        rate_fraction_pct: None,
         offered_rate: None,
         repetition: rep,
         attempt: 1,
@@ -379,12 +408,13 @@ fn full_recorded_set() -> Vec<RunRecord> {
     for w in RECORDED_WORKERS {
         let servers = servers_for(w, &RECORDED_SERVERS);
         for q in RECORDED_QOS {
+            let rates = declared_rates(Profile::Recorded, w, q).expect("recorded row group");
             for &s in &servers {
                 for rep in 1..=REPETITIONS {
                     out.push(throughput_record(s, w, q, rep));
-                    out.push(latency_record(s, w, q, 50, rep));
-                    out.push(latency_record(s, w, q, 80, rep));
-                    out.push(counted_record(s, w, q, rep));
+                    out.push(latency_record(s, w, q, rates.lower, LOWER_P99_NS, rep));
+                    out.push(latency_record(s, w, q, rates.higher, HIGHER_P99_NS, rep));
+                    out.push(counted_record(s, w, q, rates.higher, rep));
                 }
             }
         }
@@ -397,50 +427,59 @@ fn full_recorded_set() -> Vec<RunRecord> {
     out
 }
 
-fn expected_configs() -> Vec<ConfigKey> {
-    let mut out = Vec::new();
-    for w in RECORDED_WORKERS {
-        let servers = servers_for(w, &RECORDED_SERVERS);
-        for q in RECORDED_QOS {
-            for &s in &servers {
-                for kind in [RunKind::Throughput, RunKind::Latency] {
-                    let pct = if kind == RunKind::Throughput { None } else { Some(50u32) };
-                    out.push(ConfigKey {
-                        server: s,
-                        workers: w,
-                        qos: Some(q),
-                        kind,
-                        rate_fraction_pct: pct,
-                    });
-                    let pct = if kind == RunKind::Throughput { None } else { Some(80u32) };
-                    out.push(ConfigKey {
-                        server: s,
-                        workers: w,
-                        qos: Some(q),
-                        kind,
-                        rate_fraction_pct: pct,
-                    });
-                }
-                out.push(ConfigKey {
-                    server: s,
-                    workers: w,
-                    qos: Some(q),
-                    kind: RunKind::Counted,
-                    rate_fraction_pct: Some(80u32),
-                });
+/// The mosquitto label of a results row: the `## Results` tables name
+/// the endpoint the mosquitto figures measure.
+const MOSQUITTO_RESULTS_LABEL: &str = "mosquitto (endpoint = subscriber receipt)";
+
+/// Every table a recorded document publishes, named independently of
+/// the production matrix: its heading and the server rows it must hold,
+/// in order.
+const PUBLISHED_TABLES: [(&str, &[&str]); 6] = [
+    ("## Results — 1 worker(s), QoS 1", &["uring", "tokio", MOSQUITTO_RESULTS_LABEL]),
+    ("## Results — 1 worker(s), QoS 0", &["uring", "tokio", MOSQUITTO_RESULTS_LABEL]),
+    ("## Connections per second — 1 worker(s)", &["uring", "tokio", "mosquitto"]),
+    ("## Results — 4 worker(s), QoS 1", &["uring", "tokio"]),
+    ("## Results — 4 worker(s), QoS 0", &["uring", "tokio"]),
+    ("## Connections per second — 4 worker(s)", &["uring", "tokio"]),
+];
+
+/// The server names of `heading`'s table rows, in document order:
+/// every `|`-prefixed line of the section that is neither its column
+/// header nor its divider.
+fn table_row_servers(doc: &str, heading: &str) -> Vec<String> {
+    let section = doc
+        .split(heading)
+        .nth(1)
+        .unwrap_or_else(|| panic!("document is missing {heading} in:\n{doc}"))
+        .split("\n## ")
+        .next()
+        .unwrap();
+    section
+        .lines()
+        .filter(|l| l.starts_with("| ") && !l.starts_with("| Server |"))
+        .map(|l| l.split('|').nth(1).unwrap_or_default().trim().to_string())
+        .collect()
+}
+
+/// Replaces the 5 records of one open-loop configuration with three
+/// complete attempts whose repetition 1 misses 5 slots, each verdict
+/// recomputed: a configuration not sustained on the missed-slots row.
+fn make_not_sustained(records: &mut Vec<RunRecord>, matches: impl Fn(&RunRecord) -> bool) {
+    let template: Vec<RunRecord> = records.iter().filter(|r| matches(r)).cloned().collect();
+    assert_eq!(template.len(), usize::try_from(REPETITIONS).expect("fits"));
+    records.retain(|r| !matches(r));
+    for attempt in 1..=3u32 {
+        for r in &template {
+            let mut r = r.clone();
+            r.attempt = attempt;
+            if r.repetition == 1 {
+                r.generator_errors.missed_slots = 5;
+                r.invalid_reasons = bench::analysis::reconcile(&r);
+                r.valid = r.invalid_reasons.is_empty();
             }
-        }
-        for &s in &servers {
-            out.push(ConfigKey {
-                server: s,
-                workers: w,
-                qos: None,
-                kind: RunKind::Connections,
-                rate_fraction_pct: None,
-            });
+            records.push(r);
         }
     }
-    out
 }
 
 #[test]
@@ -646,7 +685,8 @@ fn render_refuses_mixed_syscall_counter_methods() {
         .find(|r| r.kind == RunKind::Counted)
         .expect("a counted record");
     target.syscalls.method = SyscallMethod::Strace;
-    target.syscalls.raw = Some(STRACE_RAW.to_string());
+    let c = counted_syscalls(target.offered_rate.expect("a counted record's rate"));
+    target.syscalls.raw = Some(strace_raw(c));
     match render(&records, false) {
         Err(DocError::ProtocolViolation(text)) => {
             assert!(
@@ -660,9 +700,9 @@ fn render_refuses_mixed_syscall_counter_methods() {
 
 #[test]
 fn render_ignores_a_failed_earlier_attempt_of_a_retried_configuration() {
-    // The uring 1-worker QoS 1 80 % configuration failed attempt 1 with a
-    // 160 µs p99 and passed attempt 2 at 80 µs. The row must read the
-    // passing attempt alone, not the median over both.
+    // The uring 1-worker QoS 1 higher-rate configuration failed attempt 1
+    // with a 160 µs p99 and passed attempt 2 at 80 µs. The row must read
+    // the passing attempt alone, not the median over both.
     let mut records = full_recorded_set();
     let mut first_attempt: Vec<RunRecord> = Vec::new();
     for r in &mut records {
@@ -670,14 +710,17 @@ fn render_ignores_a_failed_earlier_attempt_of_a_retried_configuration() {
             && r.workers == 1
             && r.qos == Some(1)
             && r.kind == RunKind::Latency
-            && r.rate_fraction_pct == Some(80)
+            && at_higher_rate(r)
         {
             let mut failed = r.clone();
             failed.latency_ns = Some(LatencySummary {
                 p50: 160_000,
                 p99: 160_000,
                 max: 160_000,
-                histogram: vec![(160_000, 4800)],
+                histogram: vec![(
+                    160_000,
+                    r.counts.window_scheduled.expect("open-loop record"),
+                )],
             });
             failed.generator_errors.stalled = 3;
             failed.valid = false;
@@ -699,7 +742,7 @@ fn render_ignores_a_failed_earlier_attempt_of_a_retried_configuration() {
         "the failed attempt's p99 leaked into the table:\n{doc}"
     );
     assert!(
-        doc.contains("| uring | 100 | 3.0 % | 95.0 | 40.0 | 40.0 | 80.0 | 1.25 | ok |"),
+        doc.contains("| uring | 100 | 3.0 % | 95.0 | 40.0 | 40.0 | 80.0 | 300000 | 1.25 | ok |"),
         "missing the passing attempt's uring row in:\n{doc}"
     );
 }
@@ -809,14 +852,23 @@ fn render_refuses_a_repeated_repetition_number() {
 }
 
 #[test]
-fn render_refuses_a_latency_rate_not_matched_to_throughput() {
-    // One 80% record with offered_rate 81 (and stored fields recomputed
+fn render_refuses_a_latency_record_at_an_undeclared_rate() {
+    // The uring w1 q1 latency record at the higher declared rate, repetition
+    // 1 attempt 1, mutated to offered_rate 81 (and stored fields recomputed
     // consistently: scheduled/window_scheduled derived from rate=81).
     let mut records = full_recorded_set();
     let target = records
         .iter_mut()
-        .find(|r| r.kind == RunKind::Latency && r.rate_fraction_pct == Some(80))
-        .expect("an 80% latency record");
+        .filter(|r| {
+            r.server == ServerKind::Uring
+                && r.workers == 1
+                && r.qos == Some(1)
+                && r.kind == RunKind::Latency
+                && r.repetition == 1
+                && r.attempt == 1
+        })
+        .max_by_key(|r| r.offered_rate)
+        .expect("a uring w1 q1 latency record");
     let rate = 81u64;
     let (scheduled, window_scheduled) = slot_counts(rate, target.origin_ns, target.window);
     target.offered_rate = Some(rate);
@@ -836,39 +888,50 @@ fn render_refuses_a_latency_rate_not_matched_to_throughput() {
     target.lateness = vec![(1000, window_scheduled)];
     match render(&records, false) {
         Err(DocError::ProtocolViolation(text)) => {
-            assert!(text.contains("offered_rate"), "text = {text}");
+            assert_eq!(
+                text,
+                "uring-w1-q1-latency-at81-a1-r1.json: configuration uring-w1-q1-latency-at81 \
+                 is outside the recorded matrix"
+            );
         }
-        other => panic!("expected ProtocolViolation(offered_rate), got {other:?}"),
+        other => panic!("expected ProtocolViolation, got {other:?}"),
     }
 }
 
 #[test]
 fn render_refuses_counter_evidence_on_a_row_the_matrix_does_not_count() {
-    // A 50 % latency record instrumented like the 80 % run: the counter
-    // fields are self-consistent (`parse_perf_count(PERF_RAW)` over this
-    // record's own deliveries), so `recompute` accepts it, but the
-    // runner counts syscalls on the 80 % run only. Its p99 was measured
+    // A lower-rate latency record instrumented like the counted run: the
+    // counter fields are self-consistent (`parse_perf_count` over this
+    // record's own deliveries), so `recompute` accepts it, but the runner
+    // counts syscalls on the counted run only. Its p99 was measured
     // against a traced server and must not be published beside the rest.
     let mut records = full_recorded_set();
     // `derive` divides the count by the timeline's in-window deliveries,
-    // which the fixture paces at the matched rate for every window second.
-    let deliveries = 50 * WINDOW_SECS;
+    // which the fixture paces at its declared rate for every window second.
+    let deliveries = DECLARED_RATES_W1_Q1.lower * WINDOW_SECS;
     let target = records
         .iter_mut()
-        .find(|r| r.kind == RunKind::Latency && r.rate_fraction_pct == Some(50))
-        .expect("a 50% latency record");
+        .find(|r| {
+            r.server == ServerKind::Uring
+                && r.workers == 1
+                && r.qos == Some(1)
+                && r.kind == RunKind::Latency
+                && at_lower_rate(r)
+        })
+        .expect("a lower-rate latency record");
     assert_eq!(
         target
             .timeline
             .sum_secs(target.window.start_sec(), target.window.end_sec()),
         deliveries,
-        "the 50% fixture should pace its whole window"
+        "the lower-rate fixture should pace its whole window"
     );
+    let c = counted_syscalls(DECLARED_RATES_W1_Q1.lower);
     target.syscalls = Syscalls {
         method: SyscallMethod::Perf,
-        count: Some(PERF_COUNT),
-        per_msg: Some(PERF_COUNT as f64 / deliveries as f64),
-        raw: Some(PERF_RAW.to_string()),
+        count: Some(c),
+        per_msg: Some(c as f64 / deliveries as f64),
+        raw: Some(perf_raw(c)),
         enabled_ns: Some(WINDOW_START_NS),
         disabled_ns: Some(WINDOW_END_NS),
         exit: Some(CounterExit::Signal(2)),
@@ -903,19 +966,21 @@ fn render_refuses_counter_evidence_on_a_row_the_matrix_does_not_count() {
         other => panic!("expected ProtocolViolation(counter method), got {other:?}"),
     }
 
-    // (c) an 80 % latency record instrumented like the counted run: a
-    // latency record is never counted now that `RunKind::Counted` is its
+    // (c) a higher-rate latency record instrumented like the counted run:
+    // a latency record is never counted now that `RunKind::Counted` is its
     // own row.
     let mut records = full_recorded_set();
     let target = records
         .iter_mut()
-        .find(|r| r.kind == RunKind::Latency && r.rate_fraction_pct == Some(80))
-        .expect("an 80% latency record");
+        .find(|r| r.kind == RunKind::Latency && at_higher_rate(r))
+        .expect("a higher-rate latency record");
+    let rate = DECLARED_RATES_W1_Q1.higher;
+    let c = counted_syscalls(rate);
     target.syscalls = Syscalls {
         method: SyscallMethod::Perf,
-        count: Some(PERF_COUNT),
-        per_msg: Some(PERF_COUNT as f64 / 4800.0),
-        raw: Some(PERF_RAW.to_string()),
+        count: Some(c),
+        per_msg: Some(c as f64 / (rate * WINDOW_SECS) as f64),
+        raw: Some(perf_raw(c)),
         enabled_ns: Some(WINDOW_START_NS),
         disabled_ns: Some(WINDOW_END_NS),
         exit: Some(CounterExit::Signal(2)),
@@ -970,7 +1035,7 @@ fn render_reports_median_throughput_and_p99_per_server() {
     let records = full_recorded_set();
     let doc = render(&records, false).expect("render ok");
     assert!(
-        doc.contains("| uring | 100 | 3.0 % | 95.0 | 40.0 | 40.0 | 80.0 | 1.25 | ok |"),
+        doc.contains("| uring | 100 | 3.0 % | 95.0 | 40.0 | 40.0 | 80.0 | 300000 | 1.25 | ok |"),
         "missing uring row in:\n{doc}"
     );
 }
@@ -992,7 +1057,10 @@ fn render_marks_every_tokio_driver_proof_not_applicable() {
     let doc = render(&records, false).expect("render ok");
     let tokio_na_count = doc
         .lines()
-        .filter(|l| *l == "| tokio | 100 | 3.0 % | 95.0 | 40.0 | 40.0 | 80.0 | 1.25 | n/a |")
+        .filter(|l| {
+            l.starts_with("| tokio | 100 | 3.0 % | 95.0 | 40.0 | 40.0 | 80.0 | ")
+                && l.ends_with(" | 1.25 | n/a |")
+        })
         .count();
     assert_eq!(
         tokio_na_count, 4,
@@ -1008,7 +1076,10 @@ fn render_marks_every_tokio_driver_proof_not_applicable() {
     );
     let uring_ok_count = doc
         .lines()
-        .filter(|l| *l == "| uring | 100 | 3.0 % | 95.0 | 40.0 | 40.0 | 80.0 | 1.25 | ok |")
+        .filter(|l| {
+            l.starts_with("| uring | 100 | 3.0 % | 95.0 | 40.0 | 40.0 | 80.0 | ")
+                && l.ends_with(" | 1.25 | ok |")
+        })
         .count();
     assert_eq!(
         uring_ok_count, 4,
@@ -1494,11 +1565,12 @@ fn render_discloses_the_epic_strace_bias_for_strace_counts() {
             "fixture already not perf before mutation"
         );
         rec.syscalls.method = SyscallMethod::Strace;
-        rec.syscalls.raw = Some(STRACE_RAW.to_string());
+        let c = counted_syscalls(rec.offered_rate.expect("a counted record's rate"));
+        rec.syscalls.raw = Some(strace_raw(c));
         assert_eq!(rec.syscalls.method, SyscallMethod::Strace, "mutation did not take");
         mutated += 1;
     }
-    assert!(mutated > 0, "no 80% latency records found to mutate");
+    assert!(mutated > 0, "no counted records found to mutate");
 
     let doc = render(&records, false).expect("render ok");
     let expected_strace_line = "| Syscall method | strace (ptrace slows each syscall, which raises completions per `io_uring_enter` and flatters io_uring) |";
@@ -1525,8 +1597,11 @@ fn render_qualifies_every_mosquitto_result_row_with_subscriber_receipt() {
     let records = full_recorded_set();
     let doc = render(&records, false).expect("render ok");
     let expected_row =
-        "| mosquitto (endpoint = subscriber receipt) | 100 | 3.0 % | 95.0 | 40.0 | 40.0 | 80.0 | 1.25 | n/a |";
-    let qualified_count = doc.lines().filter(|l| *l == expected_row).count();
+        "| mosquitto (endpoint = subscriber receipt) | 100 | 3.0 % | 95.0 | 40.0 | 40.0 | 80.0 | ";
+    let qualified_count = doc
+        .lines()
+        .filter(|l| l.starts_with(expected_row) && l.ends_with(" | 1.25 | n/a |"))
+        .count();
     assert_eq!(
         qualified_count, 2,
         "expected 2 qualified mosquitto results rows (one per QoS) in:\n{doc}"
@@ -1563,7 +1638,10 @@ fn render_marks_a_tokio_row_with_no_driver_record_not_applicable() {
     let doc = render(&records, false).expect("render ok");
     let tokio_na_count = doc
         .lines()
-        .filter(|l| *l == "| tokio | 100 | 3.0 % | 95.0 | 40.0 | 40.0 | 80.0 | 1.25 | n/a |")
+        .filter(|l| {
+            l.starts_with("| tokio | 100 | 3.0 % | 95.0 | 40.0 | 40.0 | 80.0 | ")
+                && l.ends_with(" | 1.25 | n/a |")
+        })
         .count();
     assert_eq!(
         tokio_na_count, 4,
@@ -1629,8 +1707,8 @@ fn render_ends_with_the_unticked_sign_off_checklist() {
     let doc = render(&records, false).expect("render ok");
     let expected = [
         "- [ ] Driver proof: every uring run shows io_uring fds = workers and eventpoll fds = 0",
-        "- [ ] Spread: every configuration within 10 % over 5 interleaved repetitions",
-        "- [ ] Reconciliation: every run reconciled (unresolved 0, duplicates 0, dropped 0 in throughput runs)",
+        "- [ ] Spread: every configuration with a published figure within 10 % over 5 interleaved repetitions; a not-sustained cell publishes no figure",
+        "- [ ] Reconciliation: every published repetition reconciled (unresolved 0, duplicates 0, dropped 0 in throughput runs, open-loop backlog growth within 50 ms); failed attempts and not-sustained records stay in the raw JSON",
         "- [ ] Environment: host, kernel, CPU sets, AC power and idle state match this disclosure",
         "- [ ] Saturation: in every throughput row the server CPU set, not the generator, is the saturated side",
     ];
@@ -1736,16 +1814,14 @@ fn render_succeeds_on_the_full_recorded_fixture() {
     assert!(doc.contains("# Benchmarks"));
     assert!(doc.contains("## Environment"));
     assert!(doc.contains("## Method"));
-    // Every expected configuration appears in the document at least once.
-    for key in expected_configs() {
-        let server = match key.server {
-            ServerKind::Uring => "uring",
-            ServerKind::Tokio => "tokio",
-            ServerKind::Mosquitto => "mosquitto",
-        };
-        assert!(
-            doc.contains(server),
-            "document is missing server {server:?} for {key:?}"
+    // Every published table holds exactly its expected server rows, in
+    // order: no row group is missing, and none publishes a server its
+    // row group does not run.
+    for (heading, servers) in PUBLISHED_TABLES {
+        assert_eq!(
+            table_row_servers(&doc, heading),
+            servers,
+            "{heading} does not publish exactly {servers:?} in:\n{doc}"
         );
     }
 }
@@ -1842,10 +1918,10 @@ fn render_refuses_a_failed_earlier_attempt_without_counter_evidence() {
 }
 
 #[test]
-fn render_refuses_a_failed_earlier_attempt_at_an_unmatched_rate() {
-    // The uring 1-worker QoS 1 80 % configuration failed attempt 1 at an
-    // offered rate of 81 — self-consistent, but not the matched rate —
-    // and passed attempt 2 at the matched rate.
+fn render_refuses_a_failed_earlier_attempt_at_an_undeclared_rate() {
+    // The uring 1-worker QoS 1 higher-rate configuration failed attempt 1 at
+    // an offered rate of 81 — self-consistent, but not a declared rate —
+    // and passed attempt 2 at the higher declared rate.
     let mut records = full_recorded_set();
     let rate = 81u64;
     let mut first_attempt: Vec<RunRecord> = Vec::new();
@@ -1854,7 +1930,7 @@ fn render_refuses_a_failed_earlier_attempt_at_an_unmatched_rate() {
             && r.workers == 1
             && r.qos == Some(1)
             && r.kind == RunKind::Latency
-            && r.rate_fraction_pct == Some(80)
+            && at_higher_rate(r)
         {
             let mut failed = r.clone();
             let (scheduled, window_scheduled) =
@@ -1889,9 +1965,12 @@ fn render_refuses_a_failed_earlier_attempt_at_an_unmatched_rate() {
     records.extend(first_attempt);
     match render(&records, false) {
         Err(DocError::ProtocolViolation(text)) => {
-            assert!(text.contains("offered_rate"), "text = {text}");
+            assert!(
+                text.contains("is outside the recorded matrix") && text.contains("latency-at81"),
+                "text = {text}"
+            );
         }
-        other => panic!("expected ProtocolViolation(offered_rate), got {other:?}"),
+        other => panic!("expected ProtocolViolation, got {other:?}"),
     }
 }
 
@@ -1908,8 +1987,8 @@ fn render_refuses_a_recorded_set_missing_its_counted_runs() {
         Err(DocError::FailedConfigurations(names)) => {
             assert_eq!(names.len(), 10, "expected 10 failed names, got {names:?}");
             assert!(
-                names.iter().all(|n| n.ends_with("-counted")),
-                "expected every name to end with -counted, got {names:?}"
+                names.iter().all(|n| n.contains("-counted-at")),
+                "expected every name to name a counted rate, got {names:?}"
             );
         }
         other => panic!("expected FailedConfigurations with 10 names, got {other:?}"),
@@ -1920,7 +1999,7 @@ fn render_refuses_a_recorded_set_missing_its_counted_runs() {
 fn render_reads_syscalls_from_the_counted_run_and_p99_from_the_uncounted_run() {
     // The counted run's own count/raw/per_msg feed the table's
     // `syscalls/msg` cell; its own p99 must never leak into the p99
-    // column, which stays the uncounted 80 % record's figure.
+    // column, which stays the uncounted higher-rate record's figure.
     let mut records = full_recorded_set();
     let mut mutated = 0usize;
     for r in records.iter_mut().filter(|r| {
@@ -1929,14 +2008,18 @@ fn render_reads_syscalls_from_the_counted_run_and_p99_from_the_uncounted_run() {
             && r.qos == Some(1)
             && r.kind == RunKind::Counted
     }) {
-        r.syscalls.count = Some(12000);
-        r.syscalls.raw = Some("12000,,raw_syscalls:sys_enter,60000000000,100.00,,\n".to_string());
-        r.syscalls.per_msg = Some(2.5);
+        let c = 2 * counted_syscalls(DECLARED_RATES_W1_Q1.higher);
+        r.syscalls.count = Some(c);
+        r.syscalls.raw = Some(perf_raw(c));
+        r.syscalls.per_msg = Some(
+            c as f64 / (DECLARED_RATES_W1_Q1.higher * WINDOW_SECS) as f64,
+        );
+        let window_scheduled = r.counts.window_scheduled.expect("open-loop record");
         r.latency_ns = Some(LatencySummary {
             p50: 160_000,
             p99: 160_000,
             max: 160_000,
-            histogram: vec![(160_000, 4800)],
+            histogram: vec![(160_000, window_scheduled)],
         });
         mutated += 1;
     }
@@ -1948,7 +2031,7 @@ fn render_reads_syscalls_from_the_counted_run_and_p99_from_the_uncounted_run() {
 
     let doc = render(&records, false).expect("render ok");
     assert!(
-        doc.contains("| uring | 100 | 3.0 % | 95.0 | 40.0 | 40.0 | 80.0 | 2.50 | ok |"),
+        doc.contains("| uring | 100 | 3.0 % | 95.0 | 40.0 | 40.0 | 80.0 | 300000 | 2.50 | ok |"),
         "missing the counted syscalls/msg row in:\n{doc}"
     );
     assert!(
@@ -1958,16 +2041,21 @@ fn render_reads_syscalls_from_the_counted_run_and_p99_from_the_uncounted_run() {
 }
 
 #[test]
-fn render_refuses_a_counted_run_rate_not_matched_to_throughput() {
-    // Copy of `render_refuses_a_latency_rate_not_matched_to_throughput`
-    // targeting the first `Counted` record: the counted run is paced at
-    // the matched rate too, so an unmatched offered_rate refuses it the
-    // same way.
+fn render_refuses_a_counted_record_at_an_undeclared_rate() {
+    // The uring w1 q1 counted record, repetition 1 attempt 1, mutated to
+    // offered_rate 81 — self-consistent, but not a declared rate.
     let mut records = full_recorded_set();
     let target = records
         .iter_mut()
-        .find(|r| r.kind == RunKind::Counted)
-        .expect("a counted record");
+        .find(|r| {
+            r.server == ServerKind::Uring
+                && r.workers == 1
+                && r.qos == Some(1)
+                && r.kind == RunKind::Counted
+                && r.repetition == 1
+                && r.attempt == 1
+        })
+        .expect("a uring w1 q1 counted record");
     let rate = 81u64;
     let (scheduled, window_scheduled) = slot_counts(rate, target.origin_ns, target.window);
     target.offered_rate = Some(rate);
@@ -1985,13 +2073,19 @@ fn render_refuses_a_counted_run_rate_not_matched_to_throughput() {
         histogram: vec![(80_000, window_scheduled)],
     });
     target.lateness = vec![(1000, window_scheduled)];
-    target.syscalls.count = Some(PERF_COUNT);
-    target.syscalls.per_msg = Some(PERF_COUNT as f64 / (81 * WINDOW_SECS) as f64);
+    let c = 81 * WINDOW_SECS;
+    target.syscalls.count = Some(c);
+    target.syscalls.raw = Some(perf_raw(c));
+    target.syscalls.per_msg = Some(c as f64 / (81 * WINDOW_SECS) as f64);
     match render(&records, false) {
         Err(DocError::ProtocolViolation(text)) => {
-            assert!(text.contains("offered_rate"), "text = {text}");
+            assert_eq!(
+                text,
+                "uring-w1-q1-counted-at81-a1-r1.json: configuration uring-w1-q1-counted-at81 \
+                 is outside the recorded matrix"
+            );
         }
-        other => panic!("expected ProtocolViolation(offered_rate), got {other:?}"),
+        other => panic!("expected ProtocolViolation, got {other:?}"),
     }
 }
 
@@ -2000,13 +2094,20 @@ fn render_states_that_latency_and_syscalls_come_from_separate_runs() {
     let records = full_recorded_set();
     let doc = render(&records, false).expect("render ok");
     let expected_line = "Both latency columns come from uncounted runs; `syscalls/msg` comes \
-                          from 5 separate counted repetitions at the same matched 80 % rate, \
-                          which qualify on `syscalls/msg` spread. The counted runs' p99 stays \
-                          in the raw JSON and is not published.";
+                          from 5 separate counted repetitions at each row group's higher \
+                          declared rate, which qualify on `syscalls/msg` spread. The counted \
+                          runs' p99 stays in the raw JSON and is not published.";
     assert!(
         doc.lines().any(|l| l == expected_line),
         "missing the counted Method line in:\n{doc}"
     );
+}
+
+#[test]
+fn render_names_the_declared_rates_and_their_calibration_in_the_method() {
+    let doc = render(&full_recorded_set(), false).expect("render ok");
+    let expected = "Constants: warm-up 10 s, window 60 s, 5 repetitions, 100 connections, 64-byte payloads, qos1_window 32, MQTT 3.1.1. Closed-loop throughput measures msgs/s at the callback; open-loop latency paces sends at each row group's two declared rates, identical for every server in the row group: 1 worker(s) QoS 1 at 75000 and 300000 msgs/s; 1 worker(s) QoS 0 at 150000 and 400000 msgs/s; 4 worker(s) QoS 1 at 900000 and 1200000 msgs/s; 4 worker(s) QoS 0 at 1300000 and 1500000 msgs/s. `bench/CALIBRATION.md` records how the rates were chosen. Mosquitto endpoint = subscriber receipt.";
+    assert!(doc.lines().any(|l| l == expected), "missing the declared-rate Method line in:\n{doc}");
 }
 
 #[test]
@@ -2016,17 +2117,45 @@ fn smoke_render_reads_syscalls_only_from_counted_runs() {
     let mut records = vec![
         throughput_record(ServerKind::Uring, 1, 1, 1),
         throughput_record(ServerKind::Uring, 1, 1, 2),
-        latency_record(ServerKind::Uring, 1, 1, 50, 1),
-        latency_record(ServerKind::Uring, 1, 1, 50, 2),
-        latency_record(ServerKind::Uring, 1, 1, 80, 1),
-        latency_record(ServerKind::Uring, 1, 1, 80, 2),
+        latency_record(
+            ServerKind::Uring,
+            1,
+            1,
+            SMOKE_DECLARED_RATES.lower,
+            LOWER_P99_NS,
+            1,
+        ),
+        latency_record(
+            ServerKind::Uring,
+            1,
+            1,
+            SMOKE_DECLARED_RATES.lower,
+            LOWER_P99_NS,
+            2,
+        ),
+        latency_record(
+            ServerKind::Uring,
+            1,
+            1,
+            SMOKE_DECLARED_RATES.higher,
+            HIGHER_P99_NS,
+            1,
+        ),
+        latency_record(
+            ServerKind::Uring,
+            1,
+            1,
+            SMOKE_DECLARED_RATES.higher,
+            HIGHER_P99_NS,
+            2,
+        ),
         connections_record(ServerKind::Uring, 1, 1),
         connections_record(ServerKind::Uring, 1, 2),
     ];
     let doc = render(&records, true).expect("smoke render ok");
     assert!(
         doc.lines()
-            .any(|l| l.starts_with("| uring |") && l.ends_with("| 80.0 | n/a | ok |")),
+            .any(|l| l.starts_with("| uring |") && l.ends_with("| 80.0 | 60000 | n/a | ok |")),
         "expected the uncounted uring row in:\n{doc}"
     );
     let expected_na_line = "Both latency columns come from uncounted runs; `syscalls/msg` is \
@@ -2042,18 +2171,31 @@ fn smoke_render_reads_syscalls_only_from_counted_runs() {
 
     // Adding the counted run: the syscalls/msg cell and the Method line
     // both switch to the counted figures.
-    records.push(counted_record(ServerKind::Uring, 1, 1, 1));
-    records.push(counted_record(ServerKind::Uring, 1, 1, 2));
+    records.push(counted_record(
+        ServerKind::Uring,
+        1,
+        1,
+        SMOKE_DECLARED_RATES.higher,
+        1,
+    ));
+    records.push(counted_record(
+        ServerKind::Uring,
+        1,
+        1,
+        SMOKE_DECLARED_RATES.higher,
+        2,
+    ));
     let doc = render(&records, true).expect("smoke render ok");
     assert!(
         doc.lines()
-            .any(|l| l.starts_with("| uring |") && l.ends_with("| 80.0 | 1.25 | ok |")),
+            .any(|l| l.starts_with("| uring |") && l.ends_with("| 80.0 | 60000 | 1.25 | ok |")),
         "expected the counted uring row in:\n{doc}"
     );
     let expected_counted_line = "Both latency columns come from uncounted runs; `syscalls/msg` \
-                                  comes from 2 separate counted repetitions at the same matched \
-                                  80 % rate, which qualify on `syscalls/msg` spread. The counted \
-                                  runs' p99 stays in the raw JSON and is not published.";
+                                  comes from 2 separate counted repetitions at each row group's \
+                                  higher declared rate, which qualify on `syscalls/msg` spread. \
+                                  The counted runs' p99 stays in the raw JSON and is not \
+                                  published.";
     assert!(
         doc.lines().any(|l| l == expected_counted_line),
         "missing the counted Method line in:\n{doc}"
@@ -2062,4 +2204,194 @@ fn smoke_render_reads_syscalls_only_from_counted_runs() {
         !doc.contains("because this record set holds no counted run"),
         "unexpected n/a Method line in:\n{doc}"
     );
+}
+
+#[test]
+fn render_publishes_a_not_sustained_configuration_with_its_rate_and_capacity_rows() {
+    let mut records = full_recorded_set();
+    make_not_sustained(&mut records, |r| {
+        r.server == ServerKind::Uring
+            && r.workers == 1
+            && r.qos == Some(1)
+            && r.kind == RunKind::Latency
+            && at_higher_rate(r)
+    });
+    make_not_sustained(&mut records, |r| {
+        r.server == ServerKind::Uring
+            && r.workers == 1
+            && r.qos == Some(1)
+            && r.kind == RunKind::Counted
+    });
+    let doc = render(&records, false).expect("render ok");
+    assert!(
+        doc.contains(
+            "| uring | 100 | 3.0 % | 95.0 | 40.0 | 40.0 | not sustained at 300000 msgs/s: missed slots | 75000 | not sustained at 300000 msgs/s: missed slots | ok |"
+        ),
+        "missing the not-sustained uring row in:\n{doc}"
+    );
+}
+
+#[test]
+fn render_reports_no_open_loop_rate_when_neither_declared_rate_is_sustained() {
+    let mut records = full_recorded_set();
+    make_not_sustained(&mut records, |r| {
+        r.server == ServerKind::Uring
+            && r.workers == 1
+            && r.qos == Some(1)
+            && r.kind == RunKind::Latency
+            && at_lower_rate(r)
+    });
+    make_not_sustained(&mut records, |r| {
+        r.server == ServerKind::Uring
+            && r.workers == 1
+            && r.qos == Some(1)
+            && r.kind == RunKind::Latency
+            && at_higher_rate(r)
+    });
+    let doc = render(&records, false).expect("render ok");
+    assert!(
+        doc.contains(
+            "| uring | 100 | 3.0 % | 95.0 | 40.0 | not sustained at 75000 msgs/s: missed slots | not sustained at 300000 msgs/s: missed slots | none | 1.25 | ok |"
+        ),
+        "missing the no-open-loop-rate uring row in:\n{doc}"
+    );
+}
+
+#[test]
+fn render_refuses_an_open_loop_configuration_that_is_pending_or_stopped() {
+    // (a) Exhausted: three complete, valid attempts whose repetition 5
+    // breaks the spread gate (160 µs beside the other reps' 80 µs), so
+    // the budget is spent with no invalid repetition to name a capacity
+    // row.
+    let mut records = full_recorded_set();
+    let is_target = |r: &RunRecord| {
+        r.server == ServerKind::Uring
+            && r.workers == 1
+            && r.qos == Some(1)
+            && r.kind == RunKind::Latency
+            && at_higher_rate(r)
+    };
+    let template: Vec<RunRecord> = records.iter().filter(|r| is_target(r)).cloned().collect();
+    assert_eq!(template.len(), usize::try_from(REPETITIONS).expect("fits"));
+    records.retain(|r| !is_target(r));
+    for attempt in 1..=3u32 {
+        for r in &template {
+            let mut r = r.clone();
+            r.attempt = attempt;
+            if r.repetition == 5 {
+                let window_scheduled = r.counts.window_scheduled.expect("open-loop record");
+                r.latency_ns = Some(LatencySummary {
+                    p50: 160_000,
+                    p99: 160_000,
+                    max: 160_000,
+                    histogram: vec![(160_000, window_scheduled)],
+                });
+            }
+            records.push(r);
+        }
+    }
+    match render(&records, false) {
+        Err(DocError::FailedConfigurations(names)) => {
+            assert_eq!(names, vec!["uring-w1-q1-latency-at300000".to_string()]);
+        }
+        other => panic!("expected FailedConfigurations, got {other:?}"),
+    }
+
+    // (b) Pending: only attempt 1 present, with repetition 1 missing 5
+    // slots (verdict recomputed) — the same refusal before the attempt
+    // budget is spent.
+    let mut records = full_recorded_set();
+    let target = records
+        .iter_mut()
+        .find(|r| {
+            r.server == ServerKind::Uring
+                && r.workers == 1
+                && r.qos == Some(1)
+                && r.kind == RunKind::Latency
+                && at_higher_rate(r)
+                && r.repetition == 1
+        })
+        .expect("a uring w1 q1 higher-rate latency repetition 1");
+    target.generator_errors.missed_slots = 5;
+    target.invalid_reasons = bench::analysis::reconcile(target);
+    target.valid = target.invalid_reasons.is_empty();
+    match render(&records, false) {
+        Err(DocError::FailedConfigurations(names)) => {
+            assert_eq!(names, vec!["uring-w1-q1-latency-at300000".to_string()]);
+        }
+        other => panic!("expected FailedConfigurations, got {other:?}"),
+    }
+}
+
+#[test]
+fn render_names_the_declared_rates_in_the_results_header() {
+    let records = full_recorded_set();
+    let doc = render(&records, false).expect("render ok");
+    assert!(
+        doc.contains(
+            "| Server | msgs/s | spread | server CPU % | generator CPU % | p99 @75000 msgs/s (µs) | p99 @300000 msgs/s (µs) | open-loop ≥ (msgs/s) | syscalls/msg @300000 msgs/s | driver proof |"
+        ),
+        "missing the 1-worker QoS 1 header in:\n{doc}"
+    );
+    assert!(
+        doc.contains(
+            "| Server | msgs/s | spread | server CPU % | generator CPU % | p99 @1300000 msgs/s (µs) | p99 @1500000 msgs/s (µs) | open-loop ≥ (msgs/s) | syscalls/msg @1500000 msgs/s | driver proof |"
+        ),
+        "missing the 4-worker QoS 0 header in:\n{doc}"
+    );
+}
+
+#[test]
+fn render_discloses_the_counter_method_of_not_sustained_counted_runs() {
+    // Every counted key of the fixture made not sustained: every
+    // counted record stays perf, so no counted configuration passes.
+    let mut records = full_recorded_set();
+    let mut counted_keys: Vec<(ServerKind, u32, u8)> = Vec::new();
+    for w in RECORDED_WORKERS {
+        let servers = servers_for(w, &RECORDED_SERVERS);
+        for q in RECORDED_QOS {
+            for &s in &servers {
+                counted_keys.push((s, w, q));
+            }
+        }
+    }
+    for (server, workers, qos) in counted_keys {
+        make_not_sustained(&mut records, |r| {
+            r.server == server && r.workers == workers && r.qos == Some(qos) && r.kind == RunKind::Counted
+        });
+    }
+    let doc = render(&records, false).expect("render ok");
+    assert!(
+        doc.lines().any(|l| l == "| Syscall method | perf |"),
+        "missing the perf syscall-method line in:\n{doc}"
+    );
+}
+
+#[test]
+fn render_refuses_mixed_counter_methods_across_a_not_sustained_configuration() {
+    let mut records = full_recorded_set();
+    make_not_sustained(&mut records, |r| {
+        r.server == ServerKind::Uring
+            && r.workers == 1
+            && r.qos == Some(1)
+            && r.kind == RunKind::Counted
+    });
+    for r in &mut records {
+        if r.kind == RunKind::Counted
+            && !(r.server == ServerKind::Uring && r.workers == 1 && r.qos == Some(1))
+        {
+            r.syscalls.method = SyscallMethod::Strace;
+            let c = r.syscalls.count.expect("a counted record carries a count");
+            r.syscalls.raw = Some(strace_raw(c));
+        }
+    }
+    match render(&records, false) {
+        Err(DocError::ProtocolViolation(text)) => {
+            assert!(
+                text.contains("mixed syscall counter methods"),
+                "text = {text}"
+            );
+        }
+        other => panic!("expected ProtocolViolation(mixed methods), got {other:?}"),
+    }
 }

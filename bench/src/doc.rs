@@ -18,15 +18,16 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::path::Path;
 
-use crate::analysis::{config_passes, cpu_percent, metric};
+use crate::analysis::{
+    config_passes, cpu_percent, metric, open_loop_outcome, CapacityRow, OpenLoopOutcome,
+    STEADY_STATE_GROWTH_LIMIT_NS,
+};
 use crate::matrix::{read_records, servers_for, RECORDED_QOS, RECORDED_SERVERS, RECORDED_WORKERS};
 use crate::payload::PAYLOAD_BYTES;
 use crate::run_record::{
     Build, ConfigKey, Profile, RunKind, RunRecord, ServerKind, SyscallMethod, SCHEMA_VERSION,
 };
-use crate::runner::{
-    CONNECTIONS, LATENCY_FRACTIONS_PCT, ProtocolConstants, QOS1_WINDOW, SYSCALL_FRACTION_PCT,
-};
+use crate::runner::{declared_rates, DeclaredRates, CONNECTIONS, ProtocolConstants, QOS1_WINDOW};
 
 /// Cell text for a configuration with no passing attempt: the table
 /// never shows a figure taken from a failed run.
@@ -36,6 +37,10 @@ const FAILED: &str = "FAILED";
 /// mosquitto at a subscriber, not at the callback, and orders the
 /// document to say so in those rows.
 const MOSQUITTO_RESULTS_LABEL: &str = "mosquitto (endpoint = subscriber receipt)";
+
+/// Nanoseconds per millisecond: the sign-off prints the steady-state
+/// limit in milliseconds.
+const NS_PER_MS: u64 = 1_000_000;
 
 /// Reasons `bench doc` can refuse to render a document. Every variant
 /// is the operator's only signal that an unpublishable record set exists;
@@ -78,8 +83,8 @@ pub enum DocError {
     /// contradict its raw observations.
     InconsistentRecord(String),
     /// A recorded-mode protocol invariant was violated: timing
-    /// constants, the cpu-set pair, the matched-rate, or the
-    /// counted counter evidence.
+    /// constants, the cpu-set pair, a configuration outside the recorded
+    /// matrix, or the counted counter evidence.
     ProtocolViolation(String),
     /// A fixed-matrix configuration is missing or its highest attempt
     /// failed `config_passes(runs, 5, true)`.
@@ -309,20 +314,26 @@ pub fn render(records: &[RunRecord], smoke: bool) -> Result<String, DocError> {
         }
     }
 
-    // Completeness — every expected configuration must exist and its
-    // highest attempt must pass `config_passes(runs, 5, true)`. Done
-    // first so the matched-rate calculation always has a throughput
-    // median to read. Smoke mode does not require completeness; the
-    // table marks missing or failed configurations `FAILED` in their
-    // cells instead.
-    let expected = expected_configs();
+    // The declared rates of the row groups the document renders: the
+    // smoke profile rates the smoke rows, the recorded profile rates the
+    // recorded rows.
+    let rate_profile = if smoke { Profile::Smoke } else { Profile::Recorded };
+
+    // Completeness — every expected configuration must exist and must
+    // reach a published outcome: a recorded open-loop configuration
+    // passes `open_loop_outcome` as `Passed` or `NotSustained`, and
+    // every other configuration's highest attempt must pass
+    // `config_passes(runs, 5, true)`. Smoke mode does not require
+    // completeness; the table marks missing or failed configurations
+    // `FAILED` in their cells instead.
+    let expected = expected_configs(rate_profile);
     let mut by_key: HashMap<ConfigKey, Vec<RunRecord>> = HashMap::new();
     for rec in records {
         by_key.entry(rec.key()).or_default().push(rec.clone());
     }
     // A recorded document discloses the fixed matrix and nothing else.
     // The loops below visit the expected keys only, so a record of any
-    // other configuration — a two-worker row, a third rate fraction —
+    // other configuration — a two-worker row, a rate that is not declared —
     // would pass every per-record check and stay out of the document
     // while the run succeeds. Refuse it instead of publishing a
     // measurement the document does not name.
@@ -338,15 +349,12 @@ pub fn render(records: &[RunRecord], smoke: bool) -> Result<String, DocError> {
             }
         }
     }
-    let constants = if smoke {
-        ProtocolConstants::for_profile(Profile::Smoke)
-    } else {
-        ProtocolConstants::for_profile(Profile::Recorded)
-    };
+    let constants = ProtocolConstants::for_profile(rate_profile);
     let repetitions = constants.repetitions;
     let enforce_spread = constants.enforce_spread;
     let mut failed_names: Vec<String> = Vec::new();
     let mut passing_by_key: HashMap<ConfigKey, Vec<RunRecord>> = HashMap::new();
+    let mut not_sustained: HashMap<ConfigKey, Vec<CapacityRow>> = HashMap::new();
     for key in &expected {
         let Some(runs) = by_key.get(key) else {
             if !smoke {
@@ -364,7 +372,21 @@ pub fn render(records: &[RunRecord], smoke: bool) -> Result<String, DocError> {
             highest_attempt = 0;
             attempt_runs.clone_from(runs);
         }
-        if config_passes(&attempt_runs, repetitions, enforce_spread) {
+        if !smoke && key.kind.is_open_loop() {
+            // Spec §9.1 Latency outcomes: not sustained is a published
+            // result; a pending or stopped configuration is not.
+            match open_loop_outcome(runs, &constants) {
+                OpenLoopOutcome::Passed => {
+                    passing_by_key.insert(*key, attempt_runs);
+                }
+                OpenLoopOutcome::NotSustained(rows) => {
+                    not_sustained.insert(*key, rows);
+                }
+                OpenLoopOutcome::Pending | OpenLoopOutcome::Exhausted(_) => {
+                    failed_names.push(config_label(key));
+                }
+            }
+        } else if config_passes(&attempt_runs, repetitions, enforce_spread) {
             passing_by_key.insert(*key, attempt_runs);
         } else if !smoke {
             failed_names.push(config_label(key));
@@ -374,9 +396,25 @@ pub fn render(records: &[RunRecord], smoke: bool) -> Result<String, DocError> {
         return Err(DocError::FailedConfigurations(failed_names));
     }
 
+    // Records behind every published `syscalls/msg` cell: the passing
+    // counted attempts and every attempt of a counted configuration
+    // published "not sustained at R".
+    let published_counted: Vec<&RunRecord> = passing_by_key
+        .iter()
+        .filter(|(key, _)| key.kind == RunKind::Counted)
+        .flat_map(|(_, runs)| runs)
+        .chain(
+            not_sustained
+                .keys()
+                .filter(|key| key.kind == RunKind::Counted)
+                .filter_map(|key| by_key.get(key))
+                .flatten(),
+        )
+        .collect();
+
     // Recorded-mode protocol invariants attached to one (or all) of
     // the configurations: counter evidence on the counted rows only,
-    // one syscall method, matched-rate alignment. The repetition set is
+    // one syscall method. The repetition set is
     // `config_passes`' job, already enforced above.
     if !smoke {
         for key in &expected {
@@ -409,85 +447,16 @@ pub fn render(records: &[RunRecord], smoke: bool) -> Result<String, DocError> {
             }
         }
         // One syscall method per document. The table carries a single
-        // `syscalls/msg @80 %` column and a single method label, so two
+        // `syscalls/msg` column and a single method label, so two
         // methods across the published attempts make those figures a
         // mixed-method comparison and leave strace's bias disclosure
         // attached to figures `perf` produced.
-        let methods = published_syscall_methods(&passing_by_key);
+        let methods = published_syscall_methods(published_counted.iter().copied());
         if methods.len() > 1 {
             return Err(DocError::ProtocolViolation(format!(
                 "mixed syscall counter methods: {}",
                 methods.iter().copied().collect::<Vec<_>>().join(", ")
             )));
-        }
-        // Matched-rate alignment: per (w, q) and pct, the latency
-        // `offered_rate` must equal
-        // `⌊pct / 100 × min(throughput medians of the passing attempts of (w, q))⌋`.
-        for w in RECORDED_WORKERS {
-            let servers = servers_for(w, &RECORDED_SERVERS);
-            for q in RECORDED_QOS {
-                let throughput_medians: Vec<f64> = servers
-                    .iter()
-                    .filter_map(|s| {
-                        let key = ConfigKey {
-                            server: *s,
-                            workers: w,
-                            qos: Some(q),
-                            kind: RunKind::Throughput,
-                            rate_fraction_pct: None,
-                        };
-                        let runs = passing_by_key.get(&key)?;
-                        let mut metrics: Vec<f64> = runs.iter().filter_map(metric).collect();
-                        if metrics.is_empty() {
-                            None
-                        } else {
-                            metrics.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
-                            Some(crate::analysis::median(&metrics).unwrap_or(0.0))
-                        }
-                    })
-                    .collect();
-                let Some(min) = throughput_medians
-                    .iter()
-                    .copied()
-                    .reduce(f64::min)
-                else {
-                    continue;
-                };
-                for &s in &servers {
-                    for (kind, pct) in LATENCY_FRACTIONS_PCT
-                        .iter()
-                        .map(|&pct| (RunKind::Latency, pct))
-                        .chain(std::iter::once((RunKind::Counted, SYSCALL_FRACTION_PCT)))
-                    {
-                        let key = ConfigKey {
-                            server: s,
-                            workers: w,
-                            qos: Some(q),
-                            kind,
-                            rate_fraction_pct: Some(pct),
-                        };
-                        let Some(runs) = by_key.get(&key) else { continue };
-                        let expected_rate = (f64::from(pct) / 100.0 * min).floor() as u64;
-                        // Every attempt of a latency configuration is
-                        // paced at the same matched rate: `run_matrix`
-                        // derives the rate from the passing throughput
-                        // records before the first latency run and keeps
-                        // it for the re-runs. A record at another rate
-                        // measured a different experiment, so it decides
-                        // the document even when a later attempt passes.
-                        for r in runs {
-                            if r.offered_rate != Some(expected_rate) {
-                                return Err(DocError::ProtocolViolation(format!(
-                                    "{}: offered_rate {:?} != {expected_rate} (matched rate) ({})",
-                                    config_label(&key),
-                                    r.offered_rate,
-                                    r.file_name()
-                                )));
-                            }
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -511,7 +480,7 @@ pub fn render(records: &[RunRecord], smoke: bool) -> Result<String, DocError> {
     let sample = &records[0];
     let server_cpus = &sample.cpu_sets.server;
     let gen_cpus = &sample.cpu_sets.generator;
-    let method_label = syscalls_method_label(&passing_by_key);
+    let method_label = syscalls_method_label(&published_counted);
     writeln!(out, "## Environment").unwrap();
     writeln!(out).unwrap();
     writeln!(out, "| Field | Value |").unwrap();
@@ -559,19 +528,32 @@ pub fn render(records: &[RunRecord], smoke: bool) -> Result<String, DocError> {
 
     writeln!(out, "## Method").unwrap();
     writeln!(out).unwrap();
+    let rate_list: Vec<String> = RECORDED_WORKERS
+        .iter()
+        .flat_map(|&w| {
+            RECORDED_QOS
+                .iter()
+                .map(move |&q| {
+                    let r = row_rates(rate_profile, w, q);
+                    format!("{w} worker(s) QoS {q} at {} and {} msgs/s", r.lower, r.higher)
+                })
+        })
+        .collect();
     writeln!(
         out,
         "Constants: warm-up {} s, window {} s, {} repetitions, {} connections, \
          {}-byte payloads, qos1_window {}, MQTT 3.1.1. Closed-loop throughput \
-         measures msgs/s at the callback; open-loop latency paces sends at \
-         `⌊0.5 / 0.8 × slowest competitor⌋` msgs/s of the same `(w, q)` row, \
-         the matched latency rate. Mosquitto endpoint = subscriber receipt.",
+         measures msgs/s at the callback; open-loop latency paces sends at each \
+         row group's two declared rates, identical for every server in the row \
+         group: {}. `bench/CALIBRATION.md` records how the rates were chosen. \
+         Mosquitto endpoint = subscriber receipt.",
         constants.warmup_secs,
         constants.window_secs,
         repetitions,
         CONNECTIONS,
         PAYLOAD_BYTES,
-        QOS1_WINDOW
+        QOS1_WINDOW,
+        rate_list.join("; ")
     )
     .unwrap();
     writeln!(out).unwrap();
@@ -579,8 +561,8 @@ pub fn render(records: &[RunRecord], smoke: bool) -> Result<String, DocError> {
         writeln!(
             out,
             "Both latency columns come from uncounted runs; `syscalls/msg` comes \
-             from {repetitions} separate counted repetitions at the same matched \
-             {SYSCALL_FRACTION_PCT} % rate, which qualify on `syscalls/msg` spread. \
+             from {repetitions} separate counted repetitions at each row group's \
+             higher declared rate, which qualify on `syscalls/msg` spread. \
              The counted runs' p99 stays in the raw JSON and is not published.",
         )
         .unwrap();
@@ -604,15 +586,19 @@ pub fn render(records: &[RunRecord], smoke: bool) -> Result<String, DocError> {
             )
             .unwrap();
             writeln!(out).unwrap();
+            let rates = row_rates(rate_profile, w, q);
             writeln!(
                 out,
                 "| Server | msgs/s | spread | server CPU % | generator CPU % | \
-                 p99 @50 % (µs) | p99 @80 % (µs) | syscalls/msg @80 % | driver proof |"
+                 p99 @{lower} msgs/s (µs) | p99 @{higher} msgs/s (µs) | \
+                 open-loop ≥ (msgs/s) | syscalls/msg @{higher} msgs/s | driver proof |",
+                lower = rates.lower,
+                higher = rates.higher,
             )
             .unwrap();
-            writeln!(out, "|---|---|---|---|---|---|---|---|---|").unwrap();
+            writeln!(out, "|---|---|---|---|---|---|---|---|---|---|").unwrap();
             for &s in &servers {
-                let row = results_row(&passing_by_key, s, w, q, any_counted);
+                let row = results_row(&passing_by_key, &not_sustained, s, w, q, rates, any_counted);
                 writeln!(out, "{row}").unwrap();
             }
             writeln!(out).unwrap();
@@ -643,12 +629,13 @@ pub fn render(records: &[RunRecord], smoke: bool) -> Result<String, DocError> {
     .unwrap();
     writeln!(
         out,
-        "- [ ] Spread: every configuration within 10 % over 5 interleaved repetitions"
+        "- [ ] Spread: every configuration with a published figure within 10 % over 5 interleaved repetitions; a not-sustained cell publishes no figure"
     )
     .unwrap();
     writeln!(
         out,
-        "- [ ] Reconciliation: every run reconciled (unresolved 0, duplicates 0, dropped 0 in throughput runs)"
+        "- [ ] Reconciliation: every published repetition reconciled (unresolved 0, duplicates 0, dropped 0 in throughput runs, open-loop backlog growth within {} ms); failed attempts and not-sustained records stay in the raw JSON",
+        STEADY_STATE_GROWTH_LIMIT_NS / NS_PER_MS
     )
     .unwrap();
     writeln!(
@@ -669,12 +656,16 @@ pub fn render(records: &[RunRecord], smoke: bool) -> Result<String, DocError> {
 /// rendered from the passing highest attempt of its own configuration,
 /// so a retried configuration never mixes a failed attempt into a
 /// published figure. A cell whose configuration has no passing attempt
-/// prints `FAILED`.
+/// prints `FAILED`. A configuration published as not sustained prints
+/// its rate and capacity rows instead of a figure, and `open-loop ≥` is
+/// the highest passed declared rate.
 fn results_row(
     passing: &HashMap<ConfigKey, Vec<RunRecord>>,
+    not_sustained: &HashMap<ConfigKey, Vec<CapacityRow>>,
     server: ServerKind,
     workers: u32,
     qos: u8,
+    rates: DeclaredRates,
     any_counted: bool,
 ) -> String {
     let thr_key = ConfigKey {
@@ -682,28 +673,28 @@ fn results_row(
         workers,
         qos: Some(qos),
         kind: RunKind::Throughput,
-        rate_fraction_pct: None,
+        offered_rate: None,
     };
-    let lat50_key = ConfigKey {
+    let lat_lower_key = ConfigKey {
         server,
         workers,
         qos: Some(qos),
         kind: RunKind::Latency,
-        rate_fraction_pct: Some(50u32),
+        offered_rate: Some(rates.lower),
     };
-    let lat80_key = ConfigKey {
+    let lat_higher_key = ConfigKey {
         server,
         workers,
         qos: Some(qos),
         kind: RunKind::Latency,
-        rate_fraction_pct: Some(80u32),
+        offered_rate: Some(rates.higher),
     };
     let counted_key = ConfigKey {
         server,
         workers,
         qos: Some(qos),
         kind: RunKind::Counted,
-        rate_fraction_pct: Some(SYSCALL_FRACTION_PCT),
+        offered_rate: Some(rates.higher),
     };
 
     // msgs/s, spread, the CPU shares and the driver proof all describe
@@ -730,13 +721,39 @@ fn results_row(
         ),
     };
 
+    let p_lower = match not_sustained.get(&lat_lower_key) {
+        Some(rows) => not_sustained_cell(rates.lower, rows),
+        None => latency_p99_us(passing, &lat_lower_key),
+    };
+    let p_higher = match not_sustained.get(&lat_higher_key) {
+        Some(rows) => not_sustained_cell(rates.higher, rows),
+        None => latency_p99_us(passing, &lat_higher_key),
+    };
+    let sys = match not_sustained.get(&counted_key) {
+        Some(rows) => not_sustained_cell(rates.higher, rows),
+        None => syscalls_per_msg(passing, &counted_key, any_counted),
+    };
+    // `open-loop ≥` names the highest declared rate the configuration
+    // sustained; a configuration that sustained neither rate names none.
+    let open_loop = if passing.contains_key(&lat_higher_key) {
+        rates.higher.to_string()
+    } else if passing.contains_key(&lat_lower_key) {
+        rates.lower.to_string()
+    } else {
+        "none".to_string()
+    };
+
     format!(
-        "| {server} | {msgs} | {spread} | {server_cpu} | {gen_cpu} | {p50} | {p80} | {sys} | {driver} |",
+        "| {server} | {msgs} | {spread} | {server_cpu} | {gen_cpu} | {p_lower} | {p_higher} | {open_loop} | {sys} | {driver} |",
         server = if server == ServerKind::Mosquitto { MOSQUITTO_RESULTS_LABEL } else { server_label(server) },
-        p50 = latency_p99_us(passing, &lat50_key),
-        p80 = latency_p99_us(passing, &lat80_key),
-        sys = syscalls_per_msg(passing, &counted_key, any_counted),
     )
+}
+
+/// Cell of an open-loop configuration published as not sustained at
+/// `rate`: the rate and the capacity rows its failed repetitions hit.
+fn not_sustained_cell(rate: u64, rows: &[CapacityRow]) -> String {
+    let labels: Vec<&str> = rows.iter().map(|r| r.label()).collect();
+    format!("not sustained at {rate} msgs/s: {}", labels.join(", "))
 }
 
 fn connections_row(
@@ -749,7 +766,7 @@ fn connections_row(
         workers,
         qos: None,
         kind: RunKind::Connections,
-        rate_fraction_pct: None,
+        offered_rate: None,
     };
     let Some(runs) = passing.get(&key) else {
         return format!("| {} | {FAILED} | {FAILED} |", server_label(server));
@@ -927,35 +944,35 @@ fn counter_on_uncounted_row(record: &RunRecord) -> Option<&'static str> {
     None
 }
 
-/// Methods behind the published `syscalls/msg @80 %` figures: the
-/// counter methods of the passing counted attempts, which are the only
+/// Methods behind the published `syscalls/msg` figures: the counter
+/// methods of the passing counted attempts and every attempt of a
+/// counted configuration published not sustained, which are the only
 /// records the table reads those figures from.
-fn published_syscall_methods(
-    passing: &HashMap<ConfigKey, Vec<RunRecord>>,
+fn published_syscall_methods<'a>(
+    counted: impl IntoIterator<Item = &'a RunRecord>,
 ) -> BTreeSet<&'static str> {
     let mut methods: BTreeSet<&'static str> = BTreeSet::new();
-    for (key, runs) in passing {
-        if key.kind != RunKind::Counted {
-            continue;
-        }
-        for r in runs {
-            methods.insert(match r.syscalls.method {
-                SyscallMethod::Perf => "perf",
-                SyscallMethod::Strace => "strace",
-                SyscallMethod::None => "none",
-            });
-        }
+    for r in counted {
+        methods.insert(match r.syscalls.method {
+            SyscallMethod::Perf => "perf",
+            SyscallMethod::Strace => "strace",
+            SyscallMethod::None => "none",
+        });
     }
     methods
 }
 
-/// `| Syscall method |` cell of `## Environment`. `n/a` when no passing
-/// counted attempt carries a figure. The strace bias disclosure follows
-/// the label whenever strace produced any published figure; recorded mode
+/// `| Syscall method |` cell of `## Environment`. `n/a` when the
+/// document publishes no counted record at all; a counted configuration
+/// published not sustained names its method without a passing counted
+/// attempt. The label names the methods of the passing counted attempts
+/// and every attempt of a counted configuration published not
+/// sustained. The strace bias disclosure follows the
+/// label whenever strace produced any published figure; recorded mode
 /// has already refused a mixed-method matrix, so a smoke document is the
 /// only place the label can name more than one method.
-fn syscalls_method_label(passing: &HashMap<ConfigKey, Vec<RunRecord>>) -> String {
-    let methods = published_syscall_methods(passing);
+fn syscalls_method_label(counted: &[&RunRecord]) -> String {
+    let methods = published_syscall_methods(counted.iter().copied());
     if methods.is_empty() {
         return "n/a".to_string();
     }
@@ -969,39 +986,35 @@ fn syscalls_method_label(passing: &HashMap<ConfigKey, Vec<RunRecord>>) -> String
     }
 }
 
-fn expected_configs() -> Vec<ConfigKey> {
+fn expected_configs(profile: Profile) -> Vec<ConfigKey> {
     let mut out = Vec::new();
     for w in RECORDED_WORKERS {
         let servers = servers_for(w, &RECORDED_SERVERS);
         for q in RECORDED_QOS {
+            let rates = row_rates(profile, w, q);
             for &s in &servers {
                 out.push(ConfigKey {
                     server: s,
                     workers: w,
                     qos: Some(q),
                     kind: RunKind::Throughput,
-                    rate_fraction_pct: None,
+                    offered_rate: None,
                 });
-                out.push(ConfigKey {
-                    server: s,
-                    workers: w,
-                    qos: Some(q),
-                    kind: RunKind::Latency,
-                    rate_fraction_pct: Some(50),
-                });
-                out.push(ConfigKey {
-                    server: s,
-                    workers: w,
-                    qos: Some(q),
-                    kind: RunKind::Latency,
-                    rate_fraction_pct: Some(80),
-                });
+                for rate in rates.both() {
+                    out.push(ConfigKey {
+                        server: s,
+                        workers: w,
+                        qos: Some(q),
+                        kind: RunKind::Latency,
+                        offered_rate: Some(rate),
+                    });
+                }
                 out.push(ConfigKey {
                     server: s,
                     workers: w,
                     qos: Some(q),
                     kind: RunKind::Counted,
-                    rate_fraction_pct: Some(SYSCALL_FRACTION_PCT),
+                    offered_rate: Some(rates.higher),
                 });
             }
         }
@@ -1011,26 +1024,37 @@ fn expected_configs() -> Vec<ConfigKey> {
                 workers: w,
                 qos: None,
                 kind: RunKind::Connections,
-                rate_fraction_pct: None,
+                offered_rate: None,
             });
         }
     }
     out
 }
 
+/// The declared rates of a row group the document renders.
+/// `RECORDED_WORKERS × RECORDED_QOS` is the set `declared_rates` covers
+/// for both profiles, so the lookup cannot miss.
+fn row_rates(profile: Profile, workers: u32, qos: u8) -> DeclaredRates {
+    declared_rates(profile, workers, qos)
+        .expect("declared_rates covers every recorded row group")
+}
+
 /// Kebab-case label for a configuration: `uring-w1-q1-throughput`,
-/// `tokio-w4-connections`, `mosquitto-w1-q0-latency-50`. Used in
+/// `tokio-w4-connections`, `mosquitto-w1-q0-latency-at150000`. Used in
 /// `FailedConfigurations` and `ProtocolViolation` so the operator's
 /// message names a single, greppable configuration.
 fn config_label(key: &ConfigKey) -> String {
     let kind = match key.kind {
         RunKind::Throughput => "throughput".to_string(),
-        RunKind::Latency => match key.rate_fraction_pct {
-            Some(pct) => format!("latency-{pct}"),
+        RunKind::Latency => match key.offered_rate {
+            Some(rate) => format!("latency-at{rate}"),
             None => "latency".to_string(),
         },
         RunKind::Connections => "connections".to_string(),
-        RunKind::Counted => "counted".to_string(),
+        RunKind::Counted => match key.offered_rate {
+            Some(rate) => format!("counted-at{rate}"),
+            None => "counted".to_string(),
+        },
     };
     let qos = key
         .qos

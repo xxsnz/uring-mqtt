@@ -400,19 +400,18 @@ For a strace counted run, swap the two perf lines for `--syscalls strace --strac
 
 ### Counted runs
 
-`syscalls/msg` comes from a dedicated counted run per server, worker count and QoS: open-loop at the matched 80 % rate, 5 repetitions interleaved with the latency runs (spec §9.1 Counted run). No latency run carries the counter, so both published latency columns are uncounted. The counted runs add 10 configurations — about 50 runs, roughly an hour — to a recorded session.
+`syscalls/msg` comes from a dedicated counted run per server, worker count and QoS: open-loop at the row group's higher declared rate, 5 repetitions interleaved with the latency runs (spec §9.1 Counted run). No latency run carries the counter, so both published latency columns are uncounted. The counted runs add 10 configurations — about 50 runs, roughly an hour — to a recorded session.
 
 ### Strace exhaustion recovery
 
-A strace counted run that cannot reconcile at the matched rate is re-run at that same rate, never a lower one. When a counted configuration still fails after its last attempt (`bench run` exits 2 naming a `Counted` key), the strace session cannot be published: repair the perf build, pass preflight check 2, and record a fresh dataset into a new `--out` directory with `--syscalls perf`. Do not `--resume` the strace directory — `check_resume` refuses the changed method and tool set — and do not copy, commit or publish any of its records, counted or not: one document carries one method and one environment.
+A strace counted run that cannot reconcile at the higher declared rate is re-run at that same rate, never a lower one. When a strace counted configuration still fails after its last attempt (`bench run` prints `session stopped: <Counted key>: strace counted run spent its 3 attempts; record a fresh dataset counted with perf` and exits 2), the strace session cannot be published: repair the perf build, pass preflight check 2, and record a fresh dataset into a new `--out` directory with `--syscalls perf`. Do not `--resume` the strace directory — `check_resume` refuses the changed method and tool set — and do not copy, commit or publish any of its records, counted or not: one document carries one method and one environment.
 
 Before every `--resume`, run the selected counter's preflight check again (check 2 for perf, check 3 for strace) and stop if it does not print `OK`. The `perf_event_paranoid` and tracefs settings it relies on do not survive a WSL restart, and `check_resume` does not re-test them, so a resumed session without them uses up its counted attempts.
 
 Exit codes:
 
-- `0` — every configuration passed; `bench doc` can render.
-- `2` — at least one configuration failed; records were written, the
-  failed keys are named on stderr.
+- `0` — every configuration passed or was published as not sustained (stderr names each one as `not sustained at <R> msgs/s: <key>: <rows>`); `bench doc` can render.
+- `2` — a configuration failed (stderr `failed: <key>`; in the smoke profile `smoke harness-health failure: <key>`) or the session stopped (stderr `session stopped: <key>: <cause>`); records were written.
 - `1` — refusal (missing `perf-bin`, missing `mosquitto-bin`, output
   directory already holds `*.json`, dirty / mismatched build when
   `--resume` is set, a `--perf-bin`/`--strace-bin` the selected
@@ -422,6 +421,10 @@ Exit codes:
   preflight.
 
 A dirty / mismatched build refusal with nothing to commit can come from the build itself: when a build-time `git` probe fails or gives up after 5 s, `cargo build` prints a `cargo:warning` and embeds `unknown`, and cargo keeps that value until one of the build script's `rerun-if-changed` inputs changes and `bench` is rebuilt — a new commit, a changed index or source tree, or `bench/build.rs` itself touched. A probe given up on while it was still starting — a stalled filesystem under `git` or under an earlier `PATH` entry — is left to init if its startup finishes after the build script or the CLI exits, so a stray read-only `git` can outlive the command that started it.
+
+### Latency outcomes
+
+A recorded open-loop configuration (latency or counted) ends one of three ways. It passes when its highest attempt passes. It is published "not sustained at R" when its 3 attempts are spent, every spent attempt holds an invalid repetition, and every invalid repetition fails at least one capacity row (unresolved, missed slots, steady state) and no syscall-counter row; other rows that repetition fails do not change the outcome. `bench run` prints `not sustained at <R> msgs/s: <key>: <rows>` and goes on. Any other exhaustion stops the session: an attempt that failed only on spread, a repetition invalid on no capacity row (a lateness-only failure is one), a counted repetition whose syscall counter failed (count missing, boundaries outside tolerance, or a bad counter exit), or any exhaustion of a counted configuration counted with strace — the counter policy in Strace exhaustion recovery applies to the last two. `bench run` then prints `session stopped: <key>: <cause>`, dispatches nothing more and exits 2. After a stop, fix the named cause and record a fresh dataset into a new `--out` directory; `--resume` has no attempt left for the stopped configuration, classifies the same records again and stops before dispatching any run of that open-loop stage.
 
 The recorded profile runs only the full fixed matrix; `check_request`
 refuses `--servers`/`--workers`/`--qos` subsets.
@@ -496,11 +499,13 @@ exit 1:
 - `InconsistentRecord(file: mismatches)` — `recompute` rejected at
   least one record.
 - `ProtocolViolation(text)` — recorded constants diverge, a counted
-  run lacks a counter, a latency run carries one, or a latency rate
-  does not match the throughput medians.
+  run lacks a counter, a latency run carries one, or a record sits
+  outside the recorded matrix (an undeclared rate included).
 - `FailedConfigurations(names)` — the fixed matrix is missing or
   failed configurations (a highest attempt that is invalid, too
-  spread, missing a metric, or not exactly repetitions `1..=5`),
+  spread, missing a metric, or not exactly repetitions `1..=5`; an
+  open-loop configuration with attempts left or one that stopped the
+  session — a not-sustained one is published, not listed),
   listed by kebab-case label (`uring-w1-q1-throughput`).
 
 The list is not `render`'s check order — some `ProtocolViolation`
@@ -521,10 +526,12 @@ After the recorded run:
 
 - [ ] Driver proof: every uring run shows io_uring fds = workers and
       eventpoll fds = 0.
-- [ ] Spread: every configuration within 10 % over 5 interleaved
-      repetitions.
-- [ ] Reconciliation: every run reconciled (unresolved 0, duplicates 0,
-      dropped 0 in throughput runs).
+- [ ] Spread: every configuration with a published figure within 10 % over
+      5 interleaved repetitions; a not-sustained cell publishes no figure.
+- [ ] Reconciliation: every published repetition reconciled (unresolved 0,
+      duplicates 0, dropped 0 in throughput runs, open-loop backlog growth
+      within 50 ms); failed attempts and not-sustained records stay in the
+      raw JSON.
 - [ ] Environment: host, kernel, CPU sets, AC power and idle state
       match this disclosure.
 - [ ] Saturation: in every throughput row the server CPU set, not the
@@ -534,10 +541,13 @@ After the recorded run:
 
 ## Smoke
 
-The smoke profile proves the pipeline locally. It runs eight records
-(throughput, latency 50 %, latency 80 % and connections, two
-repetitions per kind, for the 1-worker uring row), exits 0 only when every
-record reconciled, and `bench doc --smoke` then renders the document
+The smoke profile proves the pipeline locally on the debug build. It
+runs eight records per server (throughput, latency at the smoke declared
+rates 40 000 and 60 000 msgs/s, and connections, two repetitions per
+kind, for the 1-worker QoS 1 row). Every smoke configuration must pass:
+a failure prints `smoke harness-health failure: <key>` and exits 2. It
+exits 0 only when every record reconciled, and `bench doc --smoke` then
+renders the document
 with the `SMOKE — not publishable` header instead of the recorded
 checks.
 
@@ -589,7 +599,7 @@ by a recorded run, not by `bench doc --smoke`.
 ## Constants
 
 `bench::runner::ProtocolConstants::for_profile` chooses the set.
-`CONFIG_KEY` packs `server × workers × qos × kind × rate_fraction_pct`
+`ConfigKey` packs `server × workers × qos × kind × offered_rate`
 so one run fills one cell.
 
 | Field | Recorded | Smoke | Source |
@@ -603,10 +613,14 @@ so one run fills one cell.
 | `drain_grace_secs` | 5 | 2 | `ProtocolConstants::for_profile` |
 | `max_config_attempts` | 3 | 1 | `ProtocolConstants::for_profile` |
 | `enforce_spread` | true | false | `ProtocolConstants::for_profile` |
-| `LATENCY_FRACTIONS_PCT` | `[50, 80]` | `[50, 80]` | `runner.rs` |
-| `SYSCALL_FRACTION_PCT` | 80 | 80 | `runner.rs` |
+| `DECLARED_RATES_W1_Q1` | 75 000 / 300 000 msgs/s | `SMOKE_DECLARED_RATES` | `runner.rs` |
+| `DECLARED_RATES_W1_Q0` | 150 000 / 400 000 msgs/s | `SMOKE_DECLARED_RATES` | `runner.rs` |
+| `DECLARED_RATES_W4_Q1` | 900 000 / 1 200 000 msgs/s | `SMOKE_DECLARED_RATES` | `runner.rs` |
+| `DECLARED_RATES_W4_Q0` | 1 300 000 / 1 500 000 msgs/s | `SMOKE_DECLARED_RATES` | `runner.rs` |
+| `SMOKE_DECLARED_RATES` | — | 40 000 / 60 000 msgs/s | `runner.rs` |
 | `SPREAD_LIMIT` | 0.10 | 0.10 | `analysis.rs` |
 | `GENERATOR_LATENESS_FRACTION` | 0.10 | 0.10 | `analysis.rs` |
+| `STEADY_STATE_GROWTH_LIMIT_NS` | 50 ms | 50 ms | `analysis.rs` |
 | `SUSTAINED_TAIL_SECS` | 10 | 10 | `runner.rs` |
 | `GEN_LEAD_SECS` | 1 | 1 | `runner.rs` |
 | `COUNTER_BOUNDARY_TOLERANCE_NS` | 10 ms | 10 ms | `runner.rs` |
@@ -617,6 +631,38 @@ so one run fills one cell.
 | `DEFAULT_SERVER_CPUS` | `0,2,4,6` | `0,2,4,6` | `runner.rs` |
 | `DEFAULT_GENERATOR_CPUS` | `8-17` | `8-17` | `runner.rs` |
 
+`bench/CALIBRATION.md` records how the declared rates and `STEADY_STATE_GROWTH_LIMIT_NS` were chosen. Changing any of them needs a fresh calibration recorded there and a fresh recorded dataset; `--resume` refuses a record at a rate that is not declared.
+
+### Reading `bench/CALIBRATION.md`
+
+`bench/CALIBRATION.md` holds the calibration session's own record,
+committed byte for byte, so two conventions of its `## Results`
+tables are named here instead of there.
+
+**`Valid` and `failed rows` are the session's verdicts, not the
+shipped ones.** They are what `reconcile` reported while the
+calibration ran, before the steady-state row existed, so they do not
+read `STEADY_STATE_GROWTH_LIMIT_NS`. The `growth (ms)` column was
+computed offline from each record's own fields with the formula that
+row now implements. Four runs therefore read `Valid: yes` with growth
+above the 50 ms limit: mosquitto 1 worker QoS 0 at 200 000 msgs/s
+(4 631.3 ms), tokio and uring 1 worker QoS 0 at 600 000 msgs/s
+(113.8 ms and 136.9 ms), and tokio 4 workers QoS 1 at 1 250 000
+msgs/s (544.7 ms). They are the four runs `## Steady-state limit`
+names, and the shipped reconciliation calls each of them invalid on
+the steady-state row. The selection rule reads growth itself, so no
+declared rate rests on those four verdicts.
+
+**A repetition number that appears twice is a second batch, not a
+duplicated row.** In `### Smoke ladder` the uring and the tokio
+1 worker QoS 1 rows at 20 000 msgs/s each list repetitions 1-5 twice:
+the smoke ladder measured that rate in two 5-repetition batches per
+server. Every measurement in those ten rows differs, so they are ten
+independent runs. The raw records stayed in the scratch worktree
+`## Method` names and are not committed, so the table carries no
+per-batch identifier; read each pair of equal repetition numbers as
+one run of the first batch and one of the second, in table order.
+
 The runner refuses a `--profile recorded` invocation whose `--servers`,
 `--workers` or `--qos` differs from the recorded triple above; the
 smoke profile accepts any subset.
@@ -626,18 +672,18 @@ smoke profile accepts any subset.
 One JSON per run; naming uses `bench::run_record::RunRecord::file_name`:
 
 ```
-<server>-w<workers>[-q<qos>]-<kind>[-p<rate_fraction_pct>]-a<attempt>-r<repetition>.json
+<server>-w<workers>[-q<qos>]-<kind>[-at<offered_rate>]-a<attempt>-r<repetition>.json
 ```
 
 Examples:
 
 - `uring-w1-q1-throughput-a1-r1.json`
-- `tokio-w4-q0-latency-p80-a2-r3.json`
-- `uring-w1-q1-counted-p80-a1-r1.json`
+- `tokio-w4-q0-latency-at1500000-a2-r3.json`
+- `uring-w1-q1-counted-at300000-a1-r1.json`
 - `mosquitto-w1-connections-a1-r1.json`
 
 Worker is mandatory; QoS appears only on throughput, latency and
-counted runs; `rate_fraction_pct` appears only on latency and counted
+counted runs; `offered_rate` appears only on latency and counted
 runs. The runner writes failed attempts under their own attempt
 number, so a configuration that succeeds on attempt 2 leaves both
 `…-a1-…` and `…-a2-…` on disk.

@@ -554,17 +554,10 @@ fn dispatch_run(
     }
     match matrix::run_matrix(&spec, &host) {
         Ok(outcome) => {
-            if outcome.failed.is_empty() {
-                0
-            } else {
-                // Name the failed configurations: the ones a throughput
-                // failure skipped have no record of their own, so the exit
-                // code is the operator's only sign that they exist.
-                for key in &outcome.failed {
-                    eprintln!("failed: {key:?}");
-                }
-                2
+            for line in outcome.stderr_lines(profile) {
+                eprintln!("{line}");
             }
+            outcome.exit_code()
         }
         Err(e) => {
             eprintln!("{e}");

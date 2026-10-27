@@ -1,7 +1,7 @@
 //! Integration tests for the syscall counter (task 10 of the
 //! benchmark-harness feature). Each test points the runner at a temp
 //! shell script standing in for `perf` or `strace` and runs the smoke
-//! 80 % latency case end to end; the script is the seam, so no runner
+//! counted case end to end; the script is the seam, so no runner
 //! code is mocked. The scripts live next to the run's scratch dir and
 //! are removed by the test at teardown.
 
@@ -91,7 +91,6 @@ fn counted_spec() -> RunSpec {
         workers: 1,
         qos: Some(1),
         kind: RunKind::Counted,
-        rate_fraction_pct: Some(80),
         offered_rate: Some(2),
         repetition: 1,
         attempt: 1,
@@ -751,7 +750,7 @@ fn run_one_attaches_no_counter_to_a_latency_run() {
         (SyscallMethod::Perf, FAKE_PERF_SUCCESS),
         (SyscallMethod::Strace, FAKE_STRACE_SUCCESS),
     ] {
-        for pct in [50, 80] {
+        for offered_rate in [2u64, 4] {
             let dir = temp_dir("latency-no-counter");
             let marker = dir.join("counter-invoked");
             let script = make_script(
@@ -764,12 +763,12 @@ fn run_one_attaches_no_counter_to_a_latency_run() {
             let host = make_host(&dir, method, Some(script));
             let mut spec = counted_spec();
             spec.kind = RunKind::Latency;
-            spec.rate_fraction_pct = Some(pct);
+            spec.offered_rate = Some(offered_rate);
             let record = run_one(&spec, &host);
 
             assert!(
                 !marker.exists(),
-                "counter executable must never start for a latency run (method {method:?}, pct {pct})"
+                "counter executable must never start for a latency run (method {method:?}, rate {offered_rate})"
             );
             assert_eq!(
                 record.syscalls,
@@ -783,23 +782,23 @@ fn run_one_attaches_no_counter_to_a_latency_run() {
                     exit: None,
                     diagnostics: None,
                 },
-                "method {method:?}, pct {pct}"
+                "method {method:?}, rate {offered_rate}"
             );
             assert!(
                 record.harness_errors.is_empty(),
-                "method {method:?}, pct {pct}: harness_errors {:?}",
+                "method {method:?}, rate {offered_rate}: harness_errors {:?}",
                 record.harness_errors
             );
             assert!(
                 window_deliveries(&record) > 0,
-                "method {method:?}, pct {pct}: run must reach and measure its window"
+                "method {method:?}, rate {offered_rate}: run must reach and measure its window"
             );
             assert!(
                 !record
                     .invalid_reasons
                     .iter()
                     .any(|r| r.starts_with("syscall") || r.starts_with("counter")),
-                "method {method:?}, pct {pct}: unexpected counter-related invalid reason in {:?}",
+                "method {method:?}, rate {offered_rate}: unexpected counter-related invalid reason in {:?}",
                 record.invalid_reasons
             );
             let histogram = &record
@@ -809,7 +808,7 @@ fn run_one_attaches_no_counter_to_a_latency_run() {
                 .histogram;
             assert!(
                 !histogram.is_empty(),
-                "method {method:?}, pct {pct}: latency histogram must not be empty"
+                "method {method:?}, rate {offered_rate}: latency histogram must not be empty"
             );
 
             let _ = fs::remove_dir_all(&dir);
@@ -825,7 +824,7 @@ fn run_one_keeps_the_latency_histogram_of_a_counted_run() {
     let record = run_one(&counted_spec(), &host);
 
     let report_path = dir
-        .join("uring-w1-q1-counted-p80-a1-r1")
+        .join("uring-w1-q1-counted-at2-a1-r1")
         .join("endpoint.json");
     let data = fs::read_to_string(&report_path)
         .unwrap_or_else(|e| panic!("read {}: {e}", report_path.display()));
@@ -862,7 +861,7 @@ fn run_one_names_no_counter_on_a_latency_run_that_fails_before_its_window() {
 
         let mut latency = counted_spec();
         latency.kind = RunKind::Latency;
-        let latency_scratch = dir.join("uring-w1-q1-latency-p80-a1-r1");
+        let latency_scratch = dir.join("uring-w1-q1-latency-at2-a1-r1");
         fs::create_dir_all(&latency_scratch).expect("pre-create latency scratch dir");
         let latency_record = run_one(&latency, &host);
         assert_eq!(
@@ -881,7 +880,7 @@ fn run_one_names_no_counter_on_a_latency_run_that_fails_before_its_window() {
         );
 
         let counted = counted_spec();
-        let counted_scratch = dir.join("uring-w1-q1-counted-p80-a1-r1");
+        let counted_scratch = dir.join("uring-w1-q1-counted-at2-a1-r1");
         fs::create_dir_all(&counted_scratch).expect("pre-create counted scratch dir");
         let counted_record = run_one(&counted, &host);
         assert_eq!(counted_record.syscalls.method, method, "method {method:?}");

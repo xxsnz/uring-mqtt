@@ -31,9 +31,10 @@ use bench::record::Timeline;
 use bench::record::Window;
 
 use bench::runner::{
-    capture_env, capture_env_with, check_provenance, head_sha, head_sha_with, mosquitto_conf,
-    run_one, run_one_with, stem_for, HostSetup, RunSpec, CLEANUP_SURVIVOR_PREFIX,
-    GIT_HEAD_TIMEOUT_SECS, TOOL_VERSION_TIMEOUT_SECS,
+    capture_env, capture_env_with, check_provenance, declared_rates, head_sha, head_sha_with,
+    mosquitto_conf, run_one, run_one_with, stem_for, DeclaredRates, HostSetup, RunSpec,
+    CLEANUP_SURVIVOR_PREFIX, DECLARED_RATES_W1_Q0, DECLARED_RATES_W1_Q1, DECLARED_RATES_W4_Q0,
+    DECLARED_RATES_W4_Q1, GIT_HEAD_TIMEOUT_SECS, SMOKE_DECLARED_RATES, TOOL_VERSION_TIMEOUT_SECS,
 };
 
 /// `bench/build.rs`, compiled into this test so its probe can be driven with
@@ -587,7 +588,6 @@ fn smoke_uring_throughput_run_is_valid_with_driver_proof() {
         workers: 1,
         qos: Some(1),
         kind: RunKind::Throughput,
-        rate_fraction_pct: None,
         offered_rate: None,
         repetition: 1,
         attempt: 1,
@@ -626,7 +626,6 @@ fn smoke_tokio_throughput_run_is_valid() {
         workers: 1,
         qos: Some(1),
         kind: RunKind::Throughput,
-        rate_fraction_pct: None,
         offered_rate: None,
         repetition: 1,
         attempt: 1,
@@ -650,7 +649,6 @@ fn smoke_uring_connections_run_is_valid() {
         workers: 1,
         qos: None,
         kind: RunKind::Connections,
-        rate_fraction_pct: None,
         offered_rate: None,
         repetition: 1,
         attempt: 1,
@@ -681,7 +679,6 @@ fn a_run_records_the_host_cpu_pressure_over_its_window() {
         workers: 1,
         qos: None,
         kind: RunKind::Connections,
-        rate_fraction_pct: None,
         offered_rate: None,
         repetition: 1,
         attempt: 1,
@@ -735,7 +732,6 @@ fn a_run_records_the_growth_of_the_pressure_counter_between_its_window_samples()
         workers: 1,
         qos: None,
         kind: RunKind::Connections,
-        rate_fraction_pct: None,
         offered_rate: None,
         repetition: 1,
         attempt: 1,
@@ -804,7 +800,6 @@ fn a_run_whose_pressure_file_is_gone_at_the_end_sample_records_none_and_stays_va
         workers: 1,
         qos: None,
         kind: RunKind::Connections,
-        rate_fraction_pct: None,
         offered_rate: None,
         repetition: 1,
         attempt: 1,
@@ -863,7 +858,6 @@ fn a_run_without_a_pressure_file_records_none_and_stays_valid() {
         workers: 1,
         qos: None,
         kind: RunKind::Connections,
-        rate_fraction_pct: None,
         offered_rate: None,
         repetition: 1,
         attempt: 1,
@@ -929,7 +923,6 @@ fn run_one_invalidates_a_run_whose_children_write_no_reports() {
         workers: 1,
         qos: Some(1),
         kind: RunKind::Throughput,
-        rate_fraction_pct: None,
         offered_rate: None,
         repetition: 1,
         attempt: 1,
@@ -1002,7 +995,6 @@ fn a_failed_child_names_the_stderr_file_it_left() {
         workers: 1,
         qos: Some(1),
         kind: RunKind::Throughput,
-        rate_fraction_pct: None,
         offered_rate: None,
         repetition: 1,
         attempt: 1,
@@ -1084,7 +1076,6 @@ fn a_failed_child_whose_stderr_file_is_gone_says_none_was_kept() {
         workers: 1,
         qos: Some(1),
         kind: RunKind::Throughput,
-        rate_fraction_pct: None,
         offered_rate: None,
         repetition: 1,
         attempt: 1,
@@ -1154,7 +1145,6 @@ fn a_child_killed_by_a_signal_names_the_stderr_file_it_left() {
         workers: 1,
         qos: Some(1),
         kind: RunKind::Throughput,
-        rate_fraction_pct: None,
         offered_rate: None,
         repetition: 1,
         attempt: 1,
@@ -1220,7 +1210,6 @@ fn a_ready_failure_whose_stderr_file_is_gone_says_none_was_kept() {
         workers: 1,
         qos: Some(1),
         kind: RunKind::Throughput,
-        rate_fraction_pct: None,
         offered_rate: None,
         repetition: 1,
         attempt: 1,
@@ -1289,7 +1278,6 @@ fn an_arm_failure_whose_stderr_file_is_gone_says_none_was_kept() {
         workers: 1,
         qos: Some(1),
         kind: RunKind::Throughput,
-        rate_fraction_pct: None,
         offered_rate: None,
         repetition: 1,
         attempt: 1,
@@ -1364,7 +1352,6 @@ fn run_one_with_records_a_child_its_cleanup_could_not_end() {
         workers: 1,
         qos: Some(1),
         kind: RunKind::Throughput,
-        rate_fraction_pct: None,
         offered_rate: None,
         repetition: 1,
         attempt: 1,
@@ -1490,7 +1477,6 @@ fn run_one_succeeds_when_the_endpoint_starts_slower_than_the_lead() {
         workers: 1,
         qos: Some(1),
         kind: RunKind::Throughput,
-        rate_fraction_pct: None,
         offered_rate: None,
         repetition: 1,
         attempt: 1,
@@ -2524,6 +2510,48 @@ fn mosquitto_conf_renders_the_approved_options() {
 }
 
 #[test]
+fn declared_rates_maps_every_row_group_to_its_calibrated_pair() {
+    // The committed calibration (`bench/CALIBRATION.md`) is what the §9.1
+    // declared rates mean, so an edited rate is a changed experiment and
+    // needs a fresh calibration and a fresh dataset. These literals are the
+    // calibrated values, asserted at the public seam `matrix::run_matrix_with`
+    // and `doc::row_rates` dispatch through.
+    assert_eq!(DECLARED_RATES_W1_Q1, DeclaredRates { lower: 75_000, higher: 300_000 });
+    assert_eq!(DECLARED_RATES_W1_Q0, DeclaredRates { lower: 150_000, higher: 400_000 });
+    assert_eq!(DECLARED_RATES_W4_Q1, DeclaredRates { lower: 900_000, higher: 1_200_000 });
+    assert_eq!(DECLARED_RATES_W4_Q0, DeclaredRates { lower: 1_300_000, higher: 1_500_000 });
+    assert_eq!(SMOKE_DECLARED_RATES, DeclaredRates { lower: 40_000, higher: 60_000 });
+
+    for (workers, qos, expected) in [
+        (1, 1, DECLARED_RATES_W1_Q1),
+        (1, 0, DECLARED_RATES_W1_Q0),
+        (4, 1, DECLARED_RATES_W4_Q1),
+        (4, 0, DECLARED_RATES_W4_Q0),
+    ] {
+        assert_eq!(
+            declared_rates(Profile::Recorded, workers, qos),
+            Some(expected),
+            "recorded {workers} workers QoS {qos} must offer its own calibrated pair"
+        );
+        assert_eq!(
+            declared_rates(Profile::Smoke, workers, qos),
+            Some(SMOKE_DECLARED_RATES),
+            "smoke offers one pair for every row group"
+        );
+        assert_eq!(
+            expected.both(),
+            [expected.lower, expected.higher],
+            "the open-loop stage dispatches the lower rate first"
+        );
+    }
+
+    // Outside the §9.1 matrix no calibration exists, so the lookup refuses
+    // instead of lending a neighbouring row group's rates.
+    assert_eq!(declared_rates(Profile::Recorded, 2, 1), None);
+    assert_eq!(declared_rates(Profile::Recorded, 1, 2), None);
+}
+
+#[test]
 fn capture_env_refuses_a_tool_that_prints_no_version() {
     let dir = temp_dir("blank-version");
     let tool = make_script(&dir, "blank-version.sh", "printf '\\n   \\n'\n");
@@ -2968,7 +2996,6 @@ fn _shape_references() {
         workers: 1,
         qos: Some(1),
         kind: RunKind::Throughput,
-        rate_fraction_pct: None,
         offered_rate: None,
         repetition: 1,
         attempt: 1,

@@ -552,16 +552,14 @@ fn smoke_matrix_writes_every_configuration_valid() {
         "--syscalls",
         "none",
     ]);
-    // The smoke matrix on this host runs 8 records (throughput, two
-    // latency fractions, connections, × 2 repetitions) with a 2 s
-    // warmup and a 5 s window each, so the wall clock needs headroom
-    // for the 100-client connect storm and the open-loop latency
-    // pacing.
+    // The smoke matrix on this host runs 8 records (throughput, latency
+    // at the two smoke declared rates, connections, × 2 repetitions)
+    // with a 2 s warmup and a 5 s window each, so the wall clock needs
+    // headroom for the 100-client connect storm and the open-loop
+    // latency pacing.
     let status = run.wait_exit_code(Duration::from_secs(180));
     // Smoke matrix: 1 server * 1 worker * 1 qos * (1 throughput + 2 latency
-    // + 1 connections) * 2 repetitions = 8. A throughput configuration that
-    // failed would leave its latency configurations unrun, so the count
-    // alone catches a half-run matrix.
+    // + 1 connections) * 2 repetitions = 8.
     let count = count_json(&out_dir);
     let records = load_records(&out_dir);
     assert_eq!(count, 8, "expected 8 .json files, got {count}; invalid records: {:?}", invalid_summary(&records));
@@ -582,24 +580,24 @@ fn smoke_matrix_writes_every_configuration_valid() {
 
     // The matrix must cover exactly the four §9.1 configurations of this
     // row, each at both repetitions.
-    let mut configs: Vec<(RunKind, Option<u32>, u32)> = records
+    let mut configs: Vec<(RunKind, Option<u64>, u32)> = records
         .iter()
-        .map(|(_, r)| (r.kind, r.rate_fraction_pct, r.repetition))
+        .map(|(_, r)| (r.kind, r.offered_rate, r.repetition))
         .collect();
-    configs.sort_by_key(|(kind, pct, rep)| (format!("{kind:?}"), *pct, *rep));
+    configs.sort_by_key(|(kind, rate, rep)| (format!("{kind:?}"), *rate, *rep));
     assert_eq!(
         configs,
         vec![
             (RunKind::Connections, None, 1),
             (RunKind::Connections, None, 2),
-            (RunKind::Latency, Some(50), 1),
-            (RunKind::Latency, Some(50), 2),
-            (RunKind::Latency, Some(80), 1),
-            (RunKind::Latency, Some(80), 2),
+            (RunKind::Latency, Some(40_000), 1),
+            (RunKind::Latency, Some(40_000), 2),
+            (RunKind::Latency, Some(60_000), 1),
+            (RunKind::Latency, Some(60_000), 2),
             (RunKind::Throughput, None, 1),
             (RunKind::Throughput, None, 2),
         ],
-        "the smoke matrix must run throughput, latency 50 %, latency 80 % \
+        "the smoke matrix must run throughput, latency at 40000 and 60000 msgs/s \
          and connections at both repetitions"
     );
 
