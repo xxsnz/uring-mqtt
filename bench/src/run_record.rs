@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::record::{Timeline, Window};
+use crate::record::{Timeline, Window, WorkerLoad};
 
 pub const SCHEMA_VERSION: u32 = 3;
 
@@ -208,6 +208,13 @@ pub struct RunRecord {
     /// read as `None`.
     #[serde(default)]
     pub host_cpu_pressure: Option<HostCpuPressure>,
+    /// The run's connections split by the server worker that served them,
+    /// busiest first, padded to `workers` with zero entries for workers that
+    /// delivered no benchmark publish (all of them in a connections run). `None` for a
+    /// mosquitto run, a run whose endpoint wrote no report, and records written
+    /// before this field existed. Evidence only: no reconciliation row reads it.
+    #[serde(default)]
+    pub worker_loads: Option<Vec<WorkerLoad>>,
     pub started_at_unix: u64,
     pub harness_errors: Vec<String>,
     pub valid: bool,

@@ -214,6 +214,7 @@ fn passing_record(
             generator_ticks: 24_000,
         }),
         host_cpu_pressure: None,
+        worker_loads: None,
         started_at_unix: 1_791_273_600,
         harness_errors: Vec::new(),
         valid: true,

@@ -88,6 +88,7 @@ pub fn run_server(args: &ServerArgs) -> Result<(), String> {
             let total = dropped.total();
             let mut report = recorder.report();
             report.dropped = Some(total);
+            report.worker_loads = Some(recorder.worker_loads(args.workers));
             write_report(&args.report, &report)?;
             joined?;
         }
@@ -116,6 +117,7 @@ pub fn run_server(args: &ServerArgs) -> Result<(), String> {
             let total = dropped.total();
             let mut report = recorder.report();
             report.dropped = Some(total);
+            report.worker_loads = Some(recorder.worker_loads(args.workers));
             write_report(&args.report, &report)?;
             joined?;
         }

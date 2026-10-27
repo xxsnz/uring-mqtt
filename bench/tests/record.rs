@@ -6,9 +6,9 @@
 
 use bench::payload::{monotonic_now_ns, Stamp, PAYLOAD_BYTES, TOPIC};
 use bench::record::{
-    parse_arm_line, Recorder, Timeline, Window, ARM_ORIGIN_SKEW_MAX_NS, CONNECTIONS_MAX,
-    LATENCY_BINS_BUDGET, LATENCY_BUCKET_MAX_NS, LATENCY_HISTOGRAM_BINS, LATENCY_MAX_NS,
-    LATENCY_SIGFIG, SEQ_CHUNK_SEQS, WINDOW_MAX_SPAN_NS,
+    parse_arm_line, Recorder, Timeline, Window, WorkerLoad, ARM_ORIGIN_SKEW_MAX_NS,
+    CONNECTIONS_MAX, LATENCY_BINS_BUDGET, LATENCY_BUCKET_MAX_NS, LATENCY_HISTOGRAM_BINS,
+    LATENCY_MAX_NS, LATENCY_SIGFIG, SEQ_CHUNK_SEQS, WINDOW_MAX_SPAN_NS,
 };
 use hdrhistogram::Histogram;
 
@@ -30,6 +30,27 @@ fn armed_recorder() -> Recorder {
     )
     .expect("recorder arms once from a fresh instance");
     rec
+}
+
+/// Record `conn_id`'s deliveries for every `seq` in `start..=end`, each
+/// scheduled at `scheduled_ns` and delivered `latency_ns` later.
+fn record_seq_range(
+    rec: &Recorder,
+    conn_id: u32,
+    start: u64,
+    end: u64,
+    scheduled_ns: u64,
+    latency_ns: u64,
+) {
+    for seq in start..=end {
+        let payload = Stamp {
+            conn_id,
+            seq,
+            scheduled_ns,
+        }
+        .encode();
+        rec.record(&payload, scheduled_ns + latency_ns);
+    }
 }
 
 #[test]
@@ -459,4 +480,286 @@ fn the_latency_bucket_bound_is_the_top_of_the_histogram_cap_bucket() {
         histogram.highest_equivalent(LATENCY_MAX_NS),
         LATENCY_BUCKET_MAX_NS
     );
+}
+
+#[test]
+fn recorder_worker_loads_attribute_each_connection_to_the_thread_that_delivered_it_first() {
+    let rec = Recorder::new(5);
+    rec.arm_at(
+        ORIGIN_NS,
+        Window {
+            start_ns: WINDOW_START_NS,
+            end_ns: WINDOW_END_NS,
+        },
+        ORIGIN_NS,
+    )
+    .expect("recorder arms once from a fresh instance");
+
+    let scheduled_ns = 15_000_000_000;
+    let latency_ns = 1_000_000;
+
+    let rec_c = rec.clone();
+    let thread_c = std::thread::spawn(move || {
+        record_seq_range(&rec_c, 0, 0, 0, scheduled_ns, latency_ns);
+    });
+
+    let rec_b = rec.clone();
+    let thread_b = std::thread::spawn(move || {
+        record_seq_range(&rec_b, 1, 0, 0, scheduled_ns, latency_ns);
+        record_seq_range(&rec_b, 2, 0, 0, scheduled_ns, latency_ns);
+    });
+
+    let rec_a = rec.clone();
+    let thread_a = std::thread::spawn(move || {
+        record_seq_range(&rec_a, 3, 0, 1, scheduled_ns, latency_ns);
+        record_seq_range(&rec_a, 4, 0, 1, scheduled_ns, latency_ns);
+    });
+
+    thread_c.join().expect("thread C joins");
+    thread_b.join().expect("thread B joins");
+    thread_a.join().expect("thread A joins");
+
+    // A late delivery on a fourth thread must not move conn 3's group: its
+    // first delivery already ran on thread A.
+    record_seq_range(&rec, 3, 2, 2, scheduled_ns, latency_ns);
+
+    let loads = rec.worker_loads(3);
+
+    assert_eq!(loads.len(), 3);
+    let tolerance_ns = latency_ns / 1000; // within 0.1 %
+
+    assert_eq!(loads[0].connections, 2);
+    assert_eq!(loads[0].delivered, 5);
+    assert!(loads[0]
+        .latency_p99_ns
+        .expect("group has in-window samples")
+        .abs_diff(latency_ns)
+        <= tolerance_ns);
+
+    assert_eq!(loads[1].connections, 2);
+    assert_eq!(loads[1].delivered, 2);
+    assert!(loads[1]
+        .latency_p99_ns
+        .expect("group has in-window samples")
+        .abs_diff(latency_ns)
+        <= tolerance_ns);
+
+    assert_eq!(loads[2].connections, 1);
+    assert_eq!(loads[2].delivered, 1);
+    assert!(loads[2]
+        .latency_p99_ns
+        .expect("group has in-window samples")
+        .abs_diff(latency_ns)
+        <= tolerance_ns);
+}
+
+#[test]
+fn recorder_worker_loads_pad_with_idle_workers() {
+    let rec = Recorder::new(1);
+    rec.arm_at(
+        ORIGIN_NS,
+        Window {
+            start_ns: WINDOW_START_NS,
+            end_ns: WINDOW_END_NS,
+        },
+        ORIGIN_NS,
+    )
+    .expect("recorder arms once from a fresh instance");
+
+    let before_window_scheduled_ns = 9_500_000_000;
+    let late_latency_ns = 5_000_000_000; // scheduled 9.5 s, recorded 14.5 s
+
+    let rec_thread = rec.clone();
+    std::thread::spawn(move || {
+        record_seq_range(
+            &rec_thread,
+            0,
+            0,
+            0,
+            before_window_scheduled_ns,
+            late_latency_ns,
+        );
+    })
+    .join()
+    .expect("spawned thread joins");
+
+    let loads = rec.worker_loads(4);
+
+    assert_eq!(
+        loads,
+        vec![
+            WorkerLoad {
+                connections: 1,
+                delivered: 1,
+                latency_p99_ns: None,
+            },
+            WorkerLoad {
+                connections: 0,
+                delivered: 0,
+                latency_p99_ns: None,
+            },
+            WorkerLoad {
+                connections: 0,
+                delivered: 0,
+                latency_p99_ns: None,
+            },
+            WorkerLoad {
+                connections: 0,
+                delivered: 0,
+                latency_p99_ns: None,
+            },
+        ]
+    );
+}
+
+/// A connections run delivers no benchmark publish, and a foreign payload
+/// never reaches a shard, so no thread is attributed and every entry is the
+/// zero padding entry.
+#[test]
+fn recorder_worker_loads_are_all_zero_when_no_connection_delivered() {
+    let rec = armed_recorder();
+
+    let rec_thread = rec.clone();
+    std::thread::spawn(move || {
+        let short_payload = vec![0u8; PAYLOAD_BYTES - 1];
+        rec_thread.record(&short_payload, WINDOW_START_NS);
+    })
+    .join()
+    .expect("spawned thread joins");
+
+    let report = rec.report();
+    assert_eq!(report.foreign, 1);
+    assert_eq!(report.delivered, 0);
+
+    assert_eq!(
+        rec.worker_loads(4),
+        vec![
+            WorkerLoad {
+                connections: 0,
+                delivered: 0,
+                latency_p99_ns: None,
+            };
+            4
+        ]
+    );
+}
+
+/// A duplicate is not a delivery: it must not inflate its worker's
+/// `delivered`, and a duplicate recorded on a second thread must not move the
+/// connection to that thread or open a second group.
+#[test]
+fn recorder_worker_loads_count_duplicates_on_neither_worker() {
+    let rec = armed_recorder();
+    let scheduled_ns = 15_000_000_000;
+    let latency_ns = 1_000_000;
+
+    let rec_a = rec.clone();
+    std::thread::spawn(move || {
+        record_seq_range(&rec_a, 0, 0, 0, scheduled_ns, latency_ns);
+        record_seq_range(&rec_a, 0, 0, 0, scheduled_ns, latency_ns);
+    })
+    .join()
+    .expect("thread A joins");
+
+    let rec_b = rec.clone();
+    std::thread::spawn(move || {
+        record_seq_range(&rec_b, 0, 0, 0, scheduled_ns, latency_ns);
+    })
+    .join()
+    .expect("thread B joins");
+
+    let report = rec.report();
+    assert_eq!(report.delivered, 1);
+    assert_eq!(report.duplicates, 2);
+
+    let loads = rec.worker_loads(2);
+    assert_eq!(loads.len(), 2);
+    assert_eq!(loads[0].connections, 1);
+    assert_eq!(loads[0].delivered, 1);
+    assert!(loads[0]
+        .latency_p99_ns
+        .expect("group has in-window samples")
+        .abs_diff(latency_ns)
+        <= latency_ns / 1000);
+    assert_eq!(
+        loads[1],
+        WorkerLoad {
+            connections: 0,
+            delivered: 0,
+            latency_p99_ns: None,
+        }
+    );
+
+    let total_delivered: u64 = loads.iter().map(|l| l.delivered).sum();
+    assert_eq!(total_delivered, report.delivered);
+}
+
+#[test]
+fn recorder_worker_loads_report_the_p99_of_each_workers_merged_window_samples() {
+    let rec = Recorder::new(5);
+    rec.arm_at(
+        ORIGIN_NS,
+        Window {
+            start_ns: WINDOW_START_NS,
+            end_ns: WINDOW_END_NS,
+        },
+        ORIGIN_NS,
+    )
+    .expect("recorder arms once from a fresh instance");
+
+    let in_window_scheduled_ns = 15_000_000_000;
+    let fast_latency_ns = 1_000_000;
+    let slow_latency_ns = 100_000_000;
+    let before_window_scheduled_ns = 9_500_000_000;
+    let late_latency_ns = 5_000_000_000;
+
+    let rec_a = rec.clone();
+    let thread_a = std::thread::spawn(move || {
+        record_seq_range(&rec_a, 0, 0, 49, in_window_scheduled_ns, fast_latency_ns);
+        record_seq_range(&rec_a, 1, 0, 48, in_window_scheduled_ns, fast_latency_ns);
+        record_seq_range(&rec_a, 1, 49, 49, in_window_scheduled_ns, slow_latency_ns);
+        record_seq_range(&rec_a, 0, 50, 50, before_window_scheduled_ns, late_latency_ns);
+    });
+
+    let rec_b = rec.clone();
+    let thread_b = std::thread::spawn(move || {
+        record_seq_range(&rec_b, 2, 0, 0, in_window_scheduled_ns, slow_latency_ns);
+    });
+
+    let rec_c = rec.clone();
+    let thread_c = std::thread::spawn(move || {
+        record_seq_range(&rec_c, 3, 0, 49, in_window_scheduled_ns, fast_latency_ns);
+        record_seq_range(&rec_c, 4, 0, 47, in_window_scheduled_ns, fast_latency_ns);
+        record_seq_range(&rec_c, 4, 48, 49, in_window_scheduled_ns, slow_latency_ns);
+    });
+
+    thread_a.join().expect("thread A joins");
+    thread_b.join().expect("thread B joins");
+    thread_c.join().expect("thread C joins");
+
+    let loads = rec.worker_loads(3);
+
+    assert_eq!(loads.len(), 3);
+    let tolerance = |expected: u64| expected / 1000; // within 0.1 %
+
+    assert_eq!(loads[0].connections, 2);
+    assert_eq!(loads[0].delivered, 101);
+    let p99_a = loads[0]
+        .latency_p99_ns
+        .expect("group A has in-window samples");
+    assert!(p99_a.abs_diff(fast_latency_ns) <= tolerance(fast_latency_ns));
+
+    assert_eq!(loads[1].connections, 2);
+    assert_eq!(loads[1].delivered, 100);
+    let p99_c = loads[1]
+        .latency_p99_ns
+        .expect("group C has in-window samples");
+    assert!(p99_c.abs_diff(slow_latency_ns) <= tolerance(slow_latency_ns));
+
+    assert_eq!(loads[2].connections, 1);
+    assert_eq!(loads[2].delivered, 1);
+    let p99_b = loads[2]
+        .latency_p99_ns
+        .expect("group B has in-window samples");
+    assert!(p99_b.abs_diff(slow_latency_ns) <= tolerance(slow_latency_ns));
 }

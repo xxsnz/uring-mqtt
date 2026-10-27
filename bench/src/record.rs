@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::ThreadId;
 
 use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
 
+use crate::analysis::percentile;
 use crate::payload::{monotonic_now_ns, Stamp, TOPIC};
 
 pub const LATENCY_MAX_NS: u64 = 60_000_000_000;
@@ -134,6 +136,21 @@ pub struct DeliveryReport {
     pub dropped: Option<u64>,
     pub timeline: Timeline,
     pub latency: Vec<(u64, u64)>,
+    /// Per-worker split of the run's connections, busiest first, padded to the
+    /// worker count; set by `bench server` only. `None` from `bench sub` and in
+    /// reports written before this field existed.
+    #[serde(default)]
+    pub worker_loads: Option<Vec<WorkerLoad>>,
+}
+
+/// One server worker's share of a run: the connections whose first delivery
+/// ran on that worker's thread, every delivery of those connections, and the
+/// p99 of their in-window latency samples.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerLoad {
+    pub connections: u32,
+    pub delivered: u64,
+    pub latency_p99_ns: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -146,6 +163,8 @@ struct Shard {
     timeline_origin_sec: Option<u64>,
     timeline: Vec<u64>,
     latency: Option<Histogram<u64>>,
+    /// Thread of this connection's first delivery: the server worker that owns it.
+    first_thread: Option<ThreadId>,
 }
 
 /// Allocate one shard's latency histogram. Deferred to the shard's first
@@ -169,6 +188,7 @@ impl Shard {
             timeline_origin_sec: None,
             timeline: Vec::new(),
             latency: None,
+            first_thread: None,
         }
     }
 
@@ -220,6 +240,33 @@ struct Inner {
 #[derive(Clone)]
 pub struct Recorder {
     inner: Arc<Inner>,
+}
+
+/// One server worker's connections while `Recorder::worker_loads` groups them.
+struct WorkerGroup {
+    thread: ThreadId,
+    connections: u32,
+    delivered: u64,
+    latency: Option<Histogram<u64>>,
+}
+
+/// `(bucket value, count)` for every recorded bucket, ascending — the
+/// shape `DeliveryReport.latency` and `analysis::percentile` read.
+fn histogram_buckets(histogram: &Histogram<u64>) -> Vec<(u64, u64)> {
+    histogram
+        .iter_recorded()
+        .map(|iv| (iv.value_iterated_to(), iv.count_at_value()))
+        .collect()
+}
+
+/// Add `latency` into `target`, taking a copy when `target` is empty.
+fn merge_histogram(target: &mut Option<Histogram<u64>>, latency: &Histogram<u64>) {
+    match target.as_mut() {
+        Some(h) => {
+            h.add(latency).expect("merging same-bounds histograms");
+        }
+        None => *target = Some(latency.clone()),
+    }
 }
 
 impl Recorder {
@@ -299,6 +346,9 @@ impl Recorder {
             }
         };
         let mut shard = self.inner.shards[conn_id].lock().expect("shard poisoned");
+        if shard.first_thread.is_none() {
+            shard.first_thread = Some(std::thread::current().id());
+        }
         if shard.set_seq_bit(stamp.seq) {
             shard.duplicates = shard.duplicates.saturating_add(1);
             return;
@@ -352,23 +402,10 @@ impl Recorder {
             // A shard with no in-window delivery holds no histogram, so it
             // contributes nothing to merge.
             if let Some(latency) = s.latency.as_ref() {
-                match merged.as_mut() {
-                    Some(h) => {
-                        h.add(latency).expect("merging same-bounds histograms");
-                    }
-                    None => {
-                        merged = Some(latency.clone());
-                    }
-                }
+                merge_histogram(&mut merged, latency);
             }
         }
-        let latency = match merged {
-            Some(h) => h
-                .iter_recorded()
-                .map(|iv| (iv.value_iterated_to(), iv.count_at_value()))
-                .collect(),
-            None => Vec::new(),
-        };
+        let latency = merged.as_ref().map_or_else(Vec::new, histogram_buckets);
         let armed_origin_sec = self.inner.armed.get().map_or(0, |&(o, _)| o);
         // Shards that saw a delivery before the armed origin carry an earlier
         // origin of their own; the merged timeline starts at the earliest.
@@ -399,7 +436,66 @@ impl Recorder {
                 counts: timeline,
             },
             latency,
+            worker_loads: None,
         }
+    }
+
+    /// The run's connections grouped by the thread of their first delivery —
+    /// one group per server worker, because both servers run each connection
+    /// on the worker thread that accepted it. Ordered by `connections`, then
+    /// `delivered`, both descending, and padded with zero entries up to
+    /// `workers`: a zero entry means no observed benchmark delivery, not an
+    /// idle worker (a connections run records only zero entries). Each entry's p99 is `analysis::percentile` over the merged
+    /// in-window latency of that group's connections only.
+    pub fn worker_loads(&self, workers: usize) -> Vec<WorkerLoad> {
+        let mut groups: Vec<WorkerGroup> = Vec::new();
+        for shard in &self.inner.shards {
+            let s = shard.lock().expect("shard poisoned");
+            let Some(thread) = s.first_thread else { continue };
+            let index = if let Some(i) = groups.iter().position(|g| g.thread == thread) {
+                i
+            } else {
+                groups.push(WorkerGroup {
+                    thread,
+                    connections: 0,
+                    delivered: 0,
+                    latency: None,
+                });
+                groups.len() - 1
+            };
+            let group = &mut groups[index];
+            group.connections += 1;
+            group.delivered = group.delivered.saturating_add(s.delivered);
+            if let Some(latency) = s.latency.as_ref() {
+                merge_histogram(&mut group.latency, latency);
+            }
+        }
+        let mut loads: Vec<WorkerLoad> = groups
+            .into_iter()
+            .map(|g| WorkerLoad {
+                connections: g.connections,
+                delivered: g.delivered,
+                latency_p99_ns: g
+                    .latency
+                    .and_then(|h| percentile(&histogram_buckets(&h), 0.99)),
+            })
+            .collect();
+        loads.sort_by(|a, b| {
+            b.connections
+                .cmp(&a.connections)
+                .then(b.delivered.cmp(&a.delivered))
+        });
+        if loads.len() < workers {
+            loads.resize(
+                workers,
+                WorkerLoad {
+                    connections: 0,
+                    delivered: 0,
+                    latency_p99_ns: None,
+                },
+            );
+        }
+        loads
     }
 
     pub fn callback(&self) -> uring_mqtt::PublishCallback {

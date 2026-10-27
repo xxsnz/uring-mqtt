@@ -1398,6 +1398,7 @@ fn build_minimal_record(spec: &RunSpec) -> RunRecord {
         },
         cpu: None,
         host_cpu_pressure: None,
+        worker_loads: None,
         started_at_unix: 0,
         harness_errors: Vec::new(),
         valid: false,
@@ -3458,6 +3459,7 @@ fn finalize_record(
         env: host.env.clone(),
         cpu,
         host_cpu_pressure: None,
+        worker_loads: delivery.worker_loads,
         started_at_unix: now,
         harness_errors: harness_errors.to_vec(),
         valid: false,
@@ -3495,6 +3497,7 @@ fn empty_delivery_report() -> DeliveryReport {
             counts: Vec::new(),
         },
         latency: Vec::new(),
+        worker_loads: None,
     }
 }
 

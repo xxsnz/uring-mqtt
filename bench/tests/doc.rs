@@ -226,6 +226,7 @@ fn throughput_record(server: ServerKind, workers: u32, qos: u8, rep: u32) -> Run
         env: env(),
         cpu: Some(cpu_usage()),
         host_cpu_pressure: None,
+        worker_loads: None,
         started_at_unix: 1_791_273_600,
         harness_errors: Vec::new(),
         valid: true,
@@ -315,6 +316,7 @@ fn latency_record(
         env: env(),
         cpu: Some(cpu_usage()),
         host_cpu_pressure: None,
+        worker_loads: None,
         started_at_unix: 1_791_273_600,
         harness_errors: Vec::new(),
         valid: true,
@@ -393,6 +395,7 @@ fn connections_record(server: ServerKind, workers: u32, rep: u32) -> RunRecord {
         env: env(),
         cpu: Some(cpu_usage()),
         host_cpu_pressure: None,
+        worker_loads: None,
         started_at_unix: 1_791_273_600,
         harness_errors: Vec::new(),
         valid: true,
@@ -425,6 +428,26 @@ fn full_recorded_set() -> Vec<RunRecord> {
         }
     }
     out
+}
+
+#[test]
+fn render_ignores_worker_loads() {
+    let baseline = render(&full_recorded_set(), false).expect("render ok");
+    let inconsistent = serde_json::json!([{"connections": 7, "delivered": 1, "latency_p99_ns": null}]);
+    for loads in [serde_json::json!([]), inconsistent] {
+        let records: Vec<RunRecord> = full_recorded_set()
+            .iter()
+            .map(|r| {
+                let mut value = serde_json::to_value(r).expect("serialize the run");
+                value
+                    .as_object_mut()
+                    .expect("run is a JSON object")
+                    .insert("worker_loads".to_string(), loads.clone());
+                serde_json::from_value(value).expect("deserialize the run")
+            })
+            .collect();
+        assert_eq!(render(&records, false).expect("render ok"), baseline);
+    }
 }
 
 /// The mosquitto label of a results row: the `## Results` tables name

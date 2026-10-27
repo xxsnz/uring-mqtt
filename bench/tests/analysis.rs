@@ -245,6 +245,7 @@ fn baseline_record(kind: RunKind, server: ServerKind) -> RunRecord {
             generator_ticks: 24_000,
         }),
         host_cpu_pressure: None,
+        worker_loads: None,
         started_at_unix: 1_791_273_600,
         harness_errors: Vec::new(),
         valid: true,
@@ -2019,6 +2020,56 @@ fn host_cpu_pressure_does_not_change_the_reconciliation_verdict() {
     let after = reconcile(&invalid);
     assert_eq!(before, after);
     assert!(!before.is_empty(), "duplicates=2 must surface as a reconciliation reason");
+}
+
+#[test]
+fn a_record_keeps_the_worker_loads_it_was_given() {
+    let loads = serde_json::json!([
+        {"connections": 31, "delivered": 1_132_004_u64, "latency_p99_ns": 48_211_967_u64},
+        {"connections": 25, "delivered": 915_233_u64, "latency_p99_ns": null}
+    ]);
+    let mut value = serde_json::to_value(valid_record(RunKind::Latency)).expect("serialize the run");
+    value
+        .as_object_mut()
+        .expect("run is a JSON object")
+        .insert("worker_loads".to_string(), loads.clone());
+    let record: RunRecord = serde_json::from_value(value).expect("deserialize the run");
+    let back = serde_json::to_value(&record).expect("serialize the run");
+    assert_eq!(back["worker_loads"], loads);
+}
+
+#[test]
+fn a_record_written_before_worker_loads_reads_them_as_unmeasured() {
+    let mut value = serde_json::to_value(valid_record(RunKind::Latency)).expect("serialize the run");
+    value
+        .as_object_mut()
+        .expect("run is a JSON object")
+        .remove("worker_loads");
+    let record: RunRecord = serde_json::from_value(value).expect("a record without worker_loads still deserializes");
+    let back = serde_json::to_value(&record).expect("serialize the run");
+    assert_eq!(back.get("worker_loads"), Some(&serde_json::Value::Null));
+}
+
+#[test]
+fn worker_loads_do_not_change_the_reconciliation_verdict() {
+    let with_loads = |record: &RunRecord, loads: serde_json::Value| -> RunRecord {
+        let mut value = serde_json::to_value(record).expect("serialize the run");
+        value
+            .as_object_mut()
+            .expect("run is a JSON object")
+            .insert("worker_loads".to_string(), loads);
+        serde_json::from_value(value).expect("deserialize the run")
+    };
+    let valid = valid_record(RunKind::Latency);
+    let mut invalid = valid_record(RunKind::Latency);
+    invalid.counts.duplicates = 2;
+    let before = reconcile(&invalid);
+    assert!(!before.is_empty(), "duplicates=2 must surface as a reconciliation reason");
+    let inconsistent = serde_json::json!([{"connections": 7, "delivered": 1, "latency_p99_ns": null}]);
+    for loads in [serde_json::json!([]), inconsistent] {
+        assert_eq!(reconcile(&with_loads(&valid, loads.clone())), Vec::<String>::new());
+        assert_eq!(reconcile(&with_loads(&invalid, loads)), before);
+    }
 }
 
 /// The five repetitions of one attempt of the uring 1-worker QoS 1 `kind`

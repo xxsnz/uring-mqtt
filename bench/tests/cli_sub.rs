@@ -403,6 +403,8 @@ fn sub_records_and_acks_every_delivered_publish_then_reports_on_sigterm() {
 
     let raw = read_json(&report);
     assert!(raw.contains("\"dropped\": null"), "raw JSON must show dropped: null, got {raw:?}");
+    assert_eq!(delivery.worker_loads, None, "the mosquitto-side endpoint attributes no worker");
+    assert!(raw.contains("\"worker_loads\": null"), "raw JSON must show worker_loads: null, got {raw:?}");
 
     let _ = std::fs::remove_file(&report);
 }

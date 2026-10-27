@@ -33,8 +33,9 @@ use bench::record::Window;
 use bench::runner::{
     capture_env, capture_env_with, check_provenance, declared_rates, head_sha, head_sha_with,
     mosquitto_conf, run_one, run_one_with, stem_for, DeclaredRates, HostSetup, RunSpec,
-    CLEANUP_SURVIVOR_PREFIX, DECLARED_RATES_W1_Q0, DECLARED_RATES_W1_Q1, DECLARED_RATES_W4_Q0,
-    DECLARED_RATES_W4_Q1, GIT_HEAD_TIMEOUT_SECS, SMOKE_DECLARED_RATES, TOOL_VERSION_TIMEOUT_SECS,
+    CLEANUP_SURVIVOR_PREFIX, CONNECTIONS, DECLARED_RATES_W1_Q0, DECLARED_RATES_W1_Q1,
+    DECLARED_RATES_W4_Q0, DECLARED_RATES_W4_Q1, GIT_HEAD_TIMEOUT_SECS, SMOKE_DECLARED_RATES,
+    TOOL_VERSION_TIMEOUT_SECS,
 };
 
 /// `bench/build.rs`, compiled into this test so its probe can be driven with
@@ -614,6 +615,70 @@ fn smoke_uring_throughput_run_is_valid_with_driver_proof() {
     assert!(cpu.generator_ticks > 0, "generator ticks must be > 0");
 
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// Number of workers the per-worker load assertions below drive a run with.
+const WORKER_LOADS_WORKERS: u32 = 4;
+
+/// Run a four-worker smoke latency run against `server` in a scratch
+/// directory named `dir_name`, and assert the per-worker loads it records:
+/// one entry per worker, every connection and every delivery attributed,
+/// the busiest worker first, a p99 on every worker that carried a
+/// connection, and the same loads in the run's `endpoint.json`.
+///
+/// Both server kinds are asserted the same way, so each one keeps its own
+/// named test and both share this body.
+fn assert_worker_loads_recorded(server: ServerKind, dir_name: &str) {
+    let dir = temp_dir(dir_name);
+    let host = real_host_setup(dir.clone(), Arc::new(AtomicBool::new(false)));
+    let spec = RunSpec {
+        profile: Profile::Smoke,
+        server,
+        workers: WORKER_LOADS_WORKERS,
+        qos: Some(1),
+        kind: RunKind::Latency,
+        offered_rate: Some(SMOKE_DECLARED_RATES.lower),
+        repetition: 1,
+        attempt: 1,
+    };
+
+    let record = run_one(&spec, &host);
+
+    let loads = record
+        .worker_loads
+        .clone()
+        .expect("bench server reports worker loads");
+    assert_eq!(loads.len(), WORKER_LOADS_WORKERS as usize);
+    let total_connections: u32 = loads.iter().map(|l| l.connections).sum();
+    assert_eq!(total_connections, CONNECTIONS);
+    assert!(record.counts.delivered > 0);
+    let total_delivered: u64 = loads.iter().map(|l| l.delivered).sum();
+    assert_eq!(total_delivered, record.counts.delivered);
+    assert!(loads[0].connections >= loads[WORKER_LOADS_WORKERS as usize - 1].connections);
+    for load in &loads {
+        if load.connections > 0 {
+            assert!(load.latency_p99_ns.is_some());
+        }
+    }
+
+    let endpoint: DeliveryReport = serde_json::from_str(
+        &fs::read_to_string(dir.join(stem_for(&spec)).join("endpoint.json"))
+            .expect("read endpoint.json"),
+    )
+    .expect("parse endpoint.json");
+    assert_eq!(record.worker_loads, endpoint.worker_loads);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_four_worker_uring_run_records_every_connection_on_one_worker() {
+    assert_worker_loads_recorded(ServerKind::Uring, "worker-loads-uring");
+}
+
+#[test]
+fn a_four_worker_tokio_run_records_every_connection_on_one_worker() {
+    assert_worker_loads_recorded(ServerKind::Tokio, "worker-loads-tokio");
 }
 
 #[test]
@@ -3068,6 +3133,7 @@ fn _shape_references() {
         },
         cpu: None,
         host_cpu_pressure: None,
+        worker_loads: None,
         started_at_unix: 0,
         harness_errors: Vec::new(),
         valid: false,
@@ -3086,5 +3152,6 @@ fn _shape_references() {
             counts: Vec::new(),
         },
         latency: Vec::new(),
+        worker_loads: None,
     };
 }

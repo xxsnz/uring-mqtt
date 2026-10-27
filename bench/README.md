@@ -697,6 +697,15 @@ cross-references them. `bench run --resume` and `bench doc` refuse a
 `*.json` whose name is not the name its record computes, so never
 rename or copy a record inside `<out>/`.
 
+Every uring and tokio-twin record also carries `worker_loads`: one
+entry per server worker (`connections`, `delivered`,
+`latency_p99_ns`), busiest first. A connection counts on the worker
+whose thread delivered its first publish, so a zero entry means no
+observed benchmark delivery, not an idle worker: a connections run
+delivers no publish and records only zero entries. A mosquitto record, a run
+whose endpoint wrote no report, and a record written before the field
+existed hold `null`. It never changes a record's validity.
+
 ## Reading this file
 
 If a later nightly `rustc` fails to build the bench crate, install the
