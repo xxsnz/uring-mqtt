@@ -2133,6 +2133,101 @@ fn render_names_the_declared_rates_and_their_calibration_in_the_method() {
     assert!(doc.lines().any(|l| l == expected), "missing the declared-rate Method line in:\n{doc}");
 }
 
+const DIAGNOSIS_LINE: &str = "`bench/DIAGNOSIS.md` records two diagnoses at commit `d637d09` on kernel `6.18.33.2-microsoft-standard-WSL2`. Generator placement: two 10-CPU generator sets, one holding the SMT siblings of the server CPUs, were compared at every declared rate, and no configuration met the pre-registered separation rule (every repetition p99 of one set above every repetition p99 of the other, or valid counts 4 or more apart out of 5); this shows robustness across those two sets only, not against effects smaller than 5 repetitions can detect, with the generator's CPU count untested and physical core sharing under Hyper-V unverified. The 4-worker open-loop shortfall: its cause is not established; a worker with the most connections under the kernel's SO_REUSEPORT split (any one of them, when tied) had both the lowest deliveries per connection and the highest p99 in 38 of the 61 invalid 4-worker runs, not in all.";
+
+fn assert_discloses_the_diagnoses_once(doc: &str) {
+    let method: Vec<&str> = doc
+        .lines()
+        .skip_while(|l| *l != "## Method")
+        .skip(1)
+        .take_while(|l| !l.starts_with("## "))
+        .collect();
+    assert_eq!(
+        method.iter().filter(|l| **l == DIAGNOSIS_LINE).count(),
+        1,
+        "expected the diagnosis line once inside ## Method in:\n{doc}"
+    );
+    assert_eq!(
+        doc.lines().filter(|l| *l == DIAGNOSIS_LINE).count(),
+        1,
+        "expected the diagnosis line once in the whole document:\n{doc}"
+    );
+}
+
+#[test]
+fn render_discloses_the_placement_and_shortfall_diagnoses_once_in_the_method() {
+    let doc = render(&full_recorded_set(), false).expect("render ok");
+    assert_discloses_the_diagnoses_once(&doc);
+}
+
+/// A complete smoke set of one uring 1-worker QoS 1 configuration, with no
+/// counted run.
+fn smoke_uncounted_set() -> Vec<RunRecord> {
+    vec![
+        throughput_record(ServerKind::Uring, 1, 1, 1),
+        throughput_record(ServerKind::Uring, 1, 1, 2),
+        latency_record(ServerKind::Uring, 1, 1, SMOKE_DECLARED_RATES.lower, LOWER_P99_NS, 1),
+        latency_record(ServerKind::Uring, 1, 1, SMOKE_DECLARED_RATES.lower, LOWER_P99_NS, 2),
+        latency_record(ServerKind::Uring, 1, 1, SMOKE_DECLARED_RATES.higher, HIGHER_P99_NS, 1),
+        latency_record(ServerKind::Uring, 1, 1, SMOKE_DECLARED_RATES.higher, HIGHER_P99_NS, 2),
+        connections_record(ServerKind::Uring, 1, 1),
+        connections_record(ServerKind::Uring, 1, 2),
+    ]
+}
+
+#[test]
+fn smoke_render_without_counted_runs_discloses_the_diagnoses_once() {
+    let doc = render(&smoke_uncounted_set(), true).expect("smoke render ok");
+    assert_discloses_the_diagnoses_once(&doc);
+}
+
+fn assert_the_diagnosis_disclosure_closes_the_method(doc: &str) {
+    let method: Vec<&str> = doc
+        .lines()
+        .skip_while(|l| *l != "## Method")
+        .skip(1)
+        .take_while(|l| !l.starts_with("## "))
+        .collect();
+    let at = method
+        .iter()
+        .position(|l| *l == DIAGNOSIS_LINE)
+        .unwrap_or_else(|| panic!("missing the diagnosis line inside ## Method in:\n{doc}"));
+    assert!(
+        method[..at].iter().any(|l| !l.is_empty()),
+        "expected the diagnosis line after the other Method paragraphs in:\n{doc}"
+    );
+    assert_eq!(
+        method[at - 1], "",
+        "expected the diagnosis line to open its own paragraph in:\n{doc}"
+    );
+    assert!(
+        method[at + 1..].iter().all(|l| l.is_empty()),
+        "expected the diagnosis line to be the last Method paragraph in:\n{doc}"
+    );
+    let next_heading = doc
+        .lines()
+        .skip_while(|l| *l != "## Method")
+        .skip(1)
+        .find(|l| l.starts_with("## "))
+        .unwrap_or_else(|| panic!("expected a section after ## Method in:\n{doc}"));
+    assert!(
+        next_heading.starts_with("## Results — "),
+        "expected the first results section after ## Method, got {next_heading:?} in:\n{doc}"
+    );
+}
+
+#[test]
+fn render_closes_the_method_with_the_diagnosis_disclosure() {
+    let doc = render(&full_recorded_set(), false).expect("render ok");
+    assert_the_diagnosis_disclosure_closes_the_method(&doc);
+}
+
+#[test]
+fn smoke_render_closes_the_method_with_the_diagnosis_disclosure() {
+    let doc = render(&smoke_uncounted_set(), true).expect("smoke render ok");
+    assert_the_diagnosis_disclosure_closes_the_method(&doc);
+}
+
 #[test]
 fn smoke_render_reads_syscalls_only_from_counted_runs() {
     // A smoke set that holds no counted run: the syscalls/msg cell and

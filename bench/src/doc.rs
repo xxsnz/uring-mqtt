@@ -575,6 +575,24 @@ pub fn render(records: &[RunRecord], smoke: bool) -> Result<String, DocError> {
         .unwrap();
     }
     writeln!(out).unwrap();
+    writeln!(
+        out,
+        "`bench/DIAGNOSIS.md` records two diagnoses at commit `d637d09` on kernel \
+         `6.18.33.2-microsoft-standard-WSL2`. Generator placement: two 10-CPU \
+         generator sets, one holding the SMT siblings of the server CPUs, were \
+         compared at every declared rate, and no configuration met the \
+         pre-registered separation rule (every repetition p99 of one set above \
+         every repetition p99 of the other, or valid counts 4 or more apart out of \
+         5); this shows robustness across those two sets only, not against effects \
+         smaller than 5 repetitions can detect, with the generator's CPU count \
+         untested and physical core sharing under Hyper-V unverified. The 4-worker \
+         open-loop shortfall: its cause is not established; a worker with the most \
+         connections under the kernel's SO_REUSEPORT split (any one of them, when \
+         tied) had both the lowest deliveries per connection and the highest p99 in \
+         38 of the 61 invalid 4-worker runs, not in all.",
+    )
+    .unwrap();
+    writeln!(out).unwrap();
 
     // Per (w, q) results
     for w in RECORDED_WORKERS {
