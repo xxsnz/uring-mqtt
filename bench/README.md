@@ -424,7 +424,7 @@ A dirty / mismatched build refusal with nothing to commit can come from the buil
 
 ### Latency outcomes
 
-A recorded open-loop configuration (latency or counted) ends one of three ways. It passes when its highest attempt passes. It is published "not sustained at R" when its 3 attempts are spent, every spent attempt holds an invalid repetition, and every invalid repetition fails at least one capacity row (unresolved, missed slots, steady state) and no syscall-counter row; other rows that repetition fails do not change the outcome. `bench run` prints `not sustained at <R> msgs/s: <key>: <rows>` and goes on. Any other exhaustion stops the session: an attempt that failed only on spread, a repetition invalid on no capacity row (a lateness-only failure is one), a counted repetition whose syscall counter failed (count missing, boundaries outside tolerance, or a bad counter exit), or any exhaustion of a counted configuration counted with strace — the counter policy in Strace exhaustion recovery applies to the last two. `bench run` then prints `session stopped: <key>: <cause>`, dispatches nothing more and exits 2. After a stop, fix the named cause and record a fresh dataset into a new `--out` directory; `--resume` has no attempt left for the stopped configuration, classifies the same records again and stops before dispatching any run of that open-loop stage.
+A recorded open-loop configuration (latency or counted) ends one of three ways. It passes when its highest attempt passes. It is published "not sustained at R" when its 3 attempts are spent, every spent attempt holds an invalid repetition, and every invalid repetition fails at least one capacity row (unresolved, missed slots, steady state) and no syscall-counter row; other rows that repetition fails do not change the outcome. `bench run` prints `not sustained at <R> msgs/s: <key>: <rows>` and goes on. Any other exhaustion stops the session: a counted attempt that failed only on its `syscalls/msg` spread (a latency configuration has no spread check), a repetition invalid on no capacity row (a lateness-only failure is one), a counted repetition whose syscall counter failed (count missing, boundaries outside tolerance, or a bad counter exit), or any exhaustion of a counted configuration counted with strace — the counter policy in Strace exhaustion recovery applies to the last two. `bench run` then prints `session stopped: <key>: <cause>`, dispatches nothing more and exits 2. After a stop, fix the named cause and record a fresh dataset into a new `--out` directory; `--resume` has no attempt left for the stopped configuration, classifies the same records again and stops before dispatching any run of that open-loop stage.
 
 The recorded profile runs only the full fixed matrix; `check_request`
 refuses `--servers`/`--workers`/`--qos` subsets.
@@ -503,7 +503,8 @@ exit 1:
   outside the recorded matrix (an undeclared rate included).
 - `FailedConfigurations(names)` — the fixed matrix is missing or
   failed configurations (a highest attempt that is invalid, too
-  spread, missing a metric, or not exactly repetitions `1..=5`; an
+  spread or missing a metric (throughput, connections and counted
+  configurations only), or not exactly repetitions `1..=5`; an
   open-loop configuration with attempts left or one that stopped the
   session — a not-sustained one is published, not listed),
   listed by kebab-case label (`uring-w1-q1-throughput`).
@@ -526,8 +527,10 @@ After the recorded run:
 
 - [ ] Driver proof: every uring run shows io_uring fds = workers and
       eventpoll fds = 0.
-- [ ] Spread: every configuration with a published figure within 10 % over
-      5 interleaved repetitions; a not-sustained cell publishes no figure.
+- [ ] Spread: every throughput, connections and counted configuration with
+      a published figure within 10 % over 5 interleaved repetitions;
+      latency cells disclose their repetition range instead; a
+      not-sustained cell publishes no figure.
 - [ ] Reconciliation: every published repetition reconciled (unresolved 0,
       duplicates 0, dropped 0 in throughput runs, open-loop backlog growth
       within 50 ms); failed attempts and not-sustained records stay in the

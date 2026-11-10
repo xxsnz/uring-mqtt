@@ -14,7 +14,7 @@
 // truncation well-defined.
 #![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -41,6 +41,9 @@ const MOSQUITTO_RESULTS_LABEL: &str = "mosquitto (endpoint = subscriber receipt)
 /// Nanoseconds per millisecond: the sign-off prints the steady-state
 /// limit in milliseconds.
 const NS_PER_MS: u64 = 1_000_000;
+
+/// Nanoseconds per microsecond: every p99 cell prints microseconds.
+const NS_PER_US: f64 = 1_000.0;
 
 /// Reasons `bench doc` can refuse to render a document. Every variant
 /// is the operator's only signal that an unpublishable record set exists;
@@ -577,6 +580,16 @@ pub fn render(records: &[RunRecord], smoke: bool) -> Result<String, DocError> {
     writeln!(out).unwrap();
     writeln!(
         out,
+        "Each p99 cell is the p99 over all published repetitions (repetition min–max): \
+         the p99 of the merged latency histograms of the configuration's published \
+         repetitions, followed by the lowest and the highest repetition p99. A latency \
+         configuration has no spread check; the range between repetitions is disclosed, \
+         not explained.",
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
         "`bench/DIAGNOSIS.md` records two diagnoses at commit `d637d09` on kernel \
          `6.18.33.2-microsoft-standard-WSL2`. Generator placement: two 10-CPU \
          generator sets, one holding the SMT siblings of the server CPUs, were \
@@ -608,7 +621,8 @@ pub fn render(records: &[RunRecord], smoke: bool) -> Result<String, DocError> {
             writeln!(
                 out,
                 "| Server | msgs/s | spread | server CPU % | generator CPU % | \
-                 p99 @{lower} msgs/s (µs) | p99 @{higher} msgs/s (µs) | \
+                 p99 over all published repetitions (repetition min–max) @{lower} msgs/s (µs) | \
+                 p99 over all published repetitions (repetition min–max) @{higher} msgs/s (µs) | \
                  open-loop ≥ (msgs/s) | syscalls/msg @{higher} msgs/s | driver proof |",
                 lower = rates.lower,
                 higher = rates.higher,
@@ -647,7 +661,7 @@ pub fn render(records: &[RunRecord], smoke: bool) -> Result<String, DocError> {
     .unwrap();
     writeln!(
         out,
-        "- [ ] Spread: every configuration with a published figure within 10 % over 5 interleaved repetitions; a not-sustained cell publishes no figure"
+        "- [ ] Spread: every throughput, connections and counted configuration with a published figure within 10 % over 5 interleaved repetitions; latency cells disclose their repetition range instead; a not-sustained cell publishes no figure"
     )
     .unwrap();
     writeln!(
@@ -823,31 +837,40 @@ fn median_cpu_percent(runs: &[RunRecord], server: bool) -> String {
     }
 }
 
-/// Median p99 of the passing highest attempt of `key`, in µs. `FAILED`
-/// when that configuration has no passing attempt: a p99 read off a
-/// failed attempt is not a measurement of the configuration.
+/// p99 cell of the passing highest attempt of `key`, in µs: the p99 of
+/// the merged latency histograms of its repetitions, then the lowest and
+/// the highest repetition p99 (spec §9.1 Latency spread). `FAILED` when
+/// that configuration has no passing attempt: a p99 read off a failed
+/// attempt is not a measurement of the configuration.
 fn latency_p99_us(passing: &HashMap<ConfigKey, Vec<RunRecord>>, key: &ConfigKey) -> String {
     let Some(runs) = passing.get(key) else {
         return FAILED.to_string();
     };
-    let mut values: Vec<u64> = runs
+    let mut merged: BTreeMap<u64, u64> = BTreeMap::new();
+    for latency in runs.iter().filter_map(|r| r.latency_ns.as_ref()) {
+        for &(value, count) in &latency.histogram {
+            let slot = merged.entry(value).or_default();
+            *slot = slot.saturating_add(count);
+        }
+    }
+    let buckets: Vec<(u64, u64)> = merged.into_iter().collect();
+    let p99s: Vec<u64> = runs
         .iter()
         .filter_map(|r| r.latency_ns.as_ref().map(|l| l.p99))
         .collect();
-    if values.is_empty() {
+    let (Some(pooled), Some(&min), Some(&max)) = (
+        crate::analysis::percentile(&buckets, 0.99),
+        p99s.iter().min(),
+        p99s.iter().max(),
+    ) else {
         return "n/a".to_string();
-    }
-    values.sort_unstable();
-    let median_ns = if values.len() % 2 == 1 {
-        values[values.len() / 2]
-    } else {
-        let mid = values.len() / 2;
-        // Take the midpoint via `u128` to avoid `u64` overflow on the
-        // sums the (a + b) shortcut silently overflows.
-        let sum = u128::from(values[mid - 1]) + u128::from(values[mid]);
-        u64::try_from(sum / 2).expect("latency midpoint fits in u64")
     };
-    format!("{:.1}", median_ns as f64 / 1000.0)
+    format!(
+        "{:.1} ({:.1}–{:.1})",
+        pooled as f64 / NS_PER_US,
+        min as f64 / NS_PER_US,
+        max as f64 / NS_PER_US
+    )
 }
 
 /// Median syscalls/message of the passing highest attempt of `key`.

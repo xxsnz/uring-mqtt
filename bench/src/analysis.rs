@@ -789,6 +789,8 @@ pub fn attempt_complete(runs: &[RunRecord], repetitions: u32) -> bool {
 /// `config_failure(..).is_none()` *is* the verdict. A caller that only
 /// decides whether to retry reads [`config_passes`]; one that has to
 /// tell the operator why an attempt did not count reads this.
+/// A configuration whose runs are all latency runs is never spread-checked
+/// (spec §9.1 Latency spread).
 pub fn config_failure(
     runs: &[RunRecord],
     repetitions: u32,
@@ -805,7 +807,10 @@ pub fn config_failure(
             host_pressure_note(invalid)
         ));
     }
-    if !enforce_spread {
+    // Spec §9.1 Latency spread (Decision log 2026-10-27): a latency
+    // configuration has no spread check; its published cell discloses
+    // the repetition range instead.
+    if !enforce_spread || runs.iter().all(|r| r.kind == RunKind::Latency) {
         return None;
     }
     let mut metrics: Vec<f64> = Vec::with_capacity(runs.len());
@@ -828,8 +833,9 @@ pub fn config_failure(
 }
 
 /// `true` when `runs` are a complete attempt ([`attempt_complete`]),
-/// every run is valid, and (when `enforce_spread` is set) every run has
-/// its metric and their spread is within [`SPREAD_LIMIT`].
+/// every run is valid, and (when `enforce_spread` is set and the runs are
+/// not latency runs) every run has its metric and their spread is within
+/// [`SPREAD_LIMIT`].
 /// [`config_failure`] names the condition that refused them.
 pub fn config_passes(runs: &[RunRecord], repetitions: u32, enforce_spread: bool) -> bool {
     config_failure(runs, repetitions, enforce_spread).is_none()
@@ -935,8 +941,8 @@ pub fn open_loop_outcome(runs: &[RunRecord], constants: &ProtocolConstants) -> O
         invalid.sort_by_key(|run| run.repetition);
         if invalid.is_empty() {
             // The attempt holds no invalid repetition: a
-            // configuration-level gate — a missing metric or the spread —
-            // can have refused it.
+            // configuration-level gate — a missing metric or the spread of a
+            // counted configuration — can have refused it.
             let reason = config_failure(group, constants.repetitions, constants.enforce_spread)
                 .unwrap_or_default();
             return OpenLoopOutcome::Exhausted(format!("attempt {attempt}: {reason}"));

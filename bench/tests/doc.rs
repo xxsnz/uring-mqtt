@@ -430,6 +430,145 @@ fn full_recorded_set() -> Vec<RunRecord> {
     out
 }
 
+/// `full_recorded_set`, with the uring 1-worker QoS 1 latency repetitions
+/// rewritten so their p99s spread beyond `SPREAD_LIMIT` at both declared
+/// rates: the higher rate's p99 climbs 40/50/60/70/800 µs across
+/// repetitions 1-5, and the lower rate's repetition 5 shares the lower
+/// rate's 40 µs histogram bucket with the other repetitions so a pool
+/// that overwrites instead of summing bucket counts reads 800 µs.
+fn uring_w1_q1_higher_rate_spread_set() -> Vec<RunRecord> {
+    let mut records = full_recorded_set();
+    for r in &mut records {
+        if r.server == ServerKind::Uring
+            && r.workers == 1
+            && r.qos == Some(1)
+            && r.kind == RunKind::Latency
+            && at_higher_rate(r)
+        {
+            let w = r.counts.window_scheduled.expect("open-loop record");
+            r.latency_ns = Some(match r.repetition {
+                1 => LatencySummary {
+                    p50: 40_000,
+                    p99: 40_000,
+                    max: 40_000,
+                    histogram: vec![(40_000, w)],
+                },
+                2 => LatencySummary {
+                    p50: 50_000,
+                    p99: 50_000,
+                    max: 50_000,
+                    histogram: vec![(50_000, w)],
+                },
+                3 => LatencySummary {
+                    p50: 60_000,
+                    p99: 60_000,
+                    max: 60_000,
+                    histogram: vec![(60_000, w)],
+                },
+                4 => LatencySummary {
+                    p50: 70_000,
+                    p99: 70_000,
+                    max: 70_000,
+                    histogram: vec![(70_000, w)],
+                },
+                5 => LatencySummary {
+                    p50: 80_000,
+                    p99: 800_000,
+                    max: 800_000,
+                    histogram: vec![(80_000, w - w / 50), (800_000, w / 50)],
+                },
+                other => unreachable!("repetition out of 1..=5: {other}"),
+            });
+        }
+    }
+    for r in &mut records {
+        if r.server == ServerKind::Uring
+            && r.workers == 1
+            && r.qos == Some(1)
+            && r.kind == RunKind::Latency
+            && r.offered_rate == Some(DECLARED_RATES_W1_Q1.lower)
+        {
+            let w = r.counts.window_scheduled.expect("open-loop record");
+            r.latency_ns = Some(match r.repetition {
+                1..=4 => LatencySummary {
+                    p50: 40_000,
+                    p99: 40_000,
+                    max: 40_000,
+                    histogram: vec![(40_000, w)],
+                },
+                5 => LatencySummary {
+                    p50: 40_000,
+                    p99: 800_000,
+                    max: 800_000,
+                    histogram: vec![(40_000, w - w / 50), (800_000, w / 50)],
+                },
+                other => unreachable!("repetition out of 1..=5: {other}"),
+            });
+        }
+    }
+    records
+}
+
+/// `full_recorded_set`, with the uring 1-worker QoS 1 latency repetitions
+/// at the higher declared rate rewritten so every repetition's histogram
+/// opens at a 10 µs bucket far below its own p99: repetitions 1-4 hold
+/// p99 60 µs and repetition 5 holds p99 200 µs. The merged bucket list
+/// therefore runs 10 µs to 200 µs while the repetition p99s run 60 µs to
+/// 200 µs, so a range read off the merged buckets instead of the stored
+/// repetition p99s reads 10 µs as its minimum.
+fn uring_w1_q1_low_bucket_latency_set() -> Vec<RunRecord> {
+    let mut records = full_recorded_set();
+    for r in &mut records {
+        if r.server == ServerKind::Uring
+            && r.workers == 1
+            && r.qos == Some(1)
+            && r.kind == RunKind::Latency
+            && at_higher_rate(r)
+        {
+            let w = r.counts.window_scheduled.expect("open-loop record");
+            let tail = w / 50;
+            let top = if r.repetition == 5 { 200_000 } else { 60_000 };
+            r.latency_ns = Some(LatencySummary {
+                p50: 10_000,
+                p99: top,
+                max: top,
+                histogram: vec![(10_000, w - tail), (top, tail)],
+            });
+        }
+    }
+    records
+}
+
+/// AC-4 discriminator: the parenthesised range is the lowest and the
+/// highest stored repetition p99, not the lowest and the highest bucket of
+/// the merged histogram. Both readings agree in
+/// `uring_w1_q1_higher_rate_spread_set`, whose merged-bucket extrema
+/// coincide with its repetition-p99 extrema; here they disagree.
+#[test]
+fn render_reads_the_latency_range_from_the_repetition_p99s_not_the_merged_buckets() {
+    let doc = render(&uring_w1_q1_low_bucket_latency_set(), false).expect("render ok");
+    assert!(
+        doc.contains(
+            "| uring | 100 | 3.0 % | 95.0 | 40.0 | 40.0 (40.0–40.0) | 60.0 (60.0–200.0) | 300000 | 1.25 | ok |"
+        ),
+        "expected the pooled p99 60.0 with the repetition p99 range 60.0–200.0:\n{doc}"
+    );
+    assert!(
+        !doc.contains("(10.0–"),
+        "the range was read off the merged buckets, not the repetition p99s:\n{doc}"
+    );
+}
+
+#[test]
+fn render_publishes_a_latency_configuration_whose_repetition_p99s_spread_beyond_the_limit() {
+    let doc = render(&uring_w1_q1_higher_rate_spread_set(), false).expect("render ok");
+    assert!(
+        doc.lines()
+            .any(|l| l.starts_with("| uring |") && l.ends_with("| 300000 | 1.25 | ok |")),
+        "missing the uring row publishing the latency configuration despite its spread:\n{doc}"
+    );
+}
+
 #[test]
 fn render_ignores_worker_loads() {
     let baseline = render(&full_recorded_set(), false).expect("render ok");
@@ -765,8 +904,12 @@ fn render_ignores_a_failed_earlier_attempt_of_a_retried_configuration() {
         "the failed attempt's p99 leaked into the table:\n{doc}"
     );
     assert!(
-        doc.contains("| uring | 100 | 3.0 % | 95.0 | 40.0 | 40.0 | 80.0 | 300000 | 1.25 | ok |"),
+        doc.contains("| uring | 100 | 3.0 % | 95.0 | 40.0 | 40.0 (40.0–40.0) | 80.0 (80.0–80.0) | 300000 | 1.25 | ok |"),
         "missing the passing attempt's uring row in:\n{doc}"
+    );
+    assert!(
+        !doc.contains("–160.0)"),
+        "the failed attempt's p99 leaked into the range:\n{doc}"
     );
 }
 
@@ -1058,7 +1201,7 @@ fn render_reports_median_throughput_and_p99_per_server() {
     let records = full_recorded_set();
     let doc = render(&records, false).expect("render ok");
     assert!(
-        doc.contains("| uring | 100 | 3.0 % | 95.0 | 40.0 | 40.0 | 80.0 | 300000 | 1.25 | ok |"),
+        doc.contains("| uring | 100 | 3.0 % | 95.0 | 40.0 | 40.0 (40.0–40.0) | 80.0 (80.0–80.0) | 300000 | 1.25 | ok |"),
         "missing uring row in:\n{doc}"
     );
 }
@@ -1081,7 +1224,7 @@ fn render_marks_every_tokio_driver_proof_not_applicable() {
     let tokio_na_count = doc
         .lines()
         .filter(|l| {
-            l.starts_with("| tokio | 100 | 3.0 % | 95.0 | 40.0 | 40.0 | 80.0 | ")
+            l.starts_with("| tokio | 100 | 3.0 % | 95.0 | 40.0 | 40.0 (40.0–40.0) | 80.0 (80.0–80.0) | ")
                 && l.ends_with(" | 1.25 | n/a |")
         })
         .count();
@@ -1100,7 +1243,7 @@ fn render_marks_every_tokio_driver_proof_not_applicable() {
     let uring_ok_count = doc
         .lines()
         .filter(|l| {
-            l.starts_with("| uring | 100 | 3.0 % | 95.0 | 40.0 | 40.0 | 80.0 | ")
+            l.starts_with("| uring | 100 | 3.0 % | 95.0 | 40.0 | 40.0 (40.0–40.0) | 80.0 (80.0–80.0) | ")
                 && l.ends_with(" | 1.25 | ok |")
         })
         .count();
@@ -1620,7 +1763,7 @@ fn render_qualifies_every_mosquitto_result_row_with_subscriber_receipt() {
     let records = full_recorded_set();
     let doc = render(&records, false).expect("render ok");
     let expected_row =
-        "| mosquitto (endpoint = subscriber receipt) | 100 | 3.0 % | 95.0 | 40.0 | 40.0 | 80.0 | ";
+        "| mosquitto (endpoint = subscriber receipt) | 100 | 3.0 % | 95.0 | 40.0 | 40.0 (40.0–40.0) | 80.0 (80.0–80.0) | ";
     let qualified_count = doc
         .lines()
         .filter(|l| l.starts_with(expected_row) && l.ends_with(" | 1.25 | n/a |"))
@@ -1662,7 +1805,7 @@ fn render_marks_a_tokio_row_with_no_driver_record_not_applicable() {
     let tokio_na_count = doc
         .lines()
         .filter(|l| {
-            l.starts_with("| tokio | 100 | 3.0 % | 95.0 | 40.0 | 40.0 | 80.0 | ")
+            l.starts_with("| tokio | 100 | 3.0 % | 95.0 | 40.0 | 40.0 (40.0–40.0) | 80.0 (80.0–80.0) | ")
                 && l.ends_with(" | 1.25 | n/a |")
         })
         .count();
@@ -1730,7 +1873,7 @@ fn render_ends_with_the_unticked_sign_off_checklist() {
     let doc = render(&records, false).expect("render ok");
     let expected = [
         "- [ ] Driver proof: every uring run shows io_uring fds = workers and eventpoll fds = 0",
-        "- [ ] Spread: every configuration with a published figure within 10 % over 5 interleaved repetitions; a not-sustained cell publishes no figure",
+        "- [ ] Spread: every throughput, connections and counted configuration with a published figure within 10 % over 5 interleaved repetitions; latency cells disclose their repetition range instead; a not-sustained cell publishes no figure",
         "- [ ] Reconciliation: every published repetition reconciled (unresolved 0, duplicates 0, dropped 0 in throughput runs, open-loop backlog growth within 50 ms); failed attempts and not-sustained records stay in the raw JSON",
         "- [ ] Environment: host, kernel, CPU sets, AC power and idle state match this disclosure",
         "- [ ] Saturation: in every throughput row the server CPU set, not the generator, is the saturated side",
@@ -2054,7 +2197,7 @@ fn render_reads_syscalls_from_the_counted_run_and_p99_from_the_uncounted_run() {
 
     let doc = render(&records, false).expect("render ok");
     assert!(
-        doc.contains("| uring | 100 | 3.0 % | 95.0 | 40.0 | 40.0 | 80.0 | 300000 | 2.50 | ok |"),
+        doc.contains("| uring | 100 | 3.0 % | 95.0 | 40.0 | 40.0 (40.0–40.0) | 80.0 (80.0–80.0) | 300000 | 2.50 | ok |"),
         "missing the counted syscalls/msg row in:\n{doc}"
     );
     assert!(
@@ -2134,6 +2277,8 @@ fn render_names_the_declared_rates_and_their_calibration_in_the_method() {
 }
 
 const DIAGNOSIS_LINE: &str = "`bench/DIAGNOSIS.md` records two diagnoses at commit `d637d09` on kernel `6.18.33.2-microsoft-standard-WSL2`. Generator placement: two 10-CPU generator sets, one holding the SMT siblings of the server CPUs, were compared at every declared rate, and no configuration met the pre-registered separation rule (every repetition p99 of one set above every repetition p99 of the other, or valid counts 4 or more apart out of 5); this shows robustness across those two sets only, not against effects smaller than 5 repetitions can detect, with the generator's CPU count untested and physical core sharing under Hyper-V unverified. The 4-worker open-loop shortfall: its cause is not established; a worker with the most connections under the kernel's SO_REUSEPORT split (any one of them, when tied) had both the lowest deliveries per connection and the highest p99 in 38 of the 61 invalid 4-worker runs, not in all.";
+
+const POOLED_LINE: &str = "Each p99 cell is the p99 over all published repetitions (repetition min–max): the p99 of the merged latency histograms of the configuration's published repetitions, followed by the lowest and the highest repetition p99. A latency configuration has no spread check; the range between repetitions is disclosed, not explained.";
 
 fn assert_discloses_the_diagnoses_once(doc: &str) {
     let method: Vec<&str> = doc
@@ -2229,6 +2374,51 @@ fn smoke_render_closes_the_method_with_the_diagnosis_disclosure() {
 }
 
 #[test]
+fn render_publishes_the_pooled_p99_and_the_repetition_range_of_a_latency_cell() {
+    let doc = render(&uring_w1_q1_higher_rate_spread_set(), false).expect("render ok");
+    assert!(
+        doc.contains(
+            "| uring | 100 | 3.0 % | 95.0 | 40.0 | 40.0 (40.0–800.0) | 80.0 (40.0–800.0) | 300000 | 1.25 | ok |"
+        ),
+        "missing the pooled p99 and repetition range row:\n{doc}"
+    );
+}
+
+#[test]
+fn render_defines_the_pooled_p99_cell_in_the_method_before_the_diagnoses() {
+    for (records, smoke) in [(full_recorded_set(), false), (smoke_uncounted_set(), true)] {
+        let doc = render(&records, smoke).expect("render ok");
+        assert_eq!(
+            doc.lines().filter(|l| *l == POOLED_LINE).count(),
+            1,
+            "expected the pooled p99 line once in the whole document:\n{doc}"
+        );
+        let method: Vec<&str> = doc
+            .lines()
+            .skip_while(|l| *l != "## Method")
+            .skip(1)
+            .take_while(|l| !l.starts_with("## "))
+            .collect();
+        let at = method
+            .iter()
+            .position(|l| *l == POOLED_LINE)
+            .unwrap_or_else(|| panic!("missing the pooled p99 line inside ## Method in:\n{doc}"));
+        assert_eq!(
+            method[at - 1], "",
+            "expected the pooled p99 line to open its own paragraph in:\n{doc}"
+        );
+        assert_eq!(
+            method[at + 1], "",
+            "expected a blank line between the pooled p99 paragraph and the diagnosis paragraph in:\n{doc}"
+        );
+        assert_eq!(
+            method[at + 2], DIAGNOSIS_LINE,
+            "expected the diagnosis paragraph directly after the pooled p99 paragraph in:\n{doc}"
+        );
+    }
+}
+
+#[test]
 fn smoke_render_reads_syscalls_only_from_counted_runs() {
     // A smoke set that holds no counted run: the syscalls/msg cell and
     // the Method line both read `n/a`.
@@ -2273,7 +2463,7 @@ fn smoke_render_reads_syscalls_only_from_counted_runs() {
     let doc = render(&records, true).expect("smoke render ok");
     assert!(
         doc.lines()
-            .any(|l| l.starts_with("| uring |") && l.ends_with("| 80.0 | 60000 | n/a | ok |")),
+            .any(|l| l.starts_with("| uring |") && l.ends_with("| 80.0 (80.0–80.0) | 60000 | n/a | ok |")),
         "expected the uncounted uring row in:\n{doc}"
     );
     let expected_na_line = "Both latency columns come from uncounted runs; `syscalls/msg` is \
@@ -2306,7 +2496,7 @@ fn smoke_render_reads_syscalls_only_from_counted_runs() {
     let doc = render(&records, true).expect("smoke render ok");
     assert!(
         doc.lines()
-            .any(|l| l.starts_with("| uring |") && l.ends_with("| 80.0 | 60000 | 1.25 | ok |")),
+            .any(|l| l.starts_with("| uring |") && l.ends_with("| 80.0 (80.0–80.0) | 60000 | 1.25 | ok |")),
         "expected the counted uring row in:\n{doc}"
     );
     let expected_counted_line = "Both latency columns come from uncounted runs; `syscalls/msg` \
@@ -2343,7 +2533,7 @@ fn render_publishes_a_not_sustained_configuration_with_its_rate_and_capacity_row
     let doc = render(&records, false).expect("render ok");
     assert!(
         doc.contains(
-            "| uring | 100 | 3.0 % | 95.0 | 40.0 | 40.0 | not sustained at 300000 msgs/s: missed slots | 75000 | not sustained at 300000 msgs/s: missed slots | ok |"
+            "| uring | 100 | 3.0 % | 95.0 | 40.0 | 40.0 (40.0–40.0) | not sustained at 300000 msgs/s: missed slots | 75000 | not sustained at 300000 msgs/s: missed slots | ok |"
         ),
         "missing the not-sustained uring row in:\n{doc}"
     );
@@ -2377,10 +2567,9 @@ fn render_reports_no_open_loop_rate_when_neither_declared_rate_is_sustained() {
 
 #[test]
 fn render_refuses_an_open_loop_configuration_that_is_pending_or_stopped() {
-    // (a) Exhausted: three complete, valid attempts whose repetition 5
-    // breaks the spread gate (160 µs beside the other reps' 80 µs), so
-    // the budget is spent with no invalid repetition to name a capacity
-    // row.
+    // (a) Exhausted: three complete attempts whose repetition 5 stalled —
+    // invalid on no capacity row — so the budget is spent with no
+    // capacity row to name.
     let mut records = full_recorded_set();
     let is_target = |r: &RunRecord| {
         r.server == ServerKind::Uring
@@ -2397,13 +2586,9 @@ fn render_refuses_an_open_loop_configuration_that_is_pending_or_stopped() {
             let mut r = r.clone();
             r.attempt = attempt;
             if r.repetition == 5 {
-                let window_scheduled = r.counts.window_scheduled.expect("open-loop record");
-                r.latency_ns = Some(LatencySummary {
-                    p50: 160_000,
-                    p99: 160_000,
-                    max: 160_000,
-                    histogram: vec![(160_000, window_scheduled)],
-                });
+                r.generator_errors.stalled = 3;
+                r.valid = false;
+                r.invalid_reasons = vec![STALLED_3_REASON.to_string()];
             }
             records.push(r);
         }
@@ -2447,13 +2632,13 @@ fn render_names_the_declared_rates_in_the_results_header() {
     let doc = render(&records, false).expect("render ok");
     assert!(
         doc.contains(
-            "| Server | msgs/s | spread | server CPU % | generator CPU % | p99 @75000 msgs/s (µs) | p99 @300000 msgs/s (µs) | open-loop ≥ (msgs/s) | syscalls/msg @300000 msgs/s | driver proof |"
+            "| Server | msgs/s | spread | server CPU % | generator CPU % | p99 over all published repetitions (repetition min–max) @75000 msgs/s (µs) | p99 over all published repetitions (repetition min–max) @300000 msgs/s (µs) | open-loop ≥ (msgs/s) | syscalls/msg @300000 msgs/s | driver proof |"
         ),
         "missing the 1-worker QoS 1 header in:\n{doc}"
     );
     assert!(
         doc.contains(
-            "| Server | msgs/s | spread | server CPU % | generator CPU % | p99 @1300000 msgs/s (µs) | p99 @1500000 msgs/s (µs) | open-loop ≥ (msgs/s) | syscalls/msg @1500000 msgs/s | driver proof |"
+            "| Server | msgs/s | spread | server CPU % | generator CPU % | p99 over all published repetitions (repetition min–max) @1300000 msgs/s (µs) | p99 over all published repetitions (repetition min–max) @1500000 msgs/s (µs) | open-loop ≥ (msgs/s) | syscalls/msg @1500000 msgs/s | driver proof |"
         ),
         "missing the 4-worker QoS 0 header in:\n{doc}"
     );

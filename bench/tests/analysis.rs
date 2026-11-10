@@ -1222,6 +1222,123 @@ fn config_failure_names_the_gate_condition_that_refused_the_attempt() {
     assert_eq!(config_failure(&wide, 5, false), None);
 }
 
+#[test]
+fn config_failure_passes_a_latency_attempt_whose_repetition_p99s_spread_beyond_the_limit() {
+    let runs = open_loop_attempt(RunKind::Latency, 1, &[(5, slow_tail)]);
+    assert_eq!(config_failure(&runs, 5, true), None);
+    assert!(config_passes(&runs, 5, true));
+
+    let invalid = open_loop_attempt(RunKind::Latency, 1, &[(2, miss_slots)]);
+    let reason = config_failure(&invalid, 5, true).expect("an invalid repetition must fail");
+    assert!(
+        reason.starts_with("repetition 2 is invalid"),
+        "reason must name the invalid repetition: {reason}"
+    );
+
+    let short: Vec<RunRecord> = runs.iter().take(4).cloned().collect();
+    assert!(config_failure(&short, 5, true).is_some());
+}
+
+#[test]
+fn config_failure_refuses_a_throughput_connections_or_counted_attempt_over_the_spread_limit() {
+    let wide = [100.0, 105.0, 110.0, 95.0, 100.0];
+
+    let throughput: Vec<RunRecord> = wide
+        .iter()
+        .zip(1u32..)
+        .map(|(&v, rep)| {
+            let mut r = valid_record(RunKind::Throughput);
+            r.throughput_msgs_per_sec = Some(v);
+            r.repetition = rep;
+            r
+        })
+        .collect();
+    assert_eq!(
+        config_failure(&throughput, 5, true),
+        Some("spread 0.1500 is above the 0.1 limit".to_string())
+    );
+
+    let connections: Vec<RunRecord> = wide
+        .iter()
+        .zip(1u32..)
+        .map(|(&v, rep)| {
+            let mut r = valid_record(RunKind::Connections);
+            r.connections_per_sec = Some(v);
+            r.repetition = rep;
+            r
+        })
+        .collect();
+    assert_eq!(
+        config_failure(&connections, 5, true),
+        Some("spread 0.1500 is above the 0.1 limit".to_string())
+    );
+
+    let counted_per_msg = [5.0, 6.0, 5.0, 5.0, 5.0];
+    let counted: Vec<RunRecord> = counted_per_msg
+        .iter()
+        .zip(1u32..)
+        .map(|(&v, rep)| {
+            let mut r = valid_record(RunKind::Counted);
+            r.syscalls.per_msg = Some(v);
+            r.repetition = rep;
+            r
+        })
+        .collect();
+    assert_eq!(
+        config_failure(&counted, 5, true),
+        Some("spread 0.2000 is above the 0.1 limit".to_string())
+    );
+}
+
+#[test]
+fn config_failure_spread_checks_a_run_set_that_is_not_all_latency() {
+    // The latency exemption reads `all`, not `any`: a set holding one run
+    // of another kind keeps the `SPREAD_LIMIT` check. One real
+    // configuration's runs share one kind (`ConfigKey` carries it), so
+    // this set is hypothetical; the assertion pins the gate shape.
+    let mixed: Vec<RunRecord> = (1u32..=5)
+        .map(|rep| {
+            let mut r = if rep == 5 {
+                valid_record(RunKind::Counted)
+            } else {
+                valid_record(RunKind::Latency)
+            };
+            r.repetition = rep;
+            r
+        })
+        .collect();
+    let reason = config_failure(&mixed, 5, true).expect("a mixed set must stay spread-checked");
+    assert!(
+        reason.contains("spread") && reason.contains("above the 0.1 limit"),
+        "a mixed set must be refused on its spread: {reason}"
+    );
+    assert!(!config_passes(&mixed, 5, true));
+    assert_eq!(config_failure(&mixed, 5, false), None);
+}
+
+#[test]
+fn config_failure_skips_the_missing_latency_metric_check_for_a_latency_attempt() {
+    // Skipping the spread block for latency also skips its "repetition N
+    // has no metric" check. `reconcile` row 14 invalidates an open-loop
+    // record whose `latency_ns` is `None`, so the `!r.valid` branch
+    // refuses such a record first and this state never reaches a real
+    // gate; the assertion pins the deliberate skip rather than a guess.
+    let mut runs = open_loop_attempt(RunKind::Latency, 1, &[]);
+    runs[4].latency_ns = None;
+    assert_eq!(metric(&runs[4]), None);
+    assert_eq!(config_failure(&runs, 5, true), None);
+
+    // The same hole under a spread-checked kind still names the
+    // repetition without a metric.
+    let mut counted = open_loop_attempt(RunKind::Counted, 1, &[]);
+    counted[4].syscalls.per_msg = None;
+    let reason = config_failure(&counted, 5, true).expect("a missing metric must fail");
+    assert!(
+        reason.contains("repetition 5 has no"),
+        "reason must name the repetition without a metric: {reason}"
+    );
+}
+
 /// Five `valid_record(RunKind::Throughput)` runs with `repetition` 1..=5,
 /// `runs[2]` marked invalid with `invalid_reasons: ["stalled connections 3"]`.
 fn invalid_pressure_runs() -> Vec<RunRecord> {
@@ -2151,6 +2268,11 @@ fn slow_tail(r: &mut RunRecord) {
     });
 }
 
+/// A valid counted repetition whose `syscalls/msg` is 6.0 beside the others' 5.0: spread 0.2.
+fn widen_syscalls_per_msg(r: &mut RunRecord) {
+    r.syscalls.per_msg = Some(6.0);
+}
+
 #[test]
 fn capacity_rows_name_every_capacity_row_a_record_fails() {
     let record = valid_record(RunKind::Latency);
@@ -2261,14 +2383,41 @@ fn open_loop_outcome_stops_on_a_repetition_that_fails_no_capacity_row() {
 }
 
 #[test]
-fn open_loop_outcome_stops_on_an_attempt_that_failed_only_its_spread() {
+fn open_loop_outcome_passes_a_latency_attempt_whose_repetition_p99s_spread_beyond_the_limit() {
     let constants = ProtocolConstants::for_profile(Profile::Recorded);
     let mut runs = open_loop_attempt(RunKind::Latency, 1, &[(1, miss_slots)]);
     runs.extend(open_loop_attempt(RunKind::Latency, 2, &[(1, miss_slots)]));
     runs.extend(open_loop_attempt(RunKind::Latency, 3, &[(5, slow_tail)]));
+    assert_eq!(open_loop_outcome(&runs, &constants), OpenLoopOutcome::Passed);
+}
+
+#[test]
+fn open_loop_outcome_never_retries_a_latency_attempt_for_its_spread() {
+    // A spread-wide latency first attempt is `Passed`, not `Pending`: the
+    // matrix must not spend a second attempt on a spread the ruling no
+    // longer checks.
+    let constants = ProtocolConstants::for_profile(Profile::Recorded);
+    let runs = open_loop_attempt(RunKind::Latency, 1, &[(5, slow_tail)]);
+    assert_eq!(open_loop_outcome(&runs, &constants), OpenLoopOutcome::Passed);
+
+    // The same shape under a spread-checked kind still asks for another
+    // attempt while the budget holds.
+    let counted = open_loop_attempt(RunKind::Counted, 1, &[(5, widen_syscalls_per_msg)]);
+    assert_eq!(
+        open_loop_outcome(&counted, &constants),
+        OpenLoopOutcome::Pending
+    );
+}
+
+#[test]
+fn open_loop_outcome_stops_on_a_counted_attempt_that_failed_only_its_spread() {
+    let constants = ProtocolConstants::for_profile(Profile::Recorded);
+    let mut runs = open_loop_attempt(RunKind::Counted, 1, &[(1, miss_slots)]);
+    runs.extend(open_loop_attempt(RunKind::Counted, 2, &[(1, miss_slots)]));
+    runs.extend(open_loop_attempt(RunKind::Counted, 3, &[(5, widen_syscalls_per_msg)]));
     assert_eq!(
         open_loop_outcome(&runs, &constants),
-        OpenLoopOutcome::Exhausted("attempt 3: spread 1.0000 is above the 0.1 limit".to_string())
+        OpenLoopOutcome::Exhausted("attempt 3: spread 0.2000 is above the 0.1 limit".to_string())
     );
 }
 

@@ -377,9 +377,10 @@ pub struct ProtocolConstants {
 
 impl ProtocolConstants {
     /// Recorded: warmup 10 s, window 60 s, 5 repetitions, 5 s drain, up to
-    /// 3 attempts, spread enforced. Smoke: warmup 2 s, window 5 s, 2
-    /// repetitions, 2 s drain, 1 attempt, spread not enforced (matches the
-    /// matrix task 13 sets up).
+    /// 3 attempts, spread enforced on throughput, connections and counted
+    /// configurations (`config_failure` never spread-checks latency). Smoke:
+    /// warmup 2 s, window 5 s, 2 repetitions, 2 s drain, 1 attempt, spread
+    /// not enforced (matches the matrix task 13 sets up).
     pub fn for_profile(profile: Profile) -> Self {
         match profile {
             Profile::Recorded => Self {
