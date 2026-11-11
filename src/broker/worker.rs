@@ -311,6 +311,7 @@ impl Drop for SlotWait<'_> {
 pub struct EventReceiver {
     rx: local_sync::mpsc::unbounded::Rx<Publish>,
     state: Rc<EventChannelState>,
+    worker_id: usize,
 }
 
 impl EventReceiver {
@@ -321,6 +322,21 @@ impl EventReceiver {
             self.state.room.add_permits(1);
         }
         item
+    }
+
+    /// Add every publish still queued to the drop total and warn once.
+    /// Called only when the callback panicked: the worker unwinds next, so
+    /// none of them will reach it. The publish whose callback panicked is
+    /// not counted — it reached the callback.
+    fn drop_queued_after_callback_panic(&self) {
+        let queued = u64::try_from(self.state.depth.get()).unwrap_or(u64::MAX);
+        let total = self.state.dropped.fetch_add(queued, Ordering::Relaxed) + queued;
+        tracing::warn!(
+            "worker {}: event callback panicked, {} queued events dropped ({} dropped total)",
+            self.worker_id,
+            queued,
+            total
+        );
     }
 }
 
@@ -350,7 +366,11 @@ pub fn event_channel(worker_id: usize, dropped: Arc<AtomicU64>) -> (EventSender,
             state: state.clone(),
             worker_id,
         },
-        EventReceiver { rx, state },
+        EventReceiver {
+            rx,
+            state,
+            worker_id,
+        },
     )
 }
 
@@ -642,11 +662,18 @@ pub async fn run_worker(
     Ok(())
 }
 
-/// Process events from the local channel.
+/// Process events from the local channel. A callback panic adds every
+/// publish still queued to the drop total, then resumes unwinding the
+/// worker with the callback's own panic.
 async fn process_events(mut rx: EventReceiver, callback: Option<PublishCallback>) {
     while let Some(publish) = rx.recv().await {
         if let Some(ref cb) = callback {
-            cb(&publish);
+            if let Err(panic) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(&publish)))
+            {
+                rx.drop_queued_after_callback_panic();
+                std::panic::resume_unwind(panic);
+            }
         } else {
             tracing::trace!("Publish: {:?}", publish);
         }
@@ -820,6 +847,208 @@ mod tests {
             tx.queued_depth(),
             EVENT_CHANNEL_CAPACITY,
             "a rejected send must not occupy a queue slot"
+        );
+    }
+
+    /// AC-5, AC-6, AC-7, INV-2 — a panicking callback adds every publish
+    /// still queued to the drop total, warns once with the queued count and
+    /// new total, and resumes unwinding with the callback's own panic. The
+    /// publish whose callback panicked is not counted: it reached the
+    /// callback.
+    #[test]
+    fn callback_panic_counts_every_publish_still_queued_as_dropped() {
+        const PRIOR_DROPS: u64 = 7;
+        let sink = capture_logs();
+
+        // Part A: three publishes queued behind the one that panics.
+        let dropped = Arc::new(AtomicU64::new(PRIOR_DROPS));
+        let (tx, rx) = event_channel(3, dropped.clone());
+        for _ in 0..4 {
+            tx.send(Publish::fixture("t", &[]));
+        }
+        drop(tx);
+
+        let cb: PublishCallback = Arc::new(|_: &Publish| panic!("test callback panic"));
+        let mut rt = legacy_timer_runtime();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rt.block_on(process_events(rx, Some(cb.clone())));
+        }));
+        match outcome {
+            Err(payload) => {
+                assert_eq!(
+                    payload.downcast_ref::<&str>(),
+                    Some(&"test callback panic"),
+                    "the callback's own panic payload must resume unwinding"
+                );
+            }
+            Ok(()) => panic!("expected the callback panic to unwind process_events"),
+        }
+        assert_eq!(
+            dropped.load(Ordering::Relaxed),
+            10,
+            "7 earlier drops + 3 still queued; the publish in the callback is not counted"
+        );
+
+        // Part B: nothing left queued behind the panicking publish.
+        let dropped_b = Arc::new(AtomicU64::new(PRIOR_DROPS));
+        let (tx_b, rx_b) = event_channel(4, dropped_b.clone());
+        tx_b.send(Publish::fixture("t", &[]));
+        drop(tx_b);
+
+        let mut rt_b = legacy_timer_runtime();
+        let outcome_b = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rt_b.block_on(process_events(rx_b, Some(cb)));
+        }));
+        assert!(
+            outcome_b.is_err(),
+            "expected the callback panic to unwind process_events"
+        );
+        assert_eq!(dropped_b.load(Ordering::Relaxed), PRIOR_DROPS);
+
+        let logs = {
+            let bytes = sink.lock().expect("log buffer").clone();
+            String::from_utf8(bytes).expect("utf8 logs")
+        };
+        assert_eq!(
+            count_lines_at(
+                &logs,
+                "WARN",
+                "worker 3: event callback panicked, 3 queued events dropped (10 dropped total)"
+            ),
+            1
+        );
+        assert_eq!(
+            count_lines_at(
+                &logs,
+                "WARN",
+                "worker 4: event callback panicked, 0 queued events dropped (7 dropped total)"
+            ),
+            1
+        );
+    }
+
+    /// AC-5, AC-6, INV-2 — a callback that panics on a later publish counts
+    /// only what is still queued behind it: the publishes it already
+    /// delivered are not drops, and neither is the one it panicked on.
+    /// `callback_panic_counts_every_publish_still_queued_as_dropped` panics on
+    /// the first publish, where the queue depth decreased once: `recv`
+    /// decrements it before the callback runs.
+    #[test]
+    fn callback_panic_after_delivering_counts_only_the_queue_left_behind() {
+        const PRIOR_DROPS: u64 = 2;
+        const QUEUED: usize = 5;
+        const PANIC_ON: u64 = 3;
+        let sink = capture_logs();
+
+        let dropped = Arc::new(AtomicU64::new(PRIOR_DROPS));
+        let (tx, rx) = event_channel(9, dropped.clone());
+        for _ in 0..QUEUED {
+            tx.send(Publish::fixture("t", &[]));
+        }
+        drop(tx);
+
+        let delivered = Arc::new(AtomicU64::new(0));
+        let seen = delivered.clone();
+        let cb: PublishCallback = Arc::new(move |_: &Publish| {
+            assert!(
+                seen.fetch_add(1, Ordering::Relaxed) + 1 != PANIC_ON,
+                "test callback panic on the third publish"
+            );
+        });
+
+        let mut rt = legacy_timer_runtime();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rt.block_on(process_events(rx, Some(cb)));
+        }));
+        assert!(
+            outcome.is_err(),
+            "expected the callback panic to unwind process_events"
+        );
+        assert_eq!(
+            delivered.load(Ordering::Relaxed),
+            PANIC_ON,
+            "the callback runs until it panics"
+        );
+        assert_eq!(
+            dropped.load(Ordering::Relaxed),
+            PRIOR_DROPS + 2,
+            "2 earlier drops + the 2 still queued behind the third publish"
+        );
+
+        let logs = {
+            let bytes = sink.lock().expect("log buffer").clone();
+            String::from_utf8(bytes).expect("utf8 logs")
+        };
+        assert_eq!(
+            count_lines_at(
+                &logs,
+                "WARN",
+                "worker 9: event callback panicked, 2 queued events dropped (4 dropped total)"
+            ),
+            1
+        );
+    }
+
+    /// INV-2 — the unwind guard changes nothing when the callback does not
+    /// panic: every queued publish reaches the callback once, in arrival
+    /// order, nothing is counted as dropped and no panic warn is logged. The
+    /// callback-less arm drains the same way.
+    #[test]
+    fn process_events_delivers_every_queued_publish_without_counting_a_drop() {
+        const PRIOR_DROPS: u64 = 5;
+        const QUEUED: usize = 4;
+        let sink = capture_logs();
+
+        let dropped = Arc::new(AtomicU64::new(PRIOR_DROPS));
+        let (tx, rx) = event_channel(11, dropped.clone());
+        for i in 0..QUEUED {
+            tx.send(Publish::fixture(&format!("t{i}"), &[]));
+        }
+        drop(tx);
+
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let recorder = seen.clone();
+        let cb: PublishCallback = Arc::new(move |publish: &Publish| {
+            recorder
+                .lock()
+                .expect("seen lock")
+                .push(publish.topic().to_string());
+        });
+
+        let mut rt = legacy_timer_runtime();
+        rt.block_on(process_events(rx, Some(cb)));
+
+        let seen = seen.lock().expect("seen lock").clone();
+        assert_eq!(
+            seen,
+            vec!["t0", "t1", "t2", "t3"],
+            "every queued publish reaches the callback once, in arrival order"
+        );
+        assert_eq!(
+            dropped.load(Ordering::Relaxed),
+            PRIOR_DROPS,
+            "a delivered publish is not a drop"
+        );
+
+        // The callback-less arm: the trace path drains and counts nothing.
+        let dropped_b = Arc::new(AtomicU64::new(PRIOR_DROPS));
+        let (tx_b, rx_b) = event_channel(12, dropped_b.clone());
+        for _ in 0..QUEUED {
+            tx_b.send(Publish::fixture("t", &[]));
+        }
+        drop(tx_b);
+        let mut rt_b = legacy_timer_runtime();
+        rt_b.block_on(process_events(rx_b, None));
+        assert_eq!(dropped_b.load(Ordering::Relaxed), PRIOR_DROPS);
+
+        let logs = {
+            let bytes = sink.lock().expect("log buffer").clone();
+            String::from_utf8(bytes).expect("utf8 logs")
+        };
+        assert_eq!(
+            count_lines_at(&logs, "WARN", "event callback panicked"),
+            0,
+            "no panic, no panic warn"
         );
     }
 
@@ -1491,7 +1720,12 @@ mod tests {
         let sup_result = sup_rx
             .recv_timeout(Duration::from_secs(10))
             .expect("sup timeout");
-        assert!(sup_result.is_err(), "expected Err, got {sup_result:?}");
+        match sup_result {
+            Err(Error::Worker(msg)) => {
+                assert_eq!(msg, "workers [1] exited before reporting a startup result");
+            }
+            other => panic!("expected the startup error naming worker 1, got {other:?}"),
+        }
 
         // A aborted cleanly via the false fan-out.
         match res_a_rx

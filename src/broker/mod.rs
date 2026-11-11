@@ -366,9 +366,11 @@ impl BrokerHandle {
     /// Lifetime count of PUBLISH packets, at any QoS, that were discarded
     /// instead of reaching the callback, summed over every worker: dropped
     /// after waiting out the ingest deadline or the connection's idle budget
-    /// on a full event channel, or cut off mid-wait by a shutdown
-    /// force-close. A discard is counted whether or not its acknowledgement
-    /// was written; each one is also warned on the shared cadence.
+    /// on a full event channel, cut off mid-wait by a shutdown force-close,
+    /// or still queued for a callback that panicked. A discard is counted
+    /// whether or not its acknowledgement was written; each overflow drop
+    /// is also warned on the shared cadence, and a callback panic warns once
+    /// for the publishes it left queued.
     /// Monotonic; never reset.
     /// [`dropped_publishes_handle`](Self::dropped_publishes_handle) reads
     /// the same total after [`join`](Self::join).
@@ -489,7 +491,13 @@ impl MqttBroker {
     /// blocking stalls that worker's event processing AND its shutdown. A panic
     /// inside the callback unwinds the worker thread (monoio's task harness
     /// does not catch it) and surfaces from [`BrokerHandle::join`] as
-    /// [`Error::Worker(_)`]. Never call [`BrokerHandle::join`] or drop a
+    /// [`Error::Worker(_)`]. Publishes still queued for that worker's
+    /// callback when it panics are added to the drop total
+    /// ([`BrokerHandle::dropped_publishes`]); the publish whose callback
+    /// panicked is not, because it reached the callback. Publishes a
+    /// connection on that worker still holds, or has not yet read, are lost
+    /// with the worker and are not guaranteed to be counted. Never call
+    /// [`BrokerHandle::join`] or drop a
     /// [`BrokerHandle`] from inside an event callback. That panic also signals
     /// shutdown to the remaining workers, so the whole ingest server stops
     /// rather than running with a dead worker. This relies on the panic
@@ -596,7 +604,10 @@ impl MqttBroker {
                     }
                     for h in handles {
                         if let Err(panic) = h.join() {
-                            tracing::error!("Worker thread panicked during abort: {panic:?}");
+                            tracing::error!(
+                                "Worker thread panicked during abort: {}",
+                                panic_message(&*panic)
+                            );
                         }
                     }
                     return Err(Error::Worker(format!(
@@ -610,7 +621,10 @@ impl MqttBroker {
         if let Err(e) = supervise_startup(&ready_rx, &go_txs, num_workers) {
             for h in handles {
                 if let Err(panic) = h.join() {
-                    tracing::error!("Worker thread panicked during abort: {panic:?}");
+                    tracing::error!(
+                        "Worker thread panicked during abort: {}",
+                        panic_message(&*panic)
+                    );
                 }
             }
             return Err(e);
@@ -651,19 +665,23 @@ impl MqttBroker {
 
 /// Collect per-worker startup reports and fan out a single go/abort decision to
 /// every go-sender. Returns `Ok(())` once every worker has reported success
-/// (decision = `true`); returns the first `Err` reported, or a generic
-/// premature-disconnect error if the ready channel closes with workers missing
-/// (decision = `false` in both error cases). Send errors on the go side are
-/// ignored — the worker may have already exited.
+/// (decision = `true`); returns the first `Err` reported, or, if the ready
+/// channel closes with workers missing, an error naming every worker that never
+/// reported (also logged at warn) (decision = `false` in both error cases).
+/// Send errors on the go side are ignored — the worker may have already exited.
 fn supervise_startup(
     ready_rx: &std::sync::mpsc::Receiver<(usize, Result<(), Error>)>,
     go_txs: &[std::sync::mpsc::Sender<bool>],
     num_workers: usize,
 ) -> Result<(), Error> {
     let mut count = 0;
+    let mut reported = vec![false; num_workers];
     loop {
         match ready_rx.recv() {
-            Ok((_, Ok(()))) => {
+            Ok((id, Ok(()))) => {
+                if let Some(slot) = reported.get_mut(id) {
+                    *slot = true;
+                }
                 count += 1;
                 if count == num_workers {
                     for tx in go_txs {
@@ -680,15 +698,32 @@ fn supervise_startup(
                 return Err(e);
             }
             Err(std::sync::mpsc::RecvError) => {
+                let missing: Vec<usize> = reported
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, done)| !**done)
+                    .map(|(id, _)| id)
+                    .collect();
+                let reason =
+                    format!("workers {missing:?} exited before reporting a startup result");
+                tracing::warn!("{reason}");
                 for tx in go_txs {
                     let _ = tx.send(false);
                 }
-                return Err(Error::Worker(
-                    "worker exited before reporting startup result".into(),
-                ));
+                return Err(Error::Worker(reason));
             }
         }
     }
+}
+
+/// The message a worker's panic carried: the `&str` or `String` payload
+/// that `panic!` produces, or a fixed placeholder for any other payload.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
 }
 
 #[cfg(test)]
@@ -1404,24 +1439,125 @@ mod tests {
 
     #[test]
     fn supervise_premature_disconnect_aborts_every_worker() {
+        let logs = crate::broker::handler::tests::capture_logs();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (go0_tx, go0_rx) = std::sync::mpsc::channel();
         let (go1_tx, go1_rx) = std::sync::mpsc::channel();
         let (go2_tx, go2_rx) = std::sync::mpsc::channel();
         let (go3_tx, go3_rx) = std::sync::mpsc::channel();
-        let go_txs = vec![go1_tx, go2_tx, go3_tx];
+        let go_txs = vec![go0_tx, go1_tx, go2_tx, go3_tx];
 
-        // Only one Ok report for num_workers=3, then drop — premature
-        // disconnect.
-        ready_tx.send((0, Ok(()))).expect("send 0 ok");
+        // Workers 3 and 1 report Ok, then the channel drops: 0 and 2 never
+        // reported.
+        ready_tx.send((3, Ok(()))).expect("send 3 ok");
+        ready_tx.send((1, Ok(()))).expect("send 1 ok");
         drop(ready_tx);
 
-        match supervise_startup(&ready_rx, &go_txs, 3) {
-            Err(Error::Worker(_)) => {}
-            other => panic!("expected Err(Worker), got {other:?}"),
+        match supervise_startup(&ready_rx, &go_txs, 4) {
+            Err(Error::Worker(msg)) => {
+                assert_eq!(
+                    msg,
+                    "workers [0, 2] exited before reporting a startup result"
+                );
+            }
+            other => panic!("expected the startup error naming workers 0 and 2, got {other:?}"),
         }
+        assert_eq!(go0_rx.try_recv(), Ok(false));
         assert_eq!(go1_rx.try_recv(), Ok(false));
         assert_eq!(go2_rx.try_recv(), Ok(false));
         assert_eq!(go3_rx.try_recv(), Ok(false));
+
+        let logs = String::from_utf8(logs.lock().expect("log lock").clone()).expect("log UTF-8");
+        assert_eq!(
+            crate::broker::handler::tests::count_lines_at(
+                &logs,
+                "WARN",
+                "workers [0, 2] exited before reporting a startup result",
+            ),
+            1,
+        );
+    }
+
+    /// AC-3 — a startup report carrying an id outside `0..num_workers` can
+    /// never index the reported list out of bounds: the supervisor ignores
+    /// that id and still names every real worker that never reported.
+    #[test]
+    fn supervise_ignores_a_report_id_outside_the_worker_range() {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (go0_tx, go0_rx) = std::sync::mpsc::channel();
+        let (go1_tx, go1_rx) = std::sync::mpsc::channel();
+        let go_txs = vec![go0_tx, go1_tx];
+
+        ready_tx.send((5, Ok(()))).expect("send 5 ok");
+        drop(ready_tx);
+
+        match supervise_startup(&ready_rx, &go_txs, 2) {
+            Err(Error::Worker(msg)) => {
+                assert_eq!(
+                    msg,
+                    "workers [0, 1] exited before reporting a startup result"
+                );
+            }
+            other => panic!("expected the startup error naming workers 0 and 1, got {other:?}"),
+        }
+        assert_eq!(go0_rx.try_recv(), Ok(false));
+        assert_eq!(go1_rx.try_recv(), Ok(false));
+    }
+
+    /// AC-3, AC-8 — every worker that panics in setup is named in the
+    /// startup error, and each abort-path join logs that worker's own panic
+    /// message (not `Any { .. }`).
+    ///
+    /// `MqttBroker::start` blocks in `ready_rx.recv()` and in the abort-path
+    /// joins, so it runs inside a harness thread like the lifecycle tests
+    /// below: the whole body — log capture, `start`, every assertion — stays
+    /// in that thread, and the outer test only waits bounded on the channel.
+    /// A regression that retained a ready sender fails `recv_timeout` instead
+    /// of hanging the suite. Log capture is thread-local, so the harness
+    /// thread calls `capture_logs` itself.
+    #[test]
+    fn startup_abort_logs_each_setup_panic_message() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let _h = std::thread::Builder::new()
+            .name("t2-ac8-setup-panic".into())
+            .spawn(move || {
+                let logs = crate::broker::handler::tests::capture_logs();
+                let config = BrokerConfig::new(format!("127.0.0.1:{}", find_free_port()))
+                    .num_workers(2)
+                    .panic_in_setup();
+
+                match MqttBroker::start(config) {
+                    Err(Error::Worker(msg)) => {
+                        assert_eq!(
+                            msg,
+                            "workers [0, 1] exited before reporting a startup result"
+                        );
+                    }
+                    Err(e) => panic!("expected the startup error naming workers 0 and 1, got {e:?}"),
+                    Ok(_) => panic!("startup must fail when every worker panics in setup"),
+                }
+
+                let logs =
+                    String::from_utf8(logs.lock().expect("log lock").clone()).expect("log UTF-8");
+                for id in 0..2 {
+                    assert_eq!(
+                        crate::broker::handler::tests::count_lines_at(
+                            &logs,
+                            "ERROR",
+                            &format!(
+                                "Worker thread panicked during abort: test hook: worker {id} setup panic before the ready report"
+                            ),
+                        ),
+                        1,
+                    );
+                }
+                let _ = tx.send(());
+            })
+            .expect("spawn harness");
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(()) => {}
+            other => panic!("expected the startup harness to finish, got {other:?}"),
+        }
     }
 
     // ─────────────────── T3 public-API lifecycle tests ───────────────────

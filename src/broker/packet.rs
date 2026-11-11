@@ -15,7 +15,7 @@ use rmqtt_codec::types::QoS;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroUsize};
 
 /// A reply the packet loop owes the client, stated without a protocol version.
-/// Rendered once, at the send site, from the codec that will encode it.
+/// Rendered once, by the size gate, for the codec that will encode it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Reply {
     PingResponse,
@@ -46,14 +46,6 @@ impl Reply {
             Reply::PublishReceived(_) => super::handler::TIMEOUT_CTX_PUBREC_FLUSH,
             Reply::PublishComplete(_, _) => super::handler::TIMEOUT_CTX_PUBCOMP_FLUSH,
         }
-    }
-
-    /// Wire size of this reply in bytes, or `None` when it cannot be encoded
-    /// at all. Measured by encoding the rendered packet rather than derived
-    /// from the packet layout, so the size and the bytes the send site writes
-    /// can never drift apart.
-    fn encoded_len(self, version: ProtocolVersion) -> Option<usize> {
-        encoded_len(self.render(version), version)
     }
 
     /// The only constructor of an outbound packet in the packet loop.
@@ -282,19 +274,20 @@ impl Violation {
         max_packet_size: Option<NonZeroU32>,
     ) -> Option<MqttPacket> {
         let reason_code = self.disconnect_reason_code(version)?;
-        let render = || {
+        within_max_packet_size(
             MqttPacket::V5(PacketV5::Disconnect(rmqtt_codec::v5::Disconnect::new(
                 reason_code,
-            )))
-        };
-        fits_within(|| encoded_len(render(), version), max_packet_size).then(render)
+            ))),
+            version,
+            max_packet_size,
+        )
     }
 }
 
 #[cfg(test)]
 thread_local! {
     /// Test-only count of `Reply::render` calls on this thread.
-    static RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Test-only count of `encoded_len` calls on this thread.
     static ENCODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -326,6 +319,33 @@ fn fits_within(len: impl FnOnce() -> Option<usize>, max_packet_size: Option<NonZ
     matches!(len(), Some(len) if u64::try_from(len).is_ok_and(|len| len <= limit))
 }
 
+/// `packet` itself when it fits under `max_packet_size`, `None` when it
+/// does not. Measured on an owned copy, because `MqttPacket` is not
+/// `Clone` and measuring a packet consumes it; the copy is made only under
+/// a declared limit. The one gate behind every packet-loop reply and every
+/// violation DISCONNECT.
+fn within_max_packet_size(
+    packet: MqttPacket,
+    version: ProtocolVersion,
+    max_packet_size: Option<NonZeroU32>,
+) -> Option<MqttPacket> {
+    fits_within(
+        || encoded_len(owned_copy(&packet), version),
+        max_packet_size,
+    )
+    .then_some(packet)
+}
+
+/// An owned copy of `packet`. `MqttPacket` derives only `Debug`; its inner
+/// v3 and v5 packets are `Clone`.
+fn owned_copy(packet: &MqttPacket) -> MqttPacket {
+    match packet {
+        MqttPacket::V3(p) => MqttPacket::V3(p.clone()),
+        MqttPacket::V5(p) => MqttPacket::V5(p.clone()),
+        MqttPacket::Version(v) => MqttPacket::Version(*v),
+    }
+}
+
 /// Whether `packet` may be written to a client that declared
 /// `max_packet_size`. The `pub(crate)` face of the private
 /// `fits_within(encoded_len(..))` pair, for the CONNACK decision that
@@ -343,18 +363,17 @@ pub(crate) fn fits_max_packet_size(
 /// larger than the Maximum Packet Size the client declared on CONNECT, and the
 /// SUBACK's size follows the request's filter count, so a refusal the client
 /// cannot receive closes the connection instead of going out oversized.
+/// Renders `reply` exactly once and returns that packet for the send, so the
+/// measured packet and the written packet are one render.
 /// `max_packet_size` is `None` for every v3 client and for a v5 CONNECT that
 /// omits the property — both mean "no client-side limit", and are never gated.
-pub(crate) fn reply_over_max_packet_size(
+pub(crate) fn render_within_max_packet_size(
     reply: Reply,
     version: ProtocolVersion,
     max_packet_size: Option<NonZeroU32>,
-) -> Option<Violation> {
-    if fits_within(|| reply.encoded_len(version), max_packet_size) {
-        None
-    } else {
-        Some(Violation::ReplyOverMaxPacketSize)
-    }
+) -> Result<MqttPacket, Violation> {
+    within_max_packet_size(reply.render(version), version, max_packet_size)
+        .ok_or(Violation::ReplyOverMaxPacketSize)
 }
 
 /// Split a packet-loop read error into a protocol violation and a transport
@@ -1461,29 +1480,34 @@ mod tests {
         let id = NonZeroU16::new(1).expect("non-zero");
         let refusal = Reply::SubscribeRefusal(id, NonZeroUsize::new(200).expect("n"));
         assert_eq!(
-            refusal.encoded_len(ProtocolVersion::MQTT5),
+            encoded_len(
+                refusal.render(ProtocolVersion::MQTT5),
+                ProtocolVersion::MQTT5
+            ),
             Some(206),
             "3-byte fixed header + 2 packet id + 1 property length + 200 reason codes"
         );
 
         assert_eq!(
-            reply_over_max_packet_size(
+            render_within_max_packet_size(
                 refusal,
                 ProtocolVersion::MQTT5,
                 Some(NonZeroU32::new(128).expect("non-zero")),
-            ),
+            )
+            .err(),
             Some(Violation::ReplyOverMaxPacketSize)
         );
         assert_eq!(
-            reply_over_max_packet_size(
+            render_within_max_packet_size(
                 refusal,
                 ProtocolVersion::MQTT5,
                 Some(NonZeroU32::new(4096).expect("non-zero")),
-            ),
+            )
+            .err(),
             None
         );
         assert_eq!(
-            reply_over_max_packet_size(refusal, ProtocolVersion::MQTT5, None),
+            render_within_max_packet_size(refusal, ProtocolVersion::MQTT5, None).err(),
             None
         );
     }
@@ -1495,15 +1519,20 @@ mod tests {
         let two = NonZeroU32::new(2).expect("non-zero");
         let one = NonZeroU32::new(1).expect("non-zero");
         assert_eq!(
-            Reply::PingResponse.encoded_len(ProtocolVersion::MQTT3),
+            encoded_len(
+                Reply::PingResponse.render(ProtocolVersion::MQTT3),
+                ProtocolVersion::MQTT3
+            ),
             Some(2)
         );
         assert_eq!(
-            reply_over_max_packet_size(Reply::PingResponse, ProtocolVersion::MQTT3, Some(two)),
+            render_within_max_packet_size(Reply::PingResponse, ProtocolVersion::MQTT3, Some(two))
+                .err(),
             None
         );
         assert_eq!(
-            reply_over_max_packet_size(Reply::PingResponse, ProtocolVersion::MQTT3, Some(one)),
+            render_within_max_packet_size(Reply::PingResponse, ProtocolVersion::MQTT3, Some(one))
+                .err(),
             Some(Violation::ReplyOverMaxPacketSize)
         );
     }
@@ -2263,10 +2292,10 @@ mod tests {
     }
 
     /// AC-2, AC-3 — a client that declared no Maximum Packet Size is never
-    /// gated, so no size gate may render a reply or encode a packet to find
-    /// that out: the 200-filter SUBACK's status vector is never built. Under
-    /// a declared limit the SUBACK is rendered once and each gate encodes
-    /// once. Results are unchanged either way: the v5 DISCONNECT still comes
+    /// gated, so no size gate may encode a packet to find that out; the reply
+    /// is rendered once, for the send. Under a declared limit the SUBACK is
+    /// rendered once and each gate encodes once. Results are unchanged either
+    /// way: the v5 DISCONNECT still comes
     /// back as `E0 02 82 00`. The `fits_max_packet_size` inputs are built
     /// before each window opens, and every count is a delta on this test's
     /// own thread, so tests running in parallel cannot disturb it.
@@ -2281,7 +2310,7 @@ mod tests {
 
         let (r0, e0) = (renders(), encodes());
         assert_eq!(
-            reply_over_max_packet_size(suback, ProtocolVersion::MQTT5, None),
+            render_within_max_packet_size(suback, ProtocolVersion::MQTT5, None).err(),
             None
         );
         let pkt = Violation::DuplicateConnect
@@ -2294,8 +2323,8 @@ mod tests {
         ));
         assert_eq!(
             (renders() - r0, encodes() - e0),
-            (0, 0),
-            "no gate may render a reply or encode a packet when the client declared no limit"
+            (1, 0),
+            "without a declared limit the reply is rendered once, for the send, and no gate encodes"
         );
         assert_eq!(
             encode(pkt, ProtocolVersion::MQTT5),
@@ -2305,7 +2334,7 @@ mod tests {
         let limit = Some(NonZeroU32::new(4096).expect("non-zero"));
         let (r0, e0) = (renders(), encodes());
         assert_eq!(
-            reply_over_max_packet_size(suback, ProtocolVersion::MQTT5, limit),
+            render_within_max_packet_size(suback, ProtocolVersion::MQTT5, limit).err(),
             None
         );
         assert!(Violation::DuplicateConnect
@@ -2343,29 +2372,77 @@ mod tests {
         ];
         for version in [ProtocolVersion::MQTT3, ProtocolVersion::MQTT5] {
             for reply in replies {
-                let len = reply
-                    .encoded_len(version)
+                let len = encoded_len(reply.render(version), version)
                     .unwrap_or_else(|| panic!("{reply:?} must encode on {version:?}"));
                 let at = NonZeroU32::new(u32::try_from(len).expect("len fits in u32"))
                     .expect("non-zero");
                 let under = NonZeroU32::new(u32::try_from(len - 1).expect("len - 1 fits in u32"))
                     .expect("non-zero");
+                let sent =
+                    render_within_max_packet_size(reply, version, Some(at)).unwrap_or_else(|v| {
+                        panic!("{reply:?} on {version:?} fits {len} bytes, got {v:?}")
+                    });
                 assert_eq!(
-                    reply_over_max_packet_size(reply, version, Some(at)),
-                    None,
-                    "{reply:?} on {version:?} fits a limit equal to its {len} bytes"
+                    encode(sent, version),
+                    encode(reply.render(version), version),
+                    "{reply:?} on {version:?}: the gate returns that reply's own packet"
                 );
                 assert_eq!(
-                    reply_over_max_packet_size(reply, version, Some(under)),
+                    render_within_max_packet_size(reply, version, Some(under)).err(),
                     Some(Violation::ReplyOverMaxPacketSize),
                     "{reply:?} on {version:?} exceeds a limit one byte below its {len} bytes"
                 );
                 assert_eq!(
-                    reply_over_max_packet_size(reply, version, None),
+                    render_within_max_packet_size(reply, version, None).err(),
                     None,
                     "{reply:?} on {version:?} is never gated without a declared limit"
                 );
             }
+        }
+    }
+
+    /// INV-3, INV-5 — the gate hands back the packet it was given. Without a
+    /// declared limit nothing is measured, so no other assertion proves the
+    /// returned packet is the reply that was rendered; the bytes do. The
+    /// violation DISCONNECT is measured on an owned copy under a limit that
+    /// holds it, and must still return the original `E0 02 95 00`.
+    #[test]
+    fn the_gate_returns_the_packet_it_was_given() {
+        let id = NonZeroU16::new(9).expect("non-zero");
+        let filters = NonZeroUsize::new(2).expect("non-zero");
+        let replies = [
+            Reply::PingResponse,
+            Reply::PublishAck(id),
+            Reply::SubscribeRefusal(id, filters),
+            Reply::UnsubscribeAck(id, filters),
+            Reply::PublishReceived(id),
+            Reply::PublishComplete(id, ReleaseOutcome::Released),
+            Reply::PublishComplete(id, ReleaseOutcome::UnknownPacketId),
+        ];
+        for version in [ProtocolVersion::MQTT3, ProtocolVersion::MQTT5] {
+            for reply in replies {
+                let sent =
+                    render_within_max_packet_size(reply, version, None).unwrap_or_else(|v| {
+                        panic!("{reply:?} on {version:?} is never gated, got {v:?}")
+                    });
+                assert_eq!(
+                    encode(sent, version),
+                    encode(reply.render(version), version),
+                    "{reply:?} on {version:?}: the ungated path returns that reply's own packet"
+                );
+            }
+        }
+
+        let max = NonZeroU32::new(u32::MAX).expect("non-zero");
+        for limit in [None, Some(max)] {
+            let pkt = Violation::ReplyOverMaxPacketSize
+                .disconnect(ProtocolVersion::MQTT5, limit)
+                .unwrap_or_else(|| panic!("a v5 DISCONNECT must pass the gate under {limit:?}"));
+            assert_eq!(
+                encode(pkt, ProtocolVersion::MQTT5),
+                vec![0xE0, 0x02, 0x95, 0x00],
+                "the gate returns the DISCONNECT it measured under {limit:?}"
+            );
         }
     }
 

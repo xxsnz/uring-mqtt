@@ -473,24 +473,28 @@ async fn run_packet_loop<P: PacketIo, T: Timer>(
                     break Ok(SessionOutcome::Served);
                 }
                 if let Some(reply) = owed_reply {
-                    let version = packets.version();
-                    if let Some(violation) =
-                        super::packet::reply_over_max_packet_size(reply, version, max_packet_size)
-                    {
-                        break Ok(close_with_violation::<_, T>(
-                            packets,
-                            &mut unflushed,
-                            violation,
-                            reply_deadline,
-                            peer_addr,
-                            max_packet_size,
-                        )
-                        .await);
-                    }
+                    let packet = match super::packet::render_within_max_packet_size(
+                        reply,
+                        packets.version(),
+                        max_packet_size,
+                    ) {
+                        Ok(packet) => packet,
+                        Err(violation) => {
+                            break Ok(close_with_violation::<_, T>(
+                                packets,
+                                &mut unflushed,
+                                violation,
+                                reply_deadline,
+                                peer_addr,
+                                max_packet_size,
+                            )
+                            .await);
+                        }
+                    };
                     queue_reply::<_, T>(
                         packets,
                         &mut unflushed,
-                        reply.render(version),
+                        packet,
                         reply_deadline,
                         peer_addr,
                         reply.timeout_context(),
@@ -5452,6 +5456,129 @@ pub(crate) mod tests {
                 Ok(super::SessionOutcome::Violation) => {}
                 other => panic!("expected SessionOutcome::Violation, got {other:?}"),
             }
+        });
+    }
+
+    #[test]
+    fn v5_puback_under_a_declared_limit_is_rendered_once_and_sent() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            let connect = encode_v5_connect_with_max_packet_size(
+                30,
+                "test",
+                Some(NonZeroU32::new(128).expect("non-zero")),
+            );
+            tcp_write_all(&mut client, &connect)
+                .await
+                .expect("v5 CONNECT write");
+
+            let mut reader = V5Reader::new();
+            let connack = monoio::time::timeout(Duration::from_secs(2), reader.next(&mut client))
+                .await
+                .expect("v5 CONNACK read timeout")
+                .expect("v5 CONNACK decoded");
+            let MqttPacket::V5(PacketV5::ConnectAck(_)) = connack else {
+                panic!("expected v5 CONNACK, got {connack:?}")
+            };
+
+            let renders = || crate::broker::packet::RENDERS.with(std::cell::Cell::get);
+            let r0 = renders();
+
+            let mut enc = MqttEncoder::v5();
+            let pkt = MqttPacket::V5(PacketV5::Publish(Box::new(TypesPublish {
+                dup: false,
+                retain: false,
+                qos: CodecQoS::AtLeastOnce,
+                topic: "t".to_string().into(),
+                packet_id: Some(NonZeroU16::new(1).expect("non-zero")),
+                payload: bytes::Bytes::from_static(b"x"),
+                properties: None,
+            })));
+            let mut buf = BytesMut::new();
+            enc.encode(pkt, &mut buf).expect("encode v5 PUBLISH");
+            tcp_write_all(&mut client, &buf)
+                .await
+                .expect("v5 PUBLISH write");
+
+            let puback = monoio::time::timeout(Duration::from_secs(2), reader.raw(&mut client, 6))
+                .await
+                .expect("v5 PUBACK read timeout");
+            assert_eq!(puback, vec![0x40, 0x04, 0x00, 0x01, 0x00, 0x00]);
+            assert_eq!(
+                renders() - r0,
+                1,
+                "the owed PUBACK must be rendered once: the gate's render is the one sent"
+            );
+
+            drop(client);
+            let _ = monoio::time::timeout(Duration::from_secs(2), handle).await;
+        });
+    }
+
+    /// AC-1, AC-2 — the QoS 2 owed replies obey the same one-render rule as
+    /// the PUBACK: under a declared Maximum Packet Size the PUBREC and the
+    /// PUBCOMP are each rendered once, and the bytes that arrive are the
+    /// packet the gate measured. `v5_puback_under_a_declared_limit_is_rendered_once_and_sent`
+    /// covers the QoS 1 reply; this covers the two replies the QoS 2 flow owes.
+    #[test]
+    fn v5_qos2_replies_under_a_declared_limit_are_each_rendered_once() {
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            let id1 = NonZeroU16::new(1).expect("non-zero");
+            let connect = encode_v5_connect_with_max_packet_size(
+                30,
+                "qos2",
+                Some(NonZeroU32::new(128).expect("non-zero")),
+            );
+            tcp_write_all(&mut client, &connect)
+                .await
+                .expect("v5 CONNECT write");
+
+            let mut reader = V5Reader::new();
+            let connack = monoio::time::timeout(Duration::from_secs(2), reader.next(&mut client))
+                .await
+                .expect("v5 CONNACK read timeout")
+                .expect("v5 CONNACK decoded");
+            let MqttPacket::V5(PacketV5::ConnectAck(_)) = connack else {
+                panic!("expected v5 CONNACK, got {connack:?}")
+            };
+
+            let renders = || crate::broker::packet::RENDERS.with(std::cell::Cell::get);
+            let r0 = renders();
+
+            tcp_write_all(
+                &mut client,
+                &encode_v5_qos2_publish("t", id1, &FIXTURE_PAYLOAD),
+            )
+            .await
+            .expect("v5 QoS 2 PUBLISH write");
+            let pubrec = monoio::time::timeout(Duration::from_secs(2), reader.raw(&mut client, 6))
+                .await
+                .expect("v5 PUBREC read timeout");
+            assert_eq!(pubrec, vec![0x50, 0x04, 0x00, 0x01, 0x00, 0x00]);
+            assert_eq!(
+                renders() - r0,
+                1,
+                "the owed PUBREC must be rendered once: the gate's render is the one sent"
+            );
+
+            tcp_write_all(&mut client, &encode_v5_pubrel(id1))
+                .await
+                .expect("v5 PUBREL write");
+            let pubcomp = monoio::time::timeout(Duration::from_secs(2), reader.raw(&mut client, 6))
+                .await
+                .expect("v5 PUBCOMP read timeout");
+            assert_eq!(pubcomp, vec![0x70, 0x04, 0x00, 0x01, 0x00, 0x00]);
+            assert_eq!(
+                renders() - r0,
+                2,
+                "the owed PUBCOMP must be rendered once too"
+            );
+
+            drop(client);
+            let _ = monoio::time::timeout(Duration::from_secs(2), handle).await;
         });
     }
 
