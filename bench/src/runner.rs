@@ -1815,8 +1815,10 @@ fn sleep_until(host: &HostSetup, target_ns: u64) -> Result<(), String> {
 /// past that it is SIGKILLed with `signal` and reaped within
 /// [`GUARD_SIGKILL_REAP_TIMEOUT_SECS`] ([`kill_within_bound`]), and the error names a
 /// child still running after that by its pid; the child stays with the
-/// caller, whose guard ends it for good. ESRCH on the SIGTERM (the child is
-/// already gone) is ignored. Returns the exit status.
+/// caller, whose guard ends it for good. A child `try_wait` already answers
+/// for is never signalled: std may have reaped it, and its pid may belong to
+/// another process. ESRCH on the SIGTERM (the child is already gone) is
+/// ignored. Returns the exit status.
 fn terminate_within<K: FnMut(Pid, Signal) -> nix::Result<()>>(
     cancel: &AtomicBool,
     label: &str,
@@ -1824,6 +1826,12 @@ fn terminate_within<K: FnMut(Pid, Signal) -> nix::Result<()>>(
     slack_secs: u64,
     mut signal: K,
 ) -> Result<std::process::ExitStatus, String> {
+    if let Some(status) = child
+        .try_wait()
+        .map_err(|e| format!("try_wait {label}: {e}"))?
+    {
+        return Ok(status);
+    }
     let pid = i32::try_from(child.id()).expect("child pid fits in i32");
     match signal(Pid::from_raw(pid), Signal::SIGTERM) {
         Ok(()) | Err(nix::Error::ESRCH) => {}
@@ -4017,6 +4025,36 @@ mod tests {
             Err(Errno::ESRCH),
             "the child must be reaped by the wait, not left a zombie"
         );
+    }
+
+    #[test]
+    fn terminate_within_never_signals_a_child_std_has_already_reaped() {
+        // Decision 2026-10-15: no reaped pid is ever signalled. Once std has
+        // reaped the child, its pid is free for the kernel to hand to another
+        // process, so only the cached status may answer.
+        let mut child = Command::new("true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the fixture child must start");
+        child.wait().expect("the fixture child must be reaped");
+        let mut sent = Vec::new();
+
+        let status = terminate_within(
+            &AtomicBool::new(false),
+            "sub",
+            &mut child,
+            TERM_SLACK_SECS,
+            |pid, signal| {
+                sent.push((pid, signal));
+                Ok(())
+            },
+        )
+        .expect("a reaped child must return its status");
+
+        assert!(status.success(), "the cached status is returned: {status:?}");
+        assert!(sent.is_empty(), "a reaped child must not be signalled: {sent:?}");
     }
 
     #[test]

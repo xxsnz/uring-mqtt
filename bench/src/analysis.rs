@@ -842,9 +842,10 @@ pub fn config_passes(runs: &[RunRecord], repetitions: u32, enforce_spread: bool)
 }
 
 /// A reconciliation row that measures the server's capacity at the
-/// offered rate (spec §9.1 Latency outcomes): a configuration whose
-/// every invalid repetition fails at least one of these rows is
-/// published "not sustained at R".
+/// offered rate (spec §9.1 Latency outcomes): a configuration is
+/// published "not sustained at R" when it has spent its attempt budget,
+/// no repetition failed a syscall-counter row, and every invalid
+/// repetition fails at least one of these rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CapacityRow {
     Unresolved,

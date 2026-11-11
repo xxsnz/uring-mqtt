@@ -999,8 +999,9 @@ fn config_passes_requires_every_repetition_valid_and_within_spread() {
     let mut invalid = valid_record(RunKind::Throughput);
     invalid.throughput_msgs_per_sec = Some(101.0);
     invalid.valid = false;
+    // Replace a repetition, never append: a sixth record fails completeness first.
     let mut mostly_tight = tight_records.clone();
-    mostly_tight.push(invalid);
+    mostly_tight[0] = invalid;
     assert!(!config_passes(&mostly_tight, 5, true));
 
     // Spread 0.15 fails under enforcement, passes without it.

@@ -358,7 +358,6 @@ pub fn run_generator(config: &GenConfig) -> Result<GenReport, String> {
         .window
         .end_ns
         .saturating_add(drain_grace_ns);
-    let origin_lead = Duration::from_nanos(config.origin_ns - now_ns);
 
     let workers = std::thread::available_parallelism()
         .map_or(1, std::num::NonZeroUsize::get);
@@ -370,7 +369,13 @@ pub fn run_generator(config: &GenConfig) -> Result<GenReport, String> {
 
     let report = runtime.block_on(async move {
         let counters = Arc::new(Counters::new(config.connections, config.mode));
-        tokio::time::sleep(origin_lead).await;
+        // Read the clock here, after the runtime is built: a lead taken from
+        // `now_ns` would sleep through the runtime's start-up as well and
+        // start every slot that much past its absolute due time.
+        tokio::time::sleep(Duration::from_nanos(
+            config.origin_ns.saturating_sub(monotonic_now_ns()),
+        ))
+        .await;
         let mut set = JoinSet::new();
         for conn_id in 0..config.connections {
             let task = ConnectionTask {

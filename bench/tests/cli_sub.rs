@@ -16,7 +16,9 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
+use nix::libc::linger;
 use nix::sys::signal::{kill, Signal};
+use nix::sys::socket::{setsockopt, sockopt};
 use nix::unistd::Pid;
 
 use bench::payload::{monotonic_now_ns, Stamp, PAYLOAD_BYTES, TOPIC};
@@ -33,15 +35,34 @@ const ONE_SEC_NS: u64 = 1_000_000_000;
 /// test arms is the widest an `ARM` line may ask for.
 const WINDOW_SPAN_NS: u64 = 3_600_000_000_000;
 const FLOOD_PACKETS: usize = 200_000;
+/// `SO_LINGER` with a zero timeout: closing the socket sends a reset, not
+/// a FIN.
+const RESET_ON_CLOSE: linger = linger {
+    l_onoff: 1,
+    l_linger: 0,
+};
 
 fn report_path(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!("bench-cli-sub-{tag}-{}.json", std::process::id()))
 }
 
-/// Owns the spawned sub process. `Drop` kills and reaps a child that is
-/// still running, so a failed assertion or a timeout cannot leave a sub
-/// holding its port.
-struct SubChild(Child);
+/// Owns the spawned sub process and the thread that drains its stderr.
+/// `Drop` kills and reaps a child that is still running, so a failed
+/// assertion or a timeout cannot leave a sub holding its port.
+struct SubChild(Child, Option<std::thread::JoinHandle<Vec<u8>>>);
+
+impl SubChild {
+    /// Everything the sub wrote to stderr. Call once, after it has exited.
+    fn stderr(&mut self) -> String {
+        let sink = self
+            .1
+            .take()
+            .expect("stderr is read once")
+            .join()
+            .expect("the stderr drain must not panic");
+        String::from_utf8_lossy(&sink).into_owned()
+    }
+}
 
 impl std::ops::Deref for SubChild {
     type Target = Child;
@@ -107,12 +128,13 @@ fn spawn_sub(
             }
         }
     });
-    std::thread::spawn(move || {
+    let stderr_drain = std::thread::spawn(move || {
         let mut sink = Vec::new();
         let _ = BufReader::new(stderr).read_to_end(&mut sink);
+        sink
     });
 
-    (SubChild(child), rx, stdin)
+    (SubChild(child, Some(stderr_drain)), rx, stdin)
 }
 
 fn recv_line(rx: &Receiver<String>, timeout: Duration, expect: &str) {
@@ -599,6 +621,81 @@ fn sub_exits_nonzero_when_the_broker_delivers_qos_2() {
     assert_eq!(delivery.foreign, 0, "the frame is refused before recording");
 
     let _ = std::fs::remove_file(&report);
+}
+
+/// Issue 3: the DISCONNECT write's result is a teardown cause, joined to
+/// the read loop's own failure instead of discarded. A reset after READY
+/// ends the read with its cause, and the DISCONNECT write after it fails
+/// outright on the reset connection.
+#[test]
+fn sub_names_a_failed_disconnect_write_after_its_own_failure() {
+    // The reset waits for READY: the read loop must be the one to see it.
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+    let broker = spawn_fake_broker("sub-test-reset", move |mut stream| {
+        handshake_and(&mut stream, &SUBACK_QOS1, move |stream| {
+            if ready_rx.recv_timeout(READY_TIMEOUT).is_err() {
+                return;
+            }
+            setsockopt(&*stream, sockopt::Linger, &RESET_ON_CLOSE)
+                .expect("set SO_LINGER on the broker side");
+        });
+    });
+
+    let port = broker.addr();
+    let report = report_path("disconnect-failed");
+    let _ = std::fs::remove_file(&report);
+
+    let (mut child, rx, _stdin) = spawn_sub(1, &port, &report);
+    recv_line(&rx, READY_TIMEOUT, "READY");
+    ready_tx.send(()).expect("release the reset");
+
+    wait_exit_code(&mut child, EXIT_TIMEOUT, 1);
+
+    let stderr = child.stderr();
+    assert!(
+        stderr.starts_with("decode broker frame: ") && stderr.contains("; write DISCONNECT: "),
+        "the read failure and the DISCONNECT failure must both be named: {stderr:?}"
+    );
+
+    let _ = std::fs::remove_file(&report);
+}
+
+/// A report that cannot be written follows the session's causes instead of
+/// replacing them: a `--report` naming a directory fails `File::create` after
+/// the read loop and the DISCONNECT write have both failed.
+#[test]
+fn sub_names_every_cause_when_the_report_write_also_fails() {
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+    let broker = spawn_fake_broker("sub-test-reset-no-report", move |mut stream| {
+        handshake_and(&mut stream, &SUBACK_QOS1, move |stream| {
+            if ready_rx.recv_timeout(READY_TIMEOUT).is_err() {
+                return;
+            }
+            setsockopt(&*stream, sockopt::Linger, &RESET_ON_CLOSE)
+                .expect("set SO_LINGER on the broker side");
+        });
+    });
+
+    let port = broker.addr();
+    let report = report_path("report-is-a-directory");
+    let _ = std::fs::remove_dir(&report);
+    std::fs::create_dir(&report).expect("create the directory the report path names");
+
+    let (mut child, rx, _stdin) = spawn_sub(1, &port, &report);
+    recv_line(&rx, READY_TIMEOUT, "READY");
+    ready_tx.send(()).expect("release the reset");
+
+    wait_exit_code(&mut child, EXIT_TIMEOUT, 1);
+
+    let stderr = child.stderr();
+    assert!(
+        stderr.starts_with("decode broker frame: ")
+            && stderr.contains("; write DISCONNECT: ")
+            && stderr.contains("; create report: "),
+        "the read, DISCONNECT and report failures must all be named: {stderr:?}"
+    );
+
+    let _ = std::fs::remove_dir(&report);
 }
 
 /// AC-8: a CONNACK whose body is not exactly two bytes must end the run with

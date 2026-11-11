@@ -90,7 +90,8 @@ pub fn run_sub(args: &SubArgs) -> Result<(), String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LoopExit {
     /// The watch fired (signal, or a stalled PUBACK write that then waited
-    /// for it). The run ends with exit 0 (AC-51, AC-58).
+    /// for it). The run ends with exit 0 (AC-51, AC-58) unless the
+    /// DISCONNECT write after it fails outright.
     Shutdown,
     /// A failure the run must not hide: a refused ARM line, an unreadable
     /// stdin line, a broker that closed the connection, an undecodable
@@ -176,20 +177,40 @@ async fn run_sub_session(
     // The unified shutdown path: every read-loop exit reaches here, so the
     // report is written exactly once on every shutdown path (signal, peer
     // close, write stall) — the brief's "report is written on every
-    // shutdown path" guarantee.
-    let _ = tokio::time::timeout(io_timeout, write_half.write_all(&DISCONNECT))
-        .await
-        .map_err(|_| ())
-        .and_then(|r| r.map_err(|_| ()));
+    // shutdown path" guarantee. A DISCONNECT write that fails outright is a
+    // broken connection, as for a PUBACK, so its cause leaves the run. One
+    // that times out is AC-58's broker that stopped reading: stderr carries
+    // the evidence and the run still ends as its read loop did.
+    let teardown =
+        match tokio::time::timeout(io_timeout, write_half.write_all(&DISCONNECT)).await {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(format!("write DISCONNECT: {e}")),
+            Err(_) => {
+                eprintln!(
+                    "write DISCONNECT: timed out after {} s",
+                    io_timeout.as_secs()
+                );
+                None
+            }
+        };
 
-    write_run_report(&report_path, &recorder)?;
+    let report = write_run_report(&report_path, &recorder).err();
 
     // The report keeps the accounting; the cause of a broker or ARM failure
     // leaves through the exit code, which the runner records as a harness
-    // error instead of reading a clean run out of a broken one.
-    match exit {
-        LoopExit::Shutdown => Ok(()),
-        LoopExit::Failed(cause) => Err(cause),
+    // error instead of reading a clean run out of a broken one. A teardown
+    // cause follows the read loop's own and a failed report write follows
+    // both, joined with `; ` as the generator joins a session's, so no cause
+    // hides another.
+    let failed = match exit {
+        LoopExit::Shutdown => None,
+        LoopExit::Failed(cause) => Some(cause),
+    };
+    let causes: Vec<String> = [failed, teardown, report].into_iter().flatten().collect();
+    if causes.is_empty() {
+        Ok(())
+    } else {
+        Err(causes.join("; "))
     }
 }
 
@@ -225,7 +246,10 @@ async fn connect_and_subscribe(
     let (connack_packet, connack_remaining_length) =
         read_packet(&mut read, io_timeout, "CONNACK").await?;
     let Packet::ConnectAck(ack) = connack_packet else {
-        return Err(format!("expected CONNACK, got {connack_packet:?}"));
+        return Err(format!(
+            "expected CONNACK, got {}",
+            wire::packet_kind(&connack_packet)
+        ));
     };
     // The pinned codec checks only that a CONNACK body holds at least
     // two bytes and ignores the rest, so a longer body would pass every
@@ -238,8 +262,8 @@ async fn connect_and_subscribe(
     }
     if ack.return_code != rmqtt_codec::v3::ConnectAckReason::ConnectionAccepted {
         return Err(format!(
-            "CONNACK refused: {:?}",
-            ack.return_code.reason()
+            "CONNACK refused the session: {:?}",
+            ack.return_code
         ));
     }
     // `wire::encode_connect` sets CleanSession, so [MQTT-3.2.2-1]
@@ -265,7 +289,10 @@ async fn connect_and_subscribe(
         status,
     } = &suback_packet
     else {
-        return Err(format!("expected SUBACK, got {suback_packet:?}"));
+        return Err(format!(
+            "expected SUBACK, got {}",
+            wire::packet_kind(&suback_packet)
+        ));
     };
     // A SUBACK that acknowledges another request, or that answers one filter
     // with several return codes, does not say this subscription exists, so it
@@ -379,7 +406,8 @@ async fn read_loop(
                     // treatment the generator's reader gives an unexpected
                     // packet (`gen.rs:717`).
                     return LoopExit::Failed(format!(
-                        "broker sent an unexpected packet after SUBACK: {parsed:?}"
+                        "broker sent an unexpected packet after SUBACK: {}",
+                        wire::packet_kind(&parsed)
                     ));
                 };
                 // The SUBACK granted exactly the requested QoS, so a delivery
@@ -391,7 +419,7 @@ async fn read_loop(
                 // never asked for into an otherwise clean report (R2-Q2).
                 if publish.qos != expected_qos {
                     return LoopExit::Failed(format!(
-                        "broker delivered QoS {} PUBLISH on {}, expected QoS {}",
+                        "broker delivered QoS {} PUBLISH on {:?}, expected QoS {}",
                         u8::from(publish.qos),
                         publish.topic,
                         u8::from(expected_qos),
@@ -599,23 +627,42 @@ fn write_report(path: &std::path::Path, report: &DeliveryReport) -> Result<(), S
 
 #[cfg(test)]
 mod tests {
-    use super::{refuse_unsolicited_bytes, Errno};
-    use crate::wire::INBOUND_REMAINING_LENGTH_MAX;
+    use super::{
+        connect_and_subscribe, read_loop, refuse_unsolicited_bytes, Errno, LoopExit, NonZeroU16,
+        QoS, Recorder, IO_TIMEOUT_SECS, SUBSCRIBE_PACKET_ID,
+    };
+    use crate::wire::{self, INBOUND_REMAINING_LENGTH_MAX};
     use futures_util::{FutureExt, StreamExt};
     use rmqtt_codec::v3::Codec;
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
     use std::time::Duration;
     use tokio::io::AsyncWriteExt;
+    use tokio::sync::watch;
     use tokio_util::codec::FramedRead;
 
     /// CONNACK with Return Code 0 and Session Present 0.
     const CONNACK_ACCEPTED: [u8; 4] = [0x20, 0x02, 0x00, 0x00];
+    /// CONNACK with Return Code 5 (not authorized) and Session Present 0.
+    const CONNACK_NOT_AUTHORIZED: [u8; 4] = [0x20, 0x02, 0x00, 0x05];
+    /// A broker-supplied CONNECT whose client id and will message carry
+    /// data the operator's stderr must never see.
+    const CONNECT_WITH_WILL: &[u8] =
+        b"\x10\x1D\x00\x04MQTT\x04\x06\x00\x00\x00\x06secret\x00\x01w\x00\x06secret";
+    /// Whole QoS 0 PUBLISH on topic `t` with an empty payload.
+    const PUBLISH_QOS0: &[u8] = b"\x30\x03\x00\x01t";
     /// Whole SUBACK for packet id 1 (5 bytes).
     const BUFFERED_SUBACK: [u8; 5] = [0x90, 0x03, 0x00, 0x01, 0x01];
     /// Time the test's only runtime thread blocks in `std::thread::sleep` so
     /// loopback queues the byte while the reactor cannot see it.
     const LOOPBACK_SETTLE: Duration = Duration::from_millis(50);
+    /// Bound on every fixture wait — a peer socket read or write, the
+    /// peer thread's finish, a tested call's answer — so a regression fails
+    /// the test instead of hanging it. Covers the `IO_TIMEOUT_SECS` steps
+    /// the code under test may itself wait through.
+    const FIXTURE_DEADLINE: Duration = Duration::from_secs(4 * IO_TIMEOUT_SECS);
+    /// Interval at which a test polls whether its peer thread finished.
+    const FINISH_POLL: Duration = Duration::from_millis(10);
     /// One whole frame of every MQTT 3.1.1 control packet type, beside the
     /// name `wire::packet_kind` must give it. A broker sends only some of
     /// them, but the refusal names whatever decodes, and a wrong arm of the
@@ -650,6 +697,107 @@ mod tests {
             peer,
             tokio::net::TcpStream::from_std(client).expect("register client"),
         )
+    }
+
+    /// The refusal `connect_and_subscribe` gives a peer that reads the
+    /// CONNECT and answers `connack`, then — when `suback` is given — reads
+    /// the SUBSCRIBE and answers `suback`.
+    async fn connect_and_subscribe_refusal(
+        connack: &'static [u8],
+        suback: Option<&'static [u8]>,
+    ) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream
+                .set_read_timeout(Some(FIXTURE_DEADLINE))
+                .expect("peer read timeout");
+            stream
+                .set_write_timeout(Some(FIXTURE_DEADLINE))
+                .expect("peer write timeout");
+            let mut connect = vec![0; wire::encode_connect("bench-sub").len()];
+            stream.read_exact(&mut connect).expect("peer reads CONNECT");
+            stream.write_all(connack).expect("peer answers CONNECT");
+            if let Some(suback) = suback {
+                let packet_id = NonZeroU16::new(SUBSCRIBE_PACKET_ID).expect("non-zero");
+                let mut subscribe = vec![0; wire::encode_subscribe(packet_id, 1).len()];
+                stream.read_exact(&mut subscribe).expect("peer reads SUBSCRIBE");
+                stream.write_all(suback).expect("peer answers SUBSCRIBE");
+            }
+        });
+        let refusal = tokio::time::timeout(
+            FIXTURE_DEADLINE,
+            connect_and_subscribe(addr, 1, Duration::from_secs(IO_TIMEOUT_SECS)),
+        )
+        .await
+        .expect("connect_and_subscribe must answer within the fixture deadline")
+        .map(|_| ())
+        .expect_err("the peer's answer must be refused");
+        // A peer still blocked in `accept` or a read would hang `join`.
+        tokio::time::timeout(FIXTURE_DEADLINE, async {
+            while !peer.is_finished() {
+                tokio::time::sleep(FINISH_POLL).await;
+            }
+        })
+        .await
+        .expect("the peer must finish within the fixture deadline");
+        peer.join().expect("the peer must not panic");
+        refusal
+    }
+
+    /// Issue 3 — a refusal names a broker packet by `wire::packet_kind` and
+    /// a CONNACK return code by its variant, so no field of a broker frame
+    /// reaches stderr.
+    #[tokio::test]
+    async fn connect_and_subscribe_names_a_refused_answer_without_its_fields() {
+        assert_eq!(
+            connect_and_subscribe_refusal(CONNECT_WITH_WILL, None).await,
+            "expected CONNACK, got CONNECT"
+        );
+        assert_eq!(
+            connect_and_subscribe_refusal(&CONNACK_NOT_AUTHORIZED, None).await,
+            "CONNACK refused the session: NotAuthorized"
+        );
+        assert_eq!(
+            connect_and_subscribe_refusal(&CONNACK_ACCEPTED, Some(CONNECT_WITH_WILL)).await,
+            "expected SUBACK, got CONNECT"
+        );
+        assert_eq!(
+            connect_and_subscribe_refusal(&CONNACK_ACCEPTED, Some(PUBLISH_QOS0)).await,
+            "expected SUBACK, got PUBLISH"
+        );
+    }
+
+    /// Issue 3 — an unexpected packet after SUBACK is named by
+    /// `wire::packet_kind`, never by its fields.
+    #[tokio::test]
+    async fn read_loop_names_an_unexpected_packet_without_its_fields() {
+        let (mut peer, client) = loopback_pair();
+        let (read_half, mut write_half) = tokio::io::split(client);
+        let mut read = FramedRead::new(read_half, Codec::new(INBOUND_REMAINING_LENGTH_MAX));
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        peer.write_all(CONNECT_WITH_WILL).expect("peer writes CONNECT");
+
+        let exit = tokio::time::timeout(
+            FIXTURE_DEADLINE,
+            read_loop(
+                &mut read,
+                &mut write_half,
+                &Recorder::new(1),
+                &mut shutdown_rx,
+                &mut None,
+                QoS::AtMostOnce,
+                Duration::from_secs(IO_TIMEOUT_SECS),
+            ),
+        )
+        .await
+        .expect("read_loop must answer the unexpected packet within the fixture deadline");
+
+        assert_eq!(
+            exit,
+            LoopExit::Failed("broker sent an unexpected packet after SUBACK: CONNECT".to_string())
+        );
     }
 
     #[tokio::test]

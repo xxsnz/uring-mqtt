@@ -1,9 +1,8 @@
 //! CLI tests for `bench run` (task 11 of the benchmark-harness feature):
 //! refusal paths run before any process is spawned (AC-42, AC-43), the
 //! resume comparison refuses an env mismatch (AC-63), the smoke matrix
-//! produces 8 records for the four §9.1 configurations (AC-45 — see the
-//! `FIXME(ralph)` on that test for the latency shortfall), and SIGTERM
-//! reaps the runner's
+//! produces 8 records for the four §9.1 configurations (AC-45), and
+//! SIGTERM reaps the runner's
 //! children (AC-52). Signatures match `features/benchmark-harness/PLAN.md`
 //! `## Interface Contracts`.
 
