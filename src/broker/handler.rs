@@ -426,7 +426,18 @@ async fn run_packet_loop<P: PacketIo, T: Timer>(
                         }
                         Some(reply)
                     }
-                    Disposition::Reply(reply) => Some(reply),
+                    Disposition::Reply(reply) => {
+                        match reply {
+                            super::packet::Reply::SubscribeRefusal(..) => tracing::warn!(
+                                "SUBSCRIBE refused: the ingest server accepts no subscriptions from {peer_addr}"
+                            ),
+                            super::packet::Reply::UnsubscribeAck(..) => tracing::warn!(
+                                "UNSUBSCRIBE refused: the ingest server holds no subscriptions from {peer_addr}"
+                            ),
+                            _ => {}
+                        }
+                        Some(reply)
+                    }
                     Disposition::Close => {
                         tracing::debug!("Client requested disconnect");
                         flush_replies::<_, T>(packets, &mut unflushed, peer_addr).await?;
@@ -542,7 +553,7 @@ async fn deliver_publish<T: Timer>(
     idle_left: Duration,
     ingest_deadline: Duration,
 ) -> IngestStep {
-    tracing::debug!("PUBLISH {} len: {}", publish.topic, publish.payload.len());
+    tracing::debug!("PUBLISH {:?} len: {}", publish.topic, publish.payload.len());
     let reply_by = std::time::Instant::now() + idle_left;
     let idle_wait = idle_left.saturating_sub(INGEST_REPLY_RESERVE);
     let wait = ingest_deadline.min(idle_wait);
@@ -807,6 +818,10 @@ pub(crate) mod tests {
     /// v3 PUBLISH QoS 1: topic "t", packet id 1, 3-byte payload [0xAA, 0xBB, 0xCC].
     const PUBLISH_QOS1_T_BAD_PAYLOAD: [u8; 10] =
         [0x32, 0x08, 0x00, 0x01, b't', 0x00, 0x01, 0xAA, 0xBB, 0xCC];
+    /// v3 PUBLISH QoS 0: topic "a\nb" (an LF inside), payload `FIXTURE_PAYLOAD`.
+    const PUBLISH_QOS0_LF_TOPIC: [u8; 11] = [
+        0x30, 0x09, 0x00, 0x03, b'a', b'\n', b'b', 0x09, 0xC4, 0x03, 0xF5,
+    ];
     const PINGREQ: [u8; 2] = [0xC0, 0x00];
     /// PINGREQ declaring a one-byte body (MQTT 3.1.1 and 5.0 §3.12 forbid one).
     const PINGREQ_WITH_BODY: [u8; 3] = [0xC0, 0x01, 0x00];
@@ -2032,6 +2047,115 @@ pub(crate) mod tests {
                 .await
                 .expect("join timeout");
             assert!(matches!(join_res, Ok(SessionOutcome::Served)));
+        });
+    }
+
+    /// Decision 2026-09-08 — the SUBSCRIBE refusal and the UNSUBSCRIBE answer
+    /// each log one warn with the peer and the reason; the PINGRESP that
+    /// shares their `Disposition::Reply` arm logs none.
+    #[test]
+    fn subscribe_and_unsubscribe_refusals_warn_with_peer_and_reason() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, _rx, handle) = spawn_handler(2, 30).await;
+            let peer = client.local_addr().expect("local_addr").to_string();
+
+            let mut coalesced = Vec::new();
+            coalesced.extend_from_slice(&V3_CONNECT_TEST);
+            coalesced.extend_from_slice(&V3_SUBSCRIBE_T_ID37);
+            coalesced.extend_from_slice(&V3_UNSUBSCRIBE_T_ID37);
+            coalesced.extend_from_slice(&PINGREQ);
+            tcp_write_all(&mut client, &coalesced)
+                .await
+                .expect("coalesced write");
+
+            // CONNACK (4) + SUBACK (5) + UNSUBACK (4) + PINGRESP (2).
+            let got = tcp_read_n_bounded(&mut client, 15, Duration::from_secs(2))
+                .await
+                .expect("read 15 bytes");
+            assert_eq!(
+                got,
+                vec![
+                    0x20, 0x02, 0x00, 0x00, 0x90, 0x03, 0x00, 0x25, 0x80, 0xB0, 0x02, 0x00, 0x25,
+                    0xD0, 0x00
+                ],
+                "expected CONNACK, SUBACK, UNSUBACK then PINGRESP"
+            );
+
+            tcp_write_all(&mut client, &DISCONNECT)
+                .await
+                .expect("disconnect write");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(matches!(join_res, Ok(SessionOutcome::Served)));
+
+            let logs =
+                String::from_utf8(sink.lock().expect("log lock").clone()).expect("utf8 logs");
+            assert!(
+                has_line_at(
+                    &logs,
+                    "WARN",
+                    &[": SUBSCRIBE refused: the ingest server accepts no subscriptions", &peer]
+                ),
+                "expected a WARN line with the SUBSCRIBE refusal reason and peer {peer}; logs:\n{logs}"
+            );
+            assert!(
+                has_line_at(
+                    &logs,
+                    "WARN",
+                    &[": UNSUBSCRIBE refused: the ingest server holds no subscriptions", &peer]
+                ),
+                "expected a WARN line with the UNSUBSCRIBE refusal reason and peer {peer}; logs:\n{logs}"
+            );
+            assert_eq!(
+                count_lines_at(&logs, "WARN", &peer),
+                2,
+                "expected exactly the two refusal WARN lines for peer {peer}; logs:\n{logs}"
+            );
+        });
+    }
+
+    /// A client-chosen topic carrying LF is escaped in the PUBLISH debug line,
+    /// so it cannot forge a second log line.
+    #[test]
+    fn publish_debug_line_escapes_an_lf_in_the_topic() {
+        let sink = capture_logs();
+        let mut rt = build_runtime();
+        rt.block_on(async {
+            let (mut client, mut rx, handle) = spawn_handler(2, 30).await;
+
+            let mut coalesced = Vec::new();
+            coalesced.extend_from_slice(&V3_CONNECT_TEST);
+            coalesced.extend_from_slice(&PUBLISH_QOS0_LF_TOPIC);
+            tcp_write_all(&mut client, &coalesced)
+                .await
+                .expect("coalesced write");
+            let evt = monoio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("publish timeout")
+                .expect("publish Some");
+            assert_eq!(evt.topic(), "a\nb");
+
+            tcp_write_all(&mut client, &DISCONNECT)
+                .await
+                .expect("disconnect write");
+            let join_res = monoio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("join timeout");
+            assert!(matches!(join_res, Ok(SessionOutcome::Served)));
+
+            let logs =
+                String::from_utf8(sink.lock().expect("log lock").clone()).expect("utf8 logs");
+            assert!(
+                has_line_at(&logs, "DEBUG", &[r#"PUBLISH "a\nb" len:"#]),
+                "expected the topic escaped inside one DEBUG line; logs:\n{logs}"
+            );
+            assert!(
+                !logs.lines().any(|l| l.starts_with("b len:")),
+                "the topic's LF forged a log line; logs:\n{logs}"
+            );
         });
     }
 

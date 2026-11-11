@@ -312,6 +312,21 @@ impl DroppedPublishesHandle {
     }
 }
 
+/// Worker count for an unset `num_workers`, from the
+/// `std::thread::available_parallelism` result. A failed probe falls back to
+/// `FALLBACK_NUM_WORKERS` and warns with its cause.
+fn worker_count(parallelism: std::io::Result<std::num::NonZeroUsize>) -> usize {
+    match parallelism {
+        Ok(n) => n.get(),
+        Err(e) => {
+            tracing::warn!(
+                "available_parallelism failed: {e}; falling back to {FALLBACK_NUM_WORKERS} workers"
+            );
+            FALLBACK_NUM_WORKERS
+        }
+    }
+}
+
 /// Sum of every worker's lifetime drop counter.
 fn sum_counters(counters: &[Arc<AtomicU64>]) -> u64 {
     counters.iter().map(|d| d.load(Ordering::Relaxed)).sum()
@@ -486,10 +501,9 @@ impl MqttBroker {
         config: BrokerConfig,
         callback: Option<PublishCallback>,
     ) -> Result<BrokerHandle, Error> {
-        let num_workers = config.num_workers.unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map_or(FALLBACK_NUM_WORKERS, std::num::NonZero::get)
-        });
+        let num_workers = config
+            .num_workers
+            .unwrap_or_else(|| worker_count(std::thread::available_parallelism()));
 
         if num_workers == 0 {
             return Err(Error::Worker("num_workers must be at least 1".into()));
@@ -1285,6 +1299,27 @@ mod tests {
 
         // Detached broker thread — graceful shutdown is F1.4's scope.
         drop(broker_handle);
+    }
+
+    #[test]
+    fn failed_parallelism_probe_falls_back_and_warns_the_cause() {
+        let logs = crate::broker::handler::tests::capture_logs();
+
+        let workers = worker_count(Err(std::io::Error::other("probe unavailable")));
+
+        assert_eq!(workers, FALLBACK_NUM_WORKERS);
+        let logs = String::from_utf8(logs.lock().expect("log lock").clone()).expect("log UTF-8");
+        assert!(
+            crate::broker::handler::tests::has_line_at(
+                &logs,
+                "WARN",
+                &[
+                    "probe unavailable",
+                    &format!("{FALLBACK_NUM_WORKERS} workers")
+                ],
+            ),
+            "expected one WARN line naming the cause and the fallback; logs:\n{logs}"
+        );
     }
 
     // AC-21 — supervise_startup is the production fan-out; these threadless

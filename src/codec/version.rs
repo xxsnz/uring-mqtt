@@ -73,6 +73,12 @@ impl Decoder for VersionDecoder {
         }
         match TokioDecoder::decode(&mut self.inner, src) {
             Ok(Some(version)) => Ok(Decoded::Some(version)),
+            // The whole declared frame is buffered and still holds no
+            // protocol level: no later byte can complete this CONNECT.
+            Ok(None) if crate::codec::mqtt::holds_complete_packet(src) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                DecodeError::MalformedPacket,
+            )),
             Ok(None) => Ok(Decoded::Insufficient),
             Err(DecodeError::InvalidProtocol) if names_a_known_protocol(src) => {
                 Err(io::Error::new(
@@ -172,6 +178,27 @@ mod tests {
 
         let result = MonoioDecoder::decode(&mut decoder, &mut buf).unwrap();
         assert!(matches!(result, Decoded::Insufficient));
+    }
+
+    /// The declared frame (Remaining Length 6) ends before the protocol-level
+    /// byte, so no later byte can complete this CONNECT: it is malformed now.
+    #[test]
+    fn connect_frame_ending_before_the_level_byte_is_malformed() {
+        let mut decoder = VersionDecoder::new(MaxInboundPacketSize::DEFAULT);
+        let mut buf = BytesMut::from(&[0x10_u8, 0x06, 0x00, 0x04, b'M', b'Q', b'T', b'T'][..]);
+
+        let err = MonoioDecoder::decode(&mut decoder, &mut buf).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let source = err
+            .get_ref()
+            .and_then(|s| s.downcast_ref::<rmqtt_codec::error::DecodeError>());
+        assert!(
+            matches!(
+                source,
+                Some(rmqtt_codec::error::DecodeError::MalformedPacket)
+            ),
+            "expected originating MalformedPacket variant, got {source:?}"
+        );
     }
 
     #[test]
